@@ -35,6 +35,8 @@ Read only the files needed for the question:
   `/Users/ritik/Coding/claude-analytics/docs/self-improvement-loop.md`
 - Ops readiness workflow:
   `/Users/ritik/Coding/claude-analytics/docs/ops-readiness.md`
+- Slack smoke suite:
+  `/Users/ritik/Coding/claude-analytics/docs/slack-smoke-suite.md`
 - Saved query topics:
   `/Users/ritik/Coding/claude-analytics/src/lib/analytics/query-topics.ts`
 - Analytics question planner:
@@ -45,6 +47,8 @@ Read only the files needed for the question:
   `/Users/ritik/Coding/claude-analytics/scripts/plan-self-improvement.ts`
 - Ops readiness checker:
   `/Users/ritik/Coding/claude-analytics/scripts/check-ops-readiness.ts`
+- Slack smoke suite:
+  `/Users/ritik/Coding/claude-analytics/scripts/run-analytics-smoke-suite.ts`
 - Saved topic runner:
   `/Users/ritik/Coding/claude-analytics/scripts/run-saved-query-topic.ts`
 - Broad ad hoc query runner:
@@ -65,20 +69,22 @@ Read only the files needed for the question:
    structured query-log milestones or when the user asks what to productize.
 5. Check production readiness with `scripts/check-ops-readiness.ts` before
    rollout claims.
-6. Resolve business terms in the glossary before answering or querying.
-7. Ground standard metrics in metric contracts.
-8. Use transaction semantics for card-led metrics such as GTV, wallet loads,
+6. Run `scripts/run-analytics-smoke-suite.ts` before Slack rollout or after
+   major analytics-agent changes.
+7. Resolve business terms in the glossary before answering or querying.
+8. Ground standard metrics in metric contracts.
+9. Use transaction semantics for card-led metrics such as GTV, wallet loads,
    refunds, and active spenders.
-9. Run only read-only SQL/HogQL against analytics sources.
-10. Prefer saved query topics when the planner returns `saved_topic`.
-11. Use Supabase for card, marketplace, wallet, rewards, and business metrics.
-12. Use PostHog for app/product behavior metrics. Do not combine Supabase and
+10. Run only read-only SQL/HogQL against analytics sources.
+11. Prefer saved query topics when the planner returns `saved_topic`.
+12. Use Supabase for card, marketplace, wallet, rewards, and business metrics.
+13. Use PostHog for app/product behavior metrics. Do not combine Supabase and
    PostHog active-user definitions unless the user explicitly asks for combined
    active users.
-13. Preserve answer metadata: metric contract id, source tables, date window,
+14. Preserve answer metadata: metric contract id, source tables, date window,
    timezone, freshness, gross/net treatment, assumptions, caveats, and SQL or
    saved topic.
-14. Log ad hoc answers to `QUERY_LOG.md` when runtime query logging is available.
+15. Log ad hoc answers to `QUERY_LOG.md` when runtime query logging is available.
 
 ## Planner Runtime
 
@@ -262,3 +268,18 @@ Summarize `blockers` first, then `warnings`. Repo-owned blockers can be fixed
 with generic Hermes tools. External blockers, such as production merge/deploy
 approval, hosted gateway access, Slack credentials, provider credentials, or
 Vercel env vars, require user input before claiming production readiness.
+
+## Slack Smoke Suite Runtime
+
+Before Slack rollout, after major analytics-agent changes, or when asked
+whether Slack analytics still works, run the dry-run smoke suite:
+
+```bash
+cd /Users/ritik/Coding/claude-analytics
+node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --smart-approvals --generic-tools
+```
+
+If a scenario fails, summarize failed scenarios first and fix the deterministic
+contract before live queries. If all scenarios pass, summarize remaining
+`ops_readiness_contract` blockers. Do not claim production readiness from the
+smoke suite alone.

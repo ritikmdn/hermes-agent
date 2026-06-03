@@ -93,10 +93,12 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "/Users/ritik/Coding/claude-analytics/docs/source-change-workflow.md" in body
     assert "/Users/ritik/Coding/claude-analytics/docs/self-improvement-loop.md" in body
     assert "/Users/ritik/Coding/claude-analytics/docs/ops-readiness.md" in body
+    assert "/Users/ritik/Coding/claude-analytics/docs/slack-smoke-suite.md" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/plan-analytics-question.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/plan-source-change.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/plan-self-improvement.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/check-ops-readiness.ts" in body
+    assert "/Users/ritik/Coding/claude-analytics/scripts/run-analytics-smoke-suite.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/run-saved-query-topic.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/run-ad-hoc-query.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/scripts/run-posthog-query.ts" in body
@@ -104,10 +106,12 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "Plan every definition/glossary/schema/dashboard source-change request" in body
     assert "Plan self-improvement reviews" in body
     assert "Check production readiness" in body
+    assert "Run `scripts/run-analytics-smoke-suite.ts`" in body
     assert "`saved_topic`: run `recommendedCommand`" in body
     assert "`dashboard_candidate`" in body
     assert "`sourceChangeRequest`" in body
     assert "`blockers`" in body
+    assert "`ops_readiness_contract`" in body
     assert "`posthog_ad_hoc`" in body
     assert "`requiresClarification`" in body
     assert "`requiredFiles`" in body
