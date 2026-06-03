@@ -129,6 +129,8 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "`dashboardUrl`" in body
     assert "Ask clarification" in body
     assert "--env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env" in body
+    assert "--provider-authenticated openai-codex" in body
+    assert "auth status openai-codex" in body
 
 
 def test_elixir_analytics_distribution_ships_product_roadmap():
@@ -144,3 +146,4 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
     assert "delete from profiles" in body
     assert "ANALYTICS_DATABASE_URL" in body
     assert "codex/mock-single-dashboard" in body
+    assert "--provider-authenticated openai-codex" in body

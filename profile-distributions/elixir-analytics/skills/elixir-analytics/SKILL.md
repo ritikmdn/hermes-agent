@@ -261,7 +261,15 @@ gateway facts:
 
 ```bash
 cd /Users/ritik/Coding/claude-analytics
-node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --gateway-hosted --slack-connected --smart-approvals --generic-tools
+node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --provider-authenticated openai-codex --gateway-hosted --slack-connected --smart-approvals --generic-tools
+```
+
+Use `--provider-authenticated openai-codex` only after verifying Hermes profile
+auth:
+
+```bash
+cd /Users/ritik/.hermes/hermes-agent
+venv/bin/python -m hermes_cli.main --profile elixir-analytics auth status openai-codex
 ```
 
 Summarize `blockers` first, then `warnings`. Repo-owned blockers can be fixed
@@ -276,7 +284,7 @@ whether Slack analytics still works, run the dry-run smoke suite:
 
 ```bash
 cd /Users/ritik/Coding/claude-analytics
-node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --smart-approvals --generic-tools
+node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --provider-authenticated openai-codex --smart-approvals --generic-tools
 ```
 
 If a scenario fails, summarize failed scenarios first and fix the deterministic

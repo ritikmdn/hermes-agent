@@ -47,7 +47,8 @@ Do not call the agent or dashboard production-ready until all gates pass:
 1. Analytics branch is merged or deployed to the production Vercel project.
 2. Deployed Next.js env includes read-only `ANALYTICS_DATABASE_URL`.
 3. Deployed app has the artifact API env vars if temporary visuals are enabled.
-4. Hermes `elixir-analytics` profile has a configured inference provider.
+4. Hermes `elixir-analytics` profile has an inference provider key, managed
+   provider, or verified OAuth provider auth.
 5. Slack `macros` gateway is connected and supervised.
 6. Smart approvals are enabled.
 7. Generic Hermes tools remain enabled for debugging and source changes.
@@ -62,8 +63,8 @@ Run these from `/Users/ritik/Coding/claude-analytics` after analytics changes:
 npm run lint
 npm test
 npm run build
-node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --smart-approvals --generic-tools
-node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --smart-approvals --generic-tools
+node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --provider-authenticated openai-codex --smart-approvals --generic-tools
+node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --provider-authenticated openai-codex --smart-approvals --generic-tools
 ```
 
 Run this from the Hermes repo after profile changes:
@@ -90,7 +91,6 @@ These are not solved by local code changes:
 
 - Decide whether to merge/deploy `codex/mock-single-dashboard` or open a PR.
 - Configure production Vercel env vars for database reads and temporary visuals.
-- Choose the gateway host for Slack `macros`.
-- Configure the inference provider for the live Hermes profile.
+- Keep Slack `macros` gateway supervision verified during rollout.
+- Verify Hermes OAuth provider auth before passing `--provider-authenticated`.
 - Push or PR the Hermes profile branch once GitHub permissions are available.
-
