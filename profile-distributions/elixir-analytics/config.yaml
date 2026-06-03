@@ -1,0 +1,81 @@
+model:
+  provider: openai-codex
+  default: gpt-5.5
+  base_url: ""
+
+toolsets:
+  - hermes-analytics
+
+agent:
+  max_turns: 90
+  gateway_timeout: 1800
+  gateway_notify_interval: 180
+  clarify_timeout: 600
+  disabled_toolsets: []
+
+approvals:
+  mode: smart
+  timeout: 120
+  cron_mode: deny
+
+terminal:
+  cwd: "."
+  timeout: 180
+  env_passthrough:
+    - ANALYTICS_DATABASE_URL
+    - POSTHOG_API_KEY
+    - POSTHOG_PROJECT_ID
+    - ELIXIR_ANALYTICS_ARTIFACT_API_URL
+    - ELIXIR_ANALYTICS_ARTIFACT_API_SECRET
+
+platforms:
+  slack:
+    # Slack app: macros
+    enabled: true
+
+platform_toolsets:
+  cli:
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - code_execution
+    - cronjob
+  slack:
+    - web
+    - terminal
+    - file
+    - skills
+    - todo
+    - memory
+    - session_search
+    - clarify
+    - code_execution
+    - cronjob
+    - messaging
+  cron:
+    - web
+    - terminal
+    - file
+    - skills
+    - memory
+    - session_search
+    - code_execution
+
+skills:
+  guard_agent_created: true
+
+curator:
+  enabled: true
+  interval_hours: 168
+  min_idle_hours: 2
+  stale_after_days: 30
+  archive_after_days: 90
+  prune_builtins: false
+  backup:
+    enabled: true
+    keep: 5

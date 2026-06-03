@@ -1,0 +1,41 @@
+name: elixir-analytics
+version: 0.1.0
+description: "Slack-first Elixir analytics agent."
+hermes_requires: ">=0.12.0"
+author: "Elixir"
+license: "UNLICENSED"
+
+env_requires:
+  - name: SLACK_APP_TOKEN
+    description: "Slack Socket Mode app token for the macros analytics app."
+    required: true
+  - name: SLACK_BOT_TOKEN
+    description: "Slack bot token for the macros analytics app."
+    required: true
+  - name: ANALYTICS_DATABASE_URL
+    description: "Read-only analytics database URL for Supabase/Postgres queries."
+    required: false
+    default: ""
+  - name: POSTHOG_API_KEY
+    description: "Read-only PostHog API key for product analytics."
+    required: false
+    default: ""
+  - name: POSTHOG_PROJECT_ID
+    description: "PostHog project id for product analytics."
+    required: false
+    default: ""
+  - name: ELIXIR_ANALYTICS_ARTIFACT_API_URL
+    description: "Next.js artifact API base URL for temporary visualizations."
+    required: false
+    default: ""
+  - name: ELIXIR_ANALYTICS_ARTIFACT_API_SECRET
+    description: "Service secret for publishing temporary visualization artifacts."
+    required: false
+    default: ""
+
+distribution_owned:
+  - SOUL.md
+  - config.yaml
+  - skills
+  - distribution.yaml
+  - README.md
