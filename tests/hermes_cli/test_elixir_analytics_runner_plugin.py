@@ -366,6 +366,57 @@ def test_answer_question_mode_labels_saved_topic_dashboard_links(monkeypatch):
     )
 
 
+def test_answer_question_mode_labels_stored_result_links_as_visualizations(monkeypatch):
+    module = _load_plugin_module()
+    payload = {
+        "ok": True,
+        "route": "supabase_ad_hoc",
+        "shortcut": "swiggy_users_this_week",
+        "payload": {
+            "ok": True,
+            "rowCount": 1,
+            "truncated": False,
+            "dashboardUrlPath": "/query?result=result_12345678",
+            "dashboardUrl": (
+                "https://analytics.joinelixir.club/query?result=result_12345678"
+            ),
+            "slackText": (
+                "Swiggy users this week\n"
+                "Rows: 1\n"
+                "1. user_name: Ada Lovelace, gross_spend_inr: 420"
+            ),
+            "metadata": {
+                "resultType": "users",
+                "assumptions": "This week means India business week-to-date.",
+                "caveats": "Includes successful card spend only.",
+            },
+            "rows": [{"user_name": "Ada Lovelace", "gross_spend_inr": 420}],
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "which users spent on Swiggy this week?",
+        }
+    )
+
+    assert result["ok"] is True
+    assert (
+        "Dashboard: <https://analytics.joinelixir.club/query?"
+        "result=result_12345678|Open visualization>"
+        in result["hermes_direct_final_response"]
+    )
+    assert "result=result_12345678|Open dashboard>" not in result[
+        "hermes_direct_final_response"
+    ]
+
+
 def test_runner_logs_safe_route_summary_without_rows_or_sql(monkeypatch, caplog):
     module = _load_plugin_module()
     row = {"email": "ada@example.com", "gross_spend_inr": 420}

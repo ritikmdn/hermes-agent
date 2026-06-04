@@ -343,7 +343,11 @@ def _slack_dashboard_link(answer_payload: dict[str, Any]) -> str | None:
     if not dashboard_link:
         return None
 
-    label = "Open visualization" if "payload=" in dashboard_link else "Open dashboard"
+    label = (
+        "Open visualization"
+        if "payload=" in dashboard_link or "result=" in dashboard_link
+        else "Open dashboard"
+    )
     return f"<{dashboard_link}|{label}>"
 
 
