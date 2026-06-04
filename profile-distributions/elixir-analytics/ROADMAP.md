@@ -178,6 +178,18 @@ Verified:
   attempted for saved GTV and Swiggy, but Hermes could not reach the inference
   provider because the profile hit HTTP 429 usage-limit errors before the
   runner could answer.
+- Hermes gateway provider-error hygiene now covers Slack as well as Telegram:
+  Slack suppresses retry/backoff status chatter and rewrites raw provider 429
+  final responses into a short retry-later message. Focused Slack/profile
+  verification passes 234 tests.
+- After the Slack provider-error hygiene deploy, a fresh live Slack saved-GTV
+  smoke test at 2026-06-04 23:22 IST returned Weekly Card GTV with 5 rows and
+  a direct `https://analytics.joinelixir.club/query?topic=card-gtv-weekly&range=30d`
+  `Open dashboard` link.
+- A fresh live Slack Swiggy ad hoc smoke test at 2026-06-04 23:24 IST routed
+  through `answer_question` -> `supabase_ad_hoc`, returned 16 rows, and included
+  a TTL-backed `https://analytics.joinelixir.club/query?result=...`
+  `Open visualization` link.
 
 Known gaps:
 
@@ -191,9 +203,9 @@ Known gaps:
   `NousResearch/hermes-agent` `main`, and focused Hermes verification passes
   253 tests. Opening a public upstream PR remains a product/privacy decision
   because the profile is Elixir-specific.
-- Slack answer polish and short result links are merged and
-  production-deployed. The remaining live Slack recheck is blocked by the
-  current inference-provider HTTP 429 usage limit, not by the analytics runner.
+- Slack answer polish, short result links, and provider-rate-limit message
+  hygiene are implemented. Fresh post-restart saved-GTV and Swiggy ad hoc live
+  Slack smokes pass for the current code revision.
 
 ## Milestones
 
@@ -212,7 +224,7 @@ Known gaps:
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Passed via live logs after PR #6 |
 | 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
 | 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Branch pushed/tested; public upstream PR decision pending |
-| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | PR #9 short links merged/deployed; live Slack recheck blocked by provider 429 |
+| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, links, and clean provider-failure messages. | PR #9 short links merged/deployed; Slack 429 hygiene tested; post-restart saved-GTV Slack smoke passes |
 | 15 | Operating cadence | Self-improvement review runs on a regular query-log cadence. | Checker built; scheduled/live usage pending |
 
 ## Production Gates
@@ -232,6 +244,8 @@ Do not call the agent or dashboard production-ready until all gates pass:
 8. The Slack smoke suite passes.
 9. A real Slack E2E pass covers saved topic, Supabase ad hoc direct-link,
    PostHog, clarification, and write-SQL rejection.
+10. Provider failures in Slack are concise and user-safe, without retry spam or
+    raw HTTP/provider error bodies.
 
 ## Packaging Plan
 

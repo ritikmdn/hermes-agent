@@ -140,6 +140,11 @@ def _gateway_platform_value(platform: Any) -> str:
     return str(getattr(platform, "value", platform) or "").strip().lower()
 
 
+def _gateway_should_sanitize_chat(platform: Any) -> bool:
+    """Return True for chat surfaces that should not receive raw provider errors."""
+    return _gateway_platform_value(platform) in {"telegram", "slack"}
+
+
 def _is_transient_network_error(exc: BaseException) -> bool:
     """Return True for transient network errors safe to log + swallow.
 
@@ -228,7 +233,7 @@ def _redact_gateway_user_facing_secrets(text: str) -> str:
 
 
 def _gateway_provider_error_reply(text: str) -> str:
-    """Map raw provider/API errors to a short user-safe Telegram reply."""
+    """Map raw provider/API errors to a short user-safe gateway reply."""
     if _GATEWAY_AUTH_ERROR_RE.search(text):
         return (
             "⚠️ Provider authentication failed. Check the configured credentials; "
@@ -288,13 +293,13 @@ def _looks_like_gateway_provider_error(text: str) -> bool:
 def _sanitize_gateway_final_response(platform: Any, text: str) -> str:
     """Sanitize final gateway replies before sending them to high-noise chats.
 
-    Telegram is Bob's mobile inbox, so it should receive concise, safe provider
-    failure categories instead of raw HTTP bodies, request IDs, or policy text.
-    Other platforms keep the existing behaviour for now.
+    Chat platforms should receive concise, safe provider failure categories
+    instead of raw HTTP bodies, request IDs, or policy text. Developer-facing
+    surfaces keep the existing diagnostics.
     """
     if not text:
         return text
-    if _gateway_platform_value(platform) != "telegram":
+    if not _gateway_should_sanitize_chat(platform):
         return text
 
     redacted = _redact_gateway_user_facing_secrets(str(text))
@@ -308,11 +313,14 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     text = str(message or "").strip()
     if not text:
         return None
-    if _gateway_platform_value(platform) != "telegram":
+    platform_value = _gateway_platform_value(platform)
+    if not _gateway_should_sanitize_chat(platform):
         return text
 
     text = _redact_gateway_user_facing_secrets(text)
     if _TELEGRAM_NOISY_STATUS_RE.search(text):
+        return None
+    if platform_value == "slack" and _looks_like_gateway_provider_error(text):
         return None
     if _looks_like_gateway_provider_error(text):
         return _gateway_provider_error_reply(text)
