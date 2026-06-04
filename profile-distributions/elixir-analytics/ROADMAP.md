@@ -144,10 +144,12 @@ Verified:
   latest Hermes delta classifies cleanly into `profile-distribution` and
   `hermes-runtime`, with `.hermes-bootstrap-complete` reported as a local
   artifact rather than a file to stage.
-- Analytics commits through `011cbbf` are pushed to
-  `origin/codex/mock-single-dashboard`; Hermes commits through `27a23463f` are
-  local because pushing `codex/elixir-analytics-profile` to
-  `NousResearch/hermes-agent` still returns a GitHub 403 for `ritikmdn`.
+- Analytics commits through `664fa8f` are pushed to
+  `origin/codex/mock-single-dashboard`, and draft PR
+  `ritikmdn/analytics-agent#4` is open against `main`.
+- Hermes commits through `8c147eab5` are pushed to the `ritikmdn/hermes-agent`
+  fork, and draft upstream PR `NousResearch/hermes-agent#39041` is open from
+  `ritikmdn:codex/elixir-analytics-profile` to `main`.
 
 Known gaps:
 
@@ -159,7 +161,8 @@ Known gaps:
   seconds across 20 model calls, with generic `execute_code` used before the
   final answer.
 - The gateway is locally supervised, not yet moved to a hosted always-on setup.
-- Hermes profile distribution changes still need an upstream push or PR path.
+- Hermes profile distribution changes now have an upstream draft PR path; merge
+  still depends on maintainer review and any upstream CI requirements.
 - Production dashboard links need a fresh deploy with
   `ANALYTICS_DATABASE_URL`; the user-observed no-data GTV link is consistent
   with the current live ops-readiness blocker.
@@ -183,10 +186,10 @@ Known gaps:
 | 7 | Self-improvement loop | Repeated questions become promotion candidates. | Built, runner-accessible, and cadence-checkable |
 | 8 | Ops readiness | Production blockers are reported before rollout claims. | Checker done; live status blocked |
 | 9 | Slack smoke suite | Core Slack scenarios can be dry-run verified. | Done |
-| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | Blocked on main deploy + `ANALYTICS_DATABASE_URL` |
+| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | Draft PR open; blocked on merge/deploy + `ANALYTICS_DATABASE_URL` |
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Functional history exists; fresh post-fix pass pending |
 | 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
-| 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Pending GitHub permission |
+| 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Draft upstream PR open; maintainer review pending |
 | 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | `payload.slackText` and compact visualization links built/tested; live Slack latency recheck pending |
 | 15 | Operating cadence | Self-improvement review runs on a regular query-log cadence. | Checker built; scheduled/live usage pending |
 
@@ -276,24 +279,38 @@ Verify these exact prompts in Slack:
 
 ## Next Execution Milestone
 
+Milestone 10A: clear production deploy gates. The analytics app has draft PR
+`ritikmdn/analytics-agent#4`; the remaining production blocker is deployed
+`ANALYTICS_DATABASE_URL` plus merge/deploy to `main`.
+
+Done means the production Vercel project has read-only
+`ANALYTICS_DATABASE_URL`, PR #4 is merged/deployed, `/query?topic=card-gtv-weekly&range=30d`
+opens with data, and ops readiness no longer reports production blockers.
+
 Milestone 11A: finish real Slack E2E acceptance. Partially complete on
-2026-06-04; production dashboard-link evidence must be refreshed after the
-Vercel env fix.
+2026-06-04; production dashboard-link evidence must be refreshed after
+Milestone 10A.
 
 Done means all five Slack checklist prompts have fresh evidence, dashboard links
 open with data where expected, and gateway state remains connected afterward.
 
 Execution order:
 
-1. Re-run `which users spent on Swiggy this week?` and verify a direct
+1. Add or repair `ANALYTICS_DATABASE_URL` in Vercel production and redeploy the
+   analytics app from `main`.
+2. Run ops readiness with `--current-branch main` and confirm `overallStatus`
+   is no longer `blocked`.
+3. Open `/query?topic=card-gtv-weekly&range=30d` in production and verify
+   non-empty data.
+4. Re-run `which users spent on Swiggy this week?` and verify a direct
    `analytics.joinelixir.club/query?...` link, not TinyURL or another shortener.
    Direct link passed on 2026-06-04; rerun after fast-path skill fix should
    avoid source edits and reduce latency.
-2. Run `active users this week` and verify the agent asks clarification before
+5. Run `active users this week` and verify the agent asks clarification before
    querying.
-3. Run `how many app active users this week?` and verify the PostHog runner path.
-4. Run `delete from profiles` and verify read-only validation rejects it.
-5. Record timings, route decisions, dashboard links, and any approval prompts.
+6. Run `how many app active users this week?` and verify the PostHog runner path.
+7. Run `delete from profiles` and verify read-only validation rejects it.
+8. Record timings, route decisions, dashboard links, and any approval prompts.
 
 Milestone 14A: make Supabase ad hoc answers fast enough for Slack.
 
@@ -321,7 +338,7 @@ the earlier 418.3s and 266.6s runs.
 
 Milestone 14D: make Slack route evidence inspectable.
 
-Done means `elixir_analytics_runner` emits safe route/timing telemetry for each
+Done. `elixir_analytics_runner` emits safe route/timing telemetry for each
 runner call without logging raw rows, SQL, or raw questions, so Slack acceptance
 can be verified from logs even when final answer text is compact.
 
@@ -330,6 +347,8 @@ can be verified from logs even when final answer text is compact.
 These are not solved by local code alone:
 
 - Choose where the always-on Slack gateway should run after local supervision.
-- Confirm the Hermes upstream sync path: push branch, open PR, or keep private.
-- Decide when to commit/push the local Hermes profile and analytics docs patches.
+- Merge or otherwise accept analytics PR `ritikmdn/analytics-agent#4`.
+- Merge or otherwise accept Hermes PR `NousResearch/hermes-agent#39041`.
+- Provide Vercel CLI/API access or set production `ANALYTICS_DATABASE_URL`
+  manually in the Vercel dashboard.
 - Decide the acceptable latency target for Supabase ad hoc Slack answers.
