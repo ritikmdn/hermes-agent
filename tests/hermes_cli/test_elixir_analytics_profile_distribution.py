@@ -202,9 +202,11 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
     assert "Production dashboard" in body
     assert "Analytics PR #6" in body
     assert "Analytics PR #7" in body
+    assert "Analytics PR #9" in body
     assert "Open visualization" in body
-    assert "Compact-link PR #7 merged and deployed" in body
-    assert "analytics-agent-9y28kucl2" in body
+    assert "/query?result=..." in body
+    assert "analytics-agent-ogg92mopr" in body
+    assert "HTTP 429 usage-limit" in body
     assert "ops-readiness status from analytics `main` is `ready`" in body
     assert 'overallStatus: "ready"' in body
     assert "signed-in browser proof pending" in body

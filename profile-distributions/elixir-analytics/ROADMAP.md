@@ -41,8 +41,12 @@ Verified:
   `Open dashboard` links and temporary ad hoc payload links as `Open
   visualization` links while preserving relative `dashboardUrlPath` fallback
   behavior.
+- Analytics PR #9, `Add TTL-backed ad hoc visualization links`, is merged to
+  `main` at `774f433`. It stores sanitized temporary visualization snapshots in
+  Upstash when available and returns short `/query?result=...` links, with the
+  compressed `/query?payload=...` path retained as a fallback.
 - Latest local verification is green: `npm run lint` has no warnings,
-  `npm test` passed 221 analytics tests, `npm run build` passed, strict release
+  `npm test` passed 228 analytics tests, `npm run build` passed, strict release
   packaging passed, the smoke suite passed from `main`, and the live Slack log
   checker passed from `main`.
 - Latest analytics PR #7 verification is green: focused formatter coverage
@@ -140,6 +144,11 @@ Verified:
 - Temporary visualization payloads now strip both Supabase SQL and PostHog
   HogQL before encoding `/query?payload=...`, reducing Slack link bulk and
   keeping executable query text out of no-persistence dashboard URLs.
+- Temporary visualization links now prefer `/query?result=...` when Upstash is
+  configured. A synthetic Upstash probe stored and loaded a result in 60-second
+  TTL mode with `emailStored: false`, and a live local Swiggy runner smoke
+  returned 16 rows, a 1031-character Slack answer, `usesResultId: true`, and no
+  visible email in Slack or the stored visualization payload.
 - The analytics repo now has `scripts/check-release-packaging.ts` and
   `docs/release-packaging.md`. Strict release packaging passes on clean `main`,
   so runtime and dashboard changes can be packaged separately instead of merged
@@ -162,8 +171,13 @@ Verified:
   post-sign-in data rendering still needs either user-authenticated browser
   verification or a manual user check.
 - Vercel production deployment
-  `https://analytics-agent-9y28kucl2-ritikmdns-projects.vercel.app` is Ready
+  `https://analytics-agent-ogg92mopr-ritikmdns-projects.vercel.app` is Ready
   and aliased to `https://analytics.joinelixir.club`.
+- The live `elixir-analytics` Hermes gateway was restarted after the PR #9
+  deploy and reconnected to Slack Socket Mode. A live Slack recheck was
+  attempted for saved GTV and Swiggy, but Hermes could not reach the inference
+  provider because the profile hit HTTP 429 usage-limit errors before the
+  runner could answer.
 
 Known gaps:
 
@@ -177,8 +191,9 @@ Known gaps:
   `NousResearch/hermes-agent` `main`, and focused Hermes verification passes
   253 tests. Opening a public upstream PR remains a product/privacy decision
   because the profile is Elixir-specific.
-- Slack answer polish is merged and production-deployed. It still needs one
-  live Slack recheck before Milestone 14A is closed.
+- Slack answer polish and short result links are merged and
+  production-deployed. The remaining live Slack recheck is blocked by the
+  current inference-provider HTTP 429 usage limit, not by the analytics runner.
 
 ## Milestones
 
@@ -187,17 +202,17 @@ Known gaps:
 | 1 | Profile foundation | Slack `macros` uses the isolated analytics profile. | Done |
 | 2 | Saved query vertical slice | Known questions such as weekly GTV use saved topics. | Done |
 | 3 | Supabase ad hoc runner | Arbitrary business analytics questions use a JSON runner. | Done; live Swiggy and top-spenders paths pass |
-| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Done for saved and payload links; signed-in browser proof pending |
+| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Done for saved, payload, and TTL result links; signed-in browser proof pending |
 | 5 | PostHog runner | App/product analytics route to read-only HogQL. | Done; live app-active route passes |
 | 6 | Source-of-truth workflow | Definitions, glossary, topics, and dashboard changes become PR work. | Built and smoke-covered; first live change request pending |
 | 7 | Self-improvement loop | Repeated questions become promotion candidates. | Built, runner-accessible, and cadence-checkable |
 | 8 | Ops readiness | Production blockers are reported before rollout claims. | Ready when run with production env pull |
 | 9 | Slack smoke suite | Core Slack scenarios can be dry-run verified. | Done |
-| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | Main merged, Vercel production Ready, readiness ready with production env pull; signed-in browser proof pending |
+| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | PR #9 merged, Vercel production Ready, readiness ready with production env pull; signed-in browser proof pending |
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Passed via live logs after PR #6 |
 | 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
 | 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Branch pushed/tested; public upstream PR decision pending |
-| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | Compact-link PR #7 merged and deployed; live Slack recheck pending |
+| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | PR #9 short links merged/deployed; live Slack recheck blocked by provider 429 |
 | 15 | Operating cadence | Self-improvement review runs on a regular query-log cadence. | Checker built; scheduled/live usage pending |
 
 ## Production Gates
@@ -206,8 +221,9 @@ Do not call the agent or dashboard production-ready until all gates pass:
 
 1. Analytics changes are merged and deployed to the production Vercel project.
 2. Deployed Next.js env includes read-only `ANALYTICS_DATABASE_URL`.
-3. Temporary visuals use direct `/query?payload=...` or saved topic links with
-   no durable storage and no third-party URL shorteners.
+3. Temporary visuals use direct saved-topic links, compressed
+   `/query?payload=...` fallback links, or TTL-backed `/query?result=...`
+   handoffs with no durable result storage and no third-party URL shorteners.
 4. Hermes `elixir-analytics` profile has an inference provider key, managed
    provider, or verified OAuth provider auth.
 5. Slack `macros` gateway is connected and supervised.
@@ -322,7 +338,7 @@ private profile distribution.
 
 Current evidence: branch `codex/elixir-analytics-profile` is pushed to the
 `ritikmdn/hermes-agent` fork, dry-merges cleanly into current upstream `main`,
-and focused verification passed 253 Hermes tests plus strict release packaging.
+and focused verification passed 255 Hermes tests plus strict release packaging.
 
 Milestone 14A: compact Slack answer links.
 
@@ -330,17 +346,19 @@ Done means user-list answers still include dashboard links, but the Slack messag
 stays compact enough for executive reading and does not expose executable query
 text in the URL.
 
-Current evidence: analytics PR #7 is merged to `main` at `4d529dc` and deployed
+Current evidence: analytics PR #9 is merged to `main` at `774f433` and deployed
 to production at
-`https://analytics-agent-9y28kucl2-ritikmdns-projects.vercel.app`, aliased by
+`https://analytics-agent-ogg92mopr-ritikmdns-projects.vercel.app`, aliased by
 `https://analytics.joinelixir.club`. Saved dashboard URLs format as `Open
-dashboard` and temporary payload URLs format as `Open visualization` in
-Slack-facing text. Verification passed focused formatter tests, the full
-221-test analytics suite, lint, Next.js build, strict release packaging, smoke
-suite, production-env ops readiness, and Vercel production inspection.
+dashboard`; temporary payload and result URLs format as `Open visualization` in
+Slack-facing text. Verification passed focused visualization tests, the full
+228-test analytics suite, lint, Next.js build, strict release packaging, smoke
+suite, production-env ops readiness, Vercel production inspection, a synthetic
+Upstash write/read probe, and a live local Swiggy runner smoke with
+`/query?result=...`.
 
-Remaining work: run one live Slack answer check to confirm Slack renders the
-compact labels.
+Remaining work: rerun one live Slack answer check after the profile inference
+provider is out of HTTP 429 usage-limit state.
 
 ## Current Open Decisions
 
