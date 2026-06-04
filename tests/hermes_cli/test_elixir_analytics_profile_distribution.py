@@ -217,6 +217,20 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
     assert "--provider-authenticated openai-codex" in body
 
 
+def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
+    readme = (DIST_DIR / "README.md").read_text(encoding="utf-8")
+    body = (DIST_DIR / "HOSTED_GATEWAY.md").read_text(encoding="utf-8")
+
+    assert "HOSTED_GATEWAY.md" in readme
+    assert "Slack `macros` independent of the\nlocal laptop" in body
+    assert "hermes -p elixir-analytics gateway run" in body
+    assert "SLACK_APP_TOKEN" in body
+    assert "SLACK_BOT_TOKEN" in body
+    assert "ANALYTICS_DATABASE_URL" in body
+    assert "Socket Mode connected" in body
+    assert "Do not leave hosted and local gateways connected" in body
+
+
 def test_elixir_analytics_soul_requires_dashboard_links_for_data_answers():
     body = (DIST_DIR / "SOUL.md").read_text(encoding="utf-8")
 

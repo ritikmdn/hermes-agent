@@ -297,6 +297,10 @@ Done means Slack `macros` does not depend on the laptop: the gateway has an
 always-on host, restart policy, health check, log access, and documented rollback
 path.
 
+Use `HOSTED_GATEWAY.md` as the cutover runbook. The remaining product decision
+is the host itself; the required process shape, secrets, health checks, smoke
+prompts, and rollback steps are documented there.
+
 Milestone 13A: choose Hermes upstream/private sync path.
 
 Done means the `elixir-analytics` profile distribution, runner plugin, and Slack

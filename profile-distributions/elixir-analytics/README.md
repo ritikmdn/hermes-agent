@@ -33,3 +33,6 @@ Use `ROADMAP.md` as the canonical product roadmap and production rollout
 checklist for this profile. It tracks local implementation milestones,
 remaining external blockers, and the Slack E2E prompts that must pass before
 calling the analytics agent production-ready.
+
+Use `HOSTED_GATEWAY.md` for the always-on Slack gateway cutover runbook once a
+host is chosen.
