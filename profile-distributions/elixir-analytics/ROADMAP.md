@@ -33,9 +33,9 @@ Verified:
   `codex/mock-single-dashboard`, not `main`, and deployed reads are missing
   `ANALYTICS_DATABASE_URL`.
 - Latest local verification is green: `npm run lint` has no warnings,
-  `npm test` passed 185 analytics tests, `npm run build` passed, and focused
-  Hermes profile/plugin tests passed 91 tests with one external dependency
-  warning.
+  `npm test` passed 210 analytics tests, `npm run build` passed, and focused
+  Hermes profile/plugin/toolset tests passed 55 tests with one external
+  dependency warning.
 - `/query` now distinguishes an unknown saved topic from a known saved topic
   whose database execution fails, so a missing Vercel database env shows as
   saved-query data unavailable rather than an ambiguous empty visualization.
@@ -60,8 +60,9 @@ Verified:
   first using generic `execute_code` or ad hoc shell composition.
 - The runner plugin also exposes deterministic maintenance modes:
   `source_change_plan` for definition/glossary/schema/dashboard change
-  planning, and `self_improvement_plan` for query-log review/promotion
-  planning.
+  planning, `source_change_scope_check` for checking changed files before a
+  source-of-truth PR commit, and `self_improvement_plan` for query-log
+  review/promotion planning.
 - Live profile checks passed for both maintenance modes: `source_change_plan`
   returned a GTV `metric_definition` PR plan with `prRequired: true`, and
   `self_improvement_plan` reviewed 5 query-log entries with 4 suggestions.
@@ -108,10 +109,16 @@ Verified:
 - The analytics smoke suite now includes `source_change_workflow`, proving that
   a request like `GTV definition is wrong...` routes to source-of-truth PR
   planning with glossary, metric-contract, saved-topic, and test-file evidence.
-- Full verification after the ops, query-handoff, and Slack recovery-log
-  update: Hermes profile/plugin tests passed with 91 tests, Slack reconnect
-  tests passed with 223 tests, `npm run lint` completed with no warnings,
-  `npm test` passed 185 tests, and `npm run build` passed.
+- The analytics repo now includes `scripts/check-source-change-scope.ts`, which
+  verifies a source-change request against changed source/test files before
+  committing. The Hermes profile exposes it through `elixir_analytics_runner`
+  mode `source_change_scope_check`; the installed profile was synced, the local
+  Slack gateway was restarted, and a live installed-profile direct check
+  returned `status: "ready"` for a scoped GTV definition change.
+- Full verification after the source-change scope checker update: Hermes
+  profile/plugin/toolset tests passed with 55 tests, `npm run lint` completed
+  with no warnings, `npm test` passed 210 tests, `npm run build` passed, and
+  both analytics and Hermes release-packaging checks passed.
 - Temporary no-persistence `/query?payload=...` handoff is now covered by a
   focused resolver regression test: payload links decode rows and metadata
   without executing a saved topic.
@@ -129,10 +136,13 @@ Verified:
   separately instead of merged as one broad release.
 - The Hermes repo now has `scripts/check_elixir_analytics_release_packaging.py`
   and `profile-distributions/elixir-analytics/RELEASE_PACKAGING.md`. The
-  current dirty Hermes worktree classifies cleanly into
-  `profile-distribution`, `hermes-runtime`, and `slack-gateway`, with
-  `.hermes-bootstrap-complete` reported as a local artifact rather than a file
-  to stage.
+  latest Hermes delta classifies cleanly into `profile-distribution` and
+  `hermes-runtime`, with `.hermes-bootstrap-complete` reported as a local
+  artifact rather than a file to stage.
+- Analytics commits through `011cbbf` are pushed to
+  `origin/codex/mock-single-dashboard`; Hermes commits through `27a23463f` are
+  local because pushing `codex/elixir-analytics-profile` to
+  `NousResearch/hermes-agent` still returns a GitHub 403 for `ritikmdn`.
 
 Known gaps:
 
@@ -165,7 +175,7 @@ Known gaps:
 | 3 | Supabase ad hoc runner | Arbitrary business analytics questions use a JSON runner. | Done; fast-path polish pending |
 | 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Direct-link passed locally/live once; production env recheck pending |
 | 5 | PostHog runner | App/product analytics route to read-only HogQL. | Passed live; fast-path polish pending |
-| 6 | Source-of-truth workflow | Definitions, glossary, topics, and dashboard changes become PR work. | Built and smoke-covered; first live change request pending |
+| 6 | Source-of-truth workflow | Definitions, glossary, topics, and dashboard changes become PR work. | Built, scope-checkable, runner-accessible; first live change request pending |
 | 7 | Self-improvement loop | Repeated questions become promotion candidates. | Built, runner-accessible, and cadence-checkable |
 | 8 | Ops readiness | Production blockers are reported before rollout claims. | Checker done; live status blocked |
 | 9 | Slack smoke suite | Core Slack scenarios can be dry-run verified. | Done |
