@@ -38,9 +38,13 @@ class _Completed:
 class _Ctx:
     def __init__(self):
         self.tools = []
+        self.hooks = {}
 
     def register_tool(self, **kwargs):
         self.tools.append(kwargs)
+
+    def register_hook(self, hook_name, callback):
+        self.hooks.setdefault(hook_name, []).append(callback)
 
 
 def test_tool_schema_tells_model_to_use_answer_question_first():
@@ -62,6 +66,72 @@ def test_tool_schema_tells_model_to_use_answer_question_first():
     assert (
         "use answer_question first"
         in schema["parameters"]["properties"]["mode"]["description"]
+    )
+
+
+def test_elixir_analytics_skill_view_result_is_compacted_for_slack_fast_path():
+    module = _load_plugin_module()
+    ctx = _Ctx()
+
+    module.register(ctx)
+
+    raw_result = json.dumps(
+        {
+            "success": True,
+            "name": "elixir-analytics",
+            "content": "# Elixir Analytics\n" + ("large manual text\n" * 2000),
+            "description": "Answer Elixir analytics questions.",
+            "linked_files": {"references/example.md": "available"},
+            "readiness_status": "available",
+        }
+    )
+
+    hook = ctx.hooks["transform_tool_result"][0]
+    compact_result = hook(
+        tool_name="skill_view",
+        args={"name": "elixir-analytics"},
+        result=raw_result,
+        task_id="",
+        session_id="",
+        tool_call_id="",
+        duration_ms=1,
+    )
+
+    assert compact_result is not None
+    payload = json.loads(compact_result)
+    assert payload["success"] is True
+    assert payload["name"] == "elixir-analytics"
+    assert len(payload["content"]) < 3500
+    assert "large manual text" not in payload["content"]
+    assert "Mandatory Slack Fast Path" in payload["content"]
+    assert "mode='answer_question'" in payload["content"]
+    assert "source_change_plan" in payload["content"]
+    assert "self_improvement_check" in payload["content"]
+    assert payload["linked_files"] == {"references/example.md": "available"}
+
+
+def test_skill_view_compaction_ignores_other_skills_and_linked_files():
+    module = _load_plugin_module()
+
+    assert (
+        module._compact_skill_view_result(
+            {"name": "github"},
+            json.dumps({"success": True, "name": "github", "content": "unchanged"}),
+        )
+        is None
+    )
+    assert (
+        module._compact_skill_view_result(
+            {"name": "elixir-analytics", "file_path": "references/example.md"},
+            json.dumps(
+                {
+                    "success": True,
+                    "name": "elixir-analytics",
+                    "content": "linked file content",
+                }
+            ),
+        )
+        is None
     )
 
 
@@ -154,6 +224,90 @@ def test_answer_question_mode_invokes_shortcut_runner_on_stdin(monkeypatch):
         "25",
     ]
     assert kwargs["input"] == "which users spent on Swiggy this week?"
+
+
+def test_answer_question_mode_returns_compact_slack_handoff(monkeypatch):
+    module = _load_plugin_module()
+    payload = {
+        "ok": True,
+        "route": "supabase_ad_hoc",
+        "shortcut": "swiggy_users_this_week",
+        "payload": {
+            "ok": True,
+            "title": "Users who spent on Swiggy this week",
+            "resultType": "users",
+            "rowCount": 15,
+            "truncated": False,
+            "dashboardUrlPath": "/query?payload=compact",
+            "dashboardUrl": "https://analytics.joinelixir.club/query?payload=compact",
+            "slackText": (
+                "Users who spent on Swiggy this week\n"
+                "Rows: 15\n"
+                + "\n".join(
+                    f"{index}. user_name: User {index}, spend: {index * 100}"
+                    for index in range(1, 80)
+                )
+                + "\nDashboard: https://analytics.joinelixir.club/query?payload=compact"
+            ),
+            "metadata": {
+                "resultType": "users",
+                "sql": "select * from transactions",
+                "assumptions": "This week means India business week-to-date.",
+                "caveats": "Includes successful card spend only.",
+            },
+            "rows": [
+                {
+                    "email": "ada@example.com",
+                    "phone": "+910000000000",
+                    "gross_spend_inr": 420,
+                }
+            ],
+            "logEntry": "## Query #99\nSQL: select * from transactions",
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "which users spent on Swiggy this week?",
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["payload"]["route"] == "supabase_ad_hoc"
+    assert result["hermes_direct_final_response"].startswith(
+        "Users who spent on Swiggy this week"
+    )
+    assert (
+        "Dashboard: https://analytics.joinelixir.club/query?payload=compact"
+        in result["hermes_direct_final_response"]
+    )
+    assert "More rows in the dashboard." in result["hermes_direct_final_response"]
+    assert len(result["hermes_direct_final_response"]) < 5000
+    compact_payload = result["payload"]["payload"]
+    assert compact_payload["slackText"].startswith("Users who spent on Swiggy")
+    assert compact_payload["dashboardUrl"].startswith("https://analytics.joinelixir.club")
+    assert "dashboardUrlPath" not in compact_payload
+    assert compact_payload["rowCount"] == 15
+    assert len(compact_payload["slackText"]) < 2400
+    assert "Dashboard:" not in compact_payload["slackText"]
+    assert "Slack handoff truncated" in compact_payload["slackText"]
+    assert compact_payload["metadata"] == {
+        "resultType": "users",
+        "assumptions": "This week means India business week-to-date.",
+        "caveats": "Includes successful card spend only.",
+    }
+
+    serialized = json.dumps(result, ensure_ascii=False)
+    assert "select * from transactions" not in serialized
+    assert "ada@example.com" not in serialized
+    assert "+910000000000" not in serialized
+    assert "logEntry" not in serialized
 
 
 def test_runner_logs_safe_route_summary_without_rows_or_sql(monkeypatch, caplog):

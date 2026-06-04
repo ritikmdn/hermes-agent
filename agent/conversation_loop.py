@@ -70,6 +70,52 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+_DIRECT_TOOL_FINAL_RESPONSE_KEY = "hermes_direct_final_response"
+_DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS = 20_000
+
+
+def _extract_direct_tool_final_response(messages: list, tool_calls: list) -> str | None:
+    """Return an opt-in final response emitted by a single tool result.
+
+    This is deliberately narrow: the model must have made exactly one tool call,
+    and the most recent tool message must be that call's JSON result containing
+    `hermes_direct_final_response`. It lets deterministic tools return a
+    user-ready answer without paying for an extra model turn.
+    """
+    if len(tool_calls or []) != 1 or not messages:
+        return None
+
+    last_message = messages[-1]
+    if not isinstance(last_message, dict) or last_message.get("role") != "tool":
+        return None
+
+    tool_call = tool_calls[0]
+    if last_message.get("tool_call_id") != getattr(tool_call, "id", None):
+        return None
+
+    content = last_message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    direct_response = payload.get(_DIRECT_TOOL_FINAL_RESPONSE_KEY)
+    if not isinstance(direct_response, str) or not direct_response.strip():
+        return None
+
+    direct_response = direct_response.strip()
+    if len(direct_response) <= _DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS:
+        return direct_response
+    return (
+        direct_response[:_DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS].rstrip()
+        + "\n\n[Direct tool response truncated.]"
+    )
+
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
@@ -3727,6 +3773,16 @@ def run_conversation(
                                 agent.stream_delta_callback(None)
                             except Exception:
                                 pass
+                    break
+
+                direct_final_response = _extract_direct_tool_final_response(
+                    messages,
+                    assistant_message.tool_calls,
+                )
+                if direct_final_response is not None:
+                    _turn_exit_reason = "direct_tool_final_response"
+                    final_response = direct_final_response
+                    messages.append({"role": "assistant", "content": final_response})
                     break
 
                 # Reset per-turn retry counters after successful tool

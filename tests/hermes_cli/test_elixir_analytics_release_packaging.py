@@ -13,8 +13,10 @@ def test_elixir_analytics_release_packaging_classifies_current_lanes():
         [
             "profile-distributions/elixir-analytics/ROADMAP.md",
             "profile-distributions/elixir-analytics/profile_plugins/elixir-analytics-runner/__init__.py",
+            "agent/conversation_loop.py",
             "hermes_cli/plugins.py",
             "toolsets.py",
+            "tests/run_agent/test_run_agent.py",
             "gateway/platforms/slack.py",
             "tests/gateway/test_slack.py",
             ".hermes-bootstrap-complete",

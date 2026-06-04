@@ -20,7 +20,47 @@ MAX_TIMEOUT_SECONDS = 900
 DEFAULT_MAX_ROWS = 500
 DEFAULT_QUESTION_MAX_ROWS = 100
 MAX_ROWS = 5000
+MAX_COMPACT_SLACK_TEXT_CHARS = 2200
+MAX_DIRECT_FINAL_SLACK_TEXT_CHARS = 500
 LOGGER = logging.getLogger("hermes.elixir_analytics_runner")
+COMPACT_ELIXIR_ANALYTICS_SKILL = """# Elixir Analytics Runtime Brief
+
+## Mandatory Slack Fast Path
+
+For every plain Slack analytics data question, call `elixir_analytics_runner`
+with mode='answer_question' and the exact raw Slack question before planning,
+querying manually, inspecting files, or editing source.
+
+If the completed result includes `payload.slackText`, use that text as the
+Slack-facing answer. Add at most one short caveat sentence. Do not expose hidden
+SQL/HogQL, raw rows, or source-maintenance work before replying.
+
+Use `max_rows: 25` for user lists, merchant lists, rankings, and breakdowns
+unless the user explicitly asks for a larger export.
+
+## Routing
+
+- Saved business metrics: prefer `answer_question`; it promotes known topics
+  such as `show GTV last 30 days by week` to saved query dashboards.
+- Supabase business questions: use `answer_question` first, then
+  `supabase_ad_hoc` only if the runner asks for a model-built request.
+- PostHog app questions: use `answer_question` first, then `posthog_ad_hoc`
+  only if needed. Keep app active users separate from card active users unless
+  the user asks to combine definitions.
+- Ambiguous "active users": ask whether the user means card active, app active,
+  or combined active before querying.
+- Definition/glossary/query/dashboard change requests: use
+  `source_change_plan`, then `source_change_scope_check` before committing.
+- Self-improvement reviews: use `self_improvement_check`, then
+  `self_improvement_plan` only when due or explicitly requested.
+
+## Answer Rules
+
+Include rows or a compact summary, date window, freshness, assumptions/caveats,
+and a direct dashboard link when the runner returns one. Never mutate analytics
+source tables. Keep generic Hermes tools available for debugging, source
+changes, repo edits, and runner gaps.
+"""
 
 
 def _json_dumps(payload: dict[str, Any]) -> str:
@@ -158,6 +198,204 @@ def _safe_payload_summary(payload: Any) -> dict[str, Any]:
     }
     summary.update({key: value for key, value in fields.items() if value is not None})
     return summary
+
+
+def _compact_slack_text(text: str, *, limit: int = MAX_COMPACT_SLACK_TEXT_CHARS) -> str:
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().lower().startswith("dashboard:")
+    ]
+    compact_lines: list[str] = []
+    length = 0
+    truncated = False
+    for line in lines:
+        next_length = length + len(line) + (1 if compact_lines else 0)
+        if next_length > limit:
+            truncated = True
+            break
+        compact_lines.append(line)
+        length = next_length
+
+    compact_text = "\n".join(compact_lines).strip()
+    if truncated:
+        compact_text = (
+            f"{compact_text}\n"
+            "Slack handoff truncated; use payload.dashboardUrl for the full visualization."
+        ).strip()
+    return compact_text or text[:limit]
+
+
+def _compact_direct_final_slack_text(
+    text: str,
+    *,
+    limit: int = MAX_DIRECT_FINAL_SLACK_TEXT_CHARS,
+) -> str:
+    lines = [
+        line
+        for line in text.splitlines()
+        if not line.strip().lower().startswith("dashboard:")
+    ]
+    compact_lines: list[str] = []
+    length = 0
+    truncated = False
+    for line in lines:
+        next_length = length + len(line) + (1 if compact_lines else 0)
+        if next_length > limit:
+            truncated = True
+            break
+        compact_lines.append(line)
+        length = next_length
+
+    compact_text = "\n".join(compact_lines).strip()
+    if truncated:
+        suffix = "More rows in the dashboard."
+        suffix_length = len(suffix) + (1 if compact_text else 0)
+        compact_text = compact_text[: max(0, limit - suffix_length)].rstrip()
+        compact_text = f"{compact_text}\n{suffix}".strip()
+    return compact_text or text[:limit].strip()
+
+
+def _compact_answer_question_payload(payload: Any) -> Any:
+    """Keep Slack answer handoff compact without hiding route evidence."""
+    if not isinstance(payload, dict):
+        return payload
+
+    nested_payload = payload.get("payload")
+    answer_payload = nested_payload if isinstance(nested_payload, dict) else payload
+    metadata = answer_payload.get("metadata")
+    safe_metadata_keys = {
+        "interpretedDefinition",
+        "metricIds",
+        "resultType",
+        "sources",
+        "dateWindow",
+        "timezone",
+        "assumptions",
+        "caveats",
+        "freshness",
+        "resultSummary",
+        "friction",
+        "conventionAdded",
+        "repeatPromoteCandidate",
+    }
+
+    compact: dict[str, Any] = {}
+    for key in ("ok", "route", "shortcut", "error", "errorType", "message"):
+        if key in payload:
+            compact[key] = payload[key]
+
+    compact_payload: dict[str, Any] = {}
+    for key in (
+        "ok",
+        "topicId",
+        "title",
+        "kind",
+        "resultType",
+        "requiresClarification",
+        "clarificationQuestion",
+        "rowCount",
+        "truncated",
+        "dryRun",
+        "dashboardUrl",
+        "dateWindow",
+    ):
+        if key in answer_payload:
+            compact_payload[key] = answer_payload[key]
+
+    if "dashboardUrl" not in compact_payload and "dashboardUrlPath" in answer_payload:
+        compact_payload["dashboardUrlPath"] = answer_payload["dashboardUrlPath"]
+
+    slack_text = answer_payload.get("slackText")
+    if isinstance(slack_text, str) and slack_text.strip():
+        compact_payload["slackText"] = _compact_slack_text(slack_text)
+
+    if isinstance(metadata, dict):
+        safe_metadata = {
+            key: value
+            for key, value in metadata.items()
+            if key in safe_metadata_keys and value is not None
+        }
+        if safe_metadata:
+            compact_payload["metadata"] = safe_metadata
+
+    if compact_payload:
+        compact["payload"] = compact_payload
+
+    return compact
+
+
+def _direct_dashboard_link(answer_payload: dict[str, Any]) -> str | None:
+    dashboard_url = answer_payload.get("dashboardUrl")
+    if isinstance(dashboard_url, str) and dashboard_url.strip():
+        return dashboard_url.strip()
+
+    dashboard_path = answer_payload.get("dashboardUrlPath")
+    if isinstance(dashboard_path, str) and dashboard_path.strip():
+        if dashboard_path.startswith("http://") or dashboard_path.startswith("https://"):
+            return dashboard_path.strip()
+        return f"{DEFAULT_ANALYTICS_BASE_URL}{dashboard_path}"
+    return None
+
+
+def _direct_final_response_for_answer_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    nested_payload = payload.get("payload")
+    answer_payload = nested_payload if isinstance(nested_payload, dict) else payload
+    slack_text = answer_payload.get("slackText")
+    if not isinstance(slack_text, str) or not slack_text.strip():
+        clarification = answer_payload.get("clarificationQuestion")
+        if isinstance(clarification, str) and clarification.strip():
+            return clarification.strip()
+        return None
+
+    final_text = _compact_direct_final_slack_text(slack_text)
+    dashboard_link = _direct_dashboard_link(answer_payload)
+    if dashboard_link and "dashboard:" not in final_text.lower():
+        final_text = f"{final_text}\n\nDashboard: {dashboard_link}"
+    return final_text
+
+
+def _is_elixir_analytics_skill_request(args: dict[str, Any]) -> bool:
+    name = str(args.get("name") or "").strip().lower()
+    if str(args.get("file_path") or args.get("filePath") or "").strip():
+        return False
+    return name in {"elixir-analytics", "analytics/elixir-analytics"}
+
+
+def _compact_skill_view_result(args: dict[str, Any], result: str) -> str | None:
+    if not _is_elixir_analytics_skill_request(args):
+        return None
+
+    try:
+        payload = json.loads(result)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict) or payload.get("success") is not True:
+        return None
+
+    result_name = str(payload.get("name") or "").strip().lower()
+    if result_name not in {"elixir-analytics", "analytics/elixir-analytics"}:
+        return None
+
+    compact_payload = dict(payload)
+    compact_payload["content"] = COMPACT_ELIXIR_ANALYTICS_SKILL
+    compact_payload["contentCompacted"] = True
+    return _json_dumps(compact_payload)
+
+
+def _transform_tool_result(
+    *,
+    tool_name: str,
+    args: dict[str, Any],
+    result: str,
+    **_: Any,
+) -> str | None:
+    if tool_name == "skill_view" and isinstance(args, dict) and isinstance(result, str):
+        return _compact_skill_view_result(args, result)
+    return None
 
 
 def _log_runner_result(result: dict[str, Any]) -> None:
@@ -381,6 +619,9 @@ def run_elixir_analytics_runner(args: dict[str, Any]) -> dict[str, Any]:
         return result
 
     payload = _parse_json_stdout(completed.stdout)
+    if completed.returncode == 0 and mode == "answer_question":
+        payload = _compact_answer_question_payload(payload)
+
     if completed.returncode != 0:
         result = {
             "ok": False,
@@ -401,6 +642,10 @@ def run_elixir_analytics_runner(args: dict[str, Any]) -> dict[str, Any]:
         "elapsedSeconds": round(time.monotonic() - started, 3),
         "payload": payload,
     }
+    if mode == "answer_question":
+        direct_final_response = _direct_final_response_for_answer_payload(payload)
+        if direct_final_response:
+            result["hermes_direct_final_response"] = direct_final_response
     _log_runner_result(result)
     return result
 
@@ -410,6 +655,7 @@ def _handler(args: dict[str, Any], **_: Any) -> str:
 
 
 def register(ctx) -> None:
+    ctx.register_hook("transform_tool_result", _transform_tool_result)
     ctx.register_tool(
         name="elixir_analytics_runner",
         toolset=TOOLSET,

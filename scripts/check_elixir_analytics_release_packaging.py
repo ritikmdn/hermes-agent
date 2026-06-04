@@ -37,17 +37,20 @@ PACKAGE_RULES: list[PackageRule] = [
         "id": "hermes-runtime",
         "title": "Hermes Runtime",
         "description": (
-            "Core runtime changes needed to discover profile-owned plugins and "
-            "expose the analytics runner toolset."
+            "Core runtime changes needed to discover profile-owned plugins, "
+            "expose the analytics runner toolset, and support trusted direct "
+            "tool final responses."
         ),
         "matches": lambda path: path
         in {
+            "agent/conversation_loop.py",
             "hermes_cli/plugins.py",
             "hermes_cli/profile_distribution.py",
             "toolsets.py",
             "tests/hermes_cli/test_elixir_analytics_profile_distribution.py",
             "tests/hermes_cli/test_elixir_analytics_runner_plugin.py",
             "tests/hermes_cli/test_elixir_analytics_release_packaging.py",
+            "tests/run_agent/test_run_agent.py",
             "tests/plugins/test_disk_cleanup_plugin.py",
             "tests/test_toolsets.py",
             "scripts/check_elixir_analytics_release_packaging.py",

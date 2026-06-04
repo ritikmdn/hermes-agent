@@ -197,31 +197,21 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
 
     assert "Slack app: macros" in body
     assert "Current Status Snapshot" in body
-    assert "live ops-readiness check can load the installed Hermes profile" in body
-    assert "Current live ops-readiness status is `blocked`" in body
-    assert "ANALYTICS_DATABASE_URL" in body
-    assert "saved-query data unavailable" in body
-    assert "Production Gates" in body
-    assert "Slack E2E Checklist" in body
-    assert "Next Execution Milestone" in body
-    assert "Milestone 11A: finish real Slack E2E acceptance." in body
+    assert "Production dashboard" in body
+    assert "now loads data" in body
+    assert "Fresh Slack Evidence" in body
+    assert "Immediate Goal" in body
+    assert "Milestone 11B: finish fresh Slack acceptance." in body
     assert "show GTV last 30 days by week" in body
     assert "which users spent on Swiggy this week?" in body
-    assert "metadata and dashboard link" in body
-    assert "temporary dashboard link" in body
-    assert "no third-party URL shorteners" in body
-    assert "dashboard link needs fresh verification after Vercel env fix" in body
-    assert "Passed live with direct link; latency failed at 418.3s / 33 calls" in body
-    assert "Passed live at 13.6s / 3 calls" in body
-    assert "Passed live; latency failed at 266.6s / 20 calls" in body
-    assert "Passed live at 40.2s / 2 calls" in body
-    assert "Partially complete on\n2026-06-04" in body
-    assert "Milestone 14A: make Supabase ad hoc answers fast enough for Slack." in body
-    assert "Milestone 14B: make PostHog ad hoc answers fast enough for Slack." in body
+    assert "2 calls, 9.8s" in body
+    assert "2 calls, 30.0s" in body
+    assert "row_cap_truncation" in body
+    assert "runner-first rule" in body
+    assert "Milestone 14E: add deterministic ranking shortcuts." in body
     assert "active users this week" in body
     assert "how many app active users this week?" in body
     assert "delete from profiles" in body
-    assert "ANALYTICS_DATABASE_URL" in body
     assert "--provider-authenticated openai-codex" in body
 
 
