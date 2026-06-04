@@ -309,7 +309,7 @@ private profile distribution.
 
 Current evidence: branch `codex/elixir-analytics-profile` is pushed to the
 `ritikmdn/hermes-agent` fork, dry-merges cleanly into current upstream `main`,
-and focused verification passed 252 Hermes tests plus strict release packaging.
+and focused verification passed 253 Hermes tests plus strict release packaging.
 
 Milestone 14A: compact Slack answer links.
 
@@ -323,5 +323,4 @@ These are not solved by local code alone:
 
 - Choose where the always-on Slack gateway should run after local supervision.
 - Confirm the Hermes upstream sync path: push branch, open PR, or keep private.
-- Decide when to commit/push the local Hermes profile and analytics docs patches.
 - Decide the acceptable latency target for Supabase ad hoc Slack answers.
