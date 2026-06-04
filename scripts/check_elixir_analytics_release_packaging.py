@@ -60,13 +60,16 @@ PACKAGE_RULES: list[PackageRule] = [
         "id": "slack-gateway",
         "title": "Slack Gateway",
         "description": (
-            "Slack Socket Mode recovery logging and tests that prove gateway "
+            "Slack Socket Mode recovery logging, provider-error hygiene, "
+            "clarification prompt telemetry, and tests that prove gateway "
             "health after reconnects."
         ),
         "matches": lambda path: path
         in {
+            "gateway/run.py",
             "gateway/platforms/slack.py",
             "tests/gateway/test_slack.py",
+            "tests/gateway/test_telegram_noise_filter.py",
         },
     },
 ]

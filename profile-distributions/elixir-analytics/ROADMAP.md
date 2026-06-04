@@ -190,11 +190,27 @@ Verified:
   through `answer_question` -> `supabase_ad_hoc`, returned 16 rows, and included
   a TTL-backed `https://analytics.joinelixir.club/query?result=...`
   `Open visualization` link.
+- The live Slack E2E checker now treats delivered Slack clarification prompts as
+  a successful clarification outcome instead of requiring a final text response.
+  A fresh `active users this week` prompt at 2026-06-04 23:32 IST emitted
+  clarify prompt id `29dfa8872d`, and the checker passed all seven acceptance
+  scenarios from the live logs.
+- Signed-in production dashboard verification passed in Chrome for
+  `https://analytics.joinelixir.club/query?topic=card-gtv-weekly&range=30d`:
+  the page rendered Weekly Card GTV, a chart, 5 table rows, query metadata, and
+  no console errors.
+- Signed-in production ad hoc visualization verification passed in Chrome for
+  the latest Swiggy result link
+  `https://analytics.joinelixir.club/query?result=b953063205334f53a765f0a199fe1ac6`:
+  the page rendered the Slack question, 16 user rows, metadata, and no console
+  errors.
+- The live self-improvement pass added references for gym last purchases,
+  marketplace product rankings, and operational health diagnostics; those
+  references and the generic-tool fallback guidance are reconciled into the
+  profile distribution.
 
 Known gaps:
 
-- Signed-in production dashboard rendering needs one fresh user-authenticated
-  browser check. Signed-out callback preservation is verified.
 - The gateway is supervised and Socket Mode connected locally, but the product
   still needs a hosted always-on gateway decision before calling Slack analytics
   fully production-ready.
@@ -214,13 +230,13 @@ Known gaps:
 | 1 | Profile foundation | Slack `macros` uses the isolated analytics profile. | Done |
 | 2 | Saved query vertical slice | Known questions such as weekly GTV use saved topics. | Done |
 | 3 | Supabase ad hoc runner | Arbitrary business analytics questions use a JSON runner. | Done; live Swiggy and top-spenders paths pass |
-| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Done for saved, payload, and TTL result links; signed-in browser proof pending |
+| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Done for saved, payload, and TTL result links; signed-in saved/ad hoc browser proof passed |
 | 5 | PostHog runner | App/product analytics route to read-only HogQL. | Done; live app-active route passes |
 | 6 | Source-of-truth workflow | Definitions, glossary, topics, and dashboard changes become PR work. | Built and smoke-covered; first live change request pending |
 | 7 | Self-improvement loop | Repeated questions become promotion candidates. | Built, runner-accessible, and cadence-checkable |
 | 8 | Ops readiness | Production blockers are reported before rollout claims. | Ready when run with production env pull |
 | 9 | Slack smoke suite | Core Slack scenarios can be dry-run verified. | Done |
-| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | PR #9 merged, Vercel production Ready, readiness ready with production env pull; signed-in browser proof pending |
+| 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | PR #9 merged, Vercel production Ready, readiness ready with production env pull, signed-in dashboard proof passed |
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Passed via live logs after PR #6 |
 | 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
 | 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Branch pushed/tested; public upstream PR decision pending |
@@ -246,6 +262,8 @@ Do not call the agent or dashboard production-ready until all gates pass:
    PostHog, clarification, and write-SQL rejection.
 10. Provider failures in Slack are concise and user-safe, without retry spam or
     raw HTTP/provider error bodies.
+11. Signed-in production `/query` pages render saved-topic and temporary ad hoc
+    result data with no console errors.
 
 ## Packaging Plan
 

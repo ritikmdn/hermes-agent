@@ -36,8 +36,9 @@ to work without hardcoding analytics logic into generic gateway code.
 Includes Slack transport health changes:
 
 - Slack Socket Mode reconnect/recovery logging
+- Slack clarification prompt telemetry and provider-error hygiene
 - tests that prove the gateway logs a recovered connection after transport
-  self-healing
+  self-healing and suppresses noisy provider retry messages
 
 This package can ship with runtime changes, but it should remain reviewable as
 gateway reliability work rather than analytics prompt behavior.

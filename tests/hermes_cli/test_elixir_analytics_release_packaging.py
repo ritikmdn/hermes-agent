@@ -17,8 +17,10 @@ def test_elixir_analytics_release_packaging_classifies_current_lanes():
             "hermes_cli/plugins.py",
             "toolsets.py",
             "tests/run_agent/test_run_agent.py",
+            "gateway/run.py",
             "gateway/platforms/slack.py",
             "tests/gateway/test_slack.py",
+            "tests/gateway/test_telegram_noise_filter.py",
             ".hermes-bootstrap-complete",
         ]
     )

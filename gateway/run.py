@@ -13926,6 +13926,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _clarify_mod.clear_session(session_key or "")
                     return "[clarify prompt could not be delivered]"
 
+                logger.info(
+                    "Gateway sent clarify prompt (session=%s, id=%s)",
+                    session_key or "",
+                    clarify_id,
+                )
                 timeout = _clarify_mod.get_clarify_timeout()
                 response = _clarify_mod.wait_for_response(clarify_id, timeout=float(timeout))
                 if response is None or response == "":

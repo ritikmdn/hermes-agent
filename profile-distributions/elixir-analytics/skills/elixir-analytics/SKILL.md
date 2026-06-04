@@ -5,6 +5,11 @@ description: Answer Elixir analytics questions.
 
 # Elixir Analytics
 
+Support files:
+- `references/gym-last-purchases.md` — SQL shape and metadata for “who bought the last N gyms?” active gym milestone purchase questions.
+- `references/marketplace-product-rankings.md` — partner-specific `marketplace_order.order_details` extraction for top marketplace product/item rankings.
+- `references/operational-health-diagnostics.md` — diagnostic patterns for “is X broken?” flow-health questions such as card creation/onboarding.
+
 Use this skill for Elixir analytics questions, especially Slack questions
 about GTV, GMV, wallet loads, rewards, active users, marketplace usage, gym
 benefits, metric definitions, dashboard numbers, ad hoc SQL, temporary
@@ -196,6 +201,9 @@ Use the planner output as the routing contract:
 - `saved_topic`: run `recommendedCommand`.
 - `supabase_ad_hoc`: build an `AdHocQueryRequest` and run
   `scripts/run-ad-hoc-query.ts`.
+- `generic_tools`: inspect the source-of-truth schema/glossary only as much as
+  needed, then prefer the same `supabase_ad_hoc` runner with a complete
+  `AdHocQueryRequest` rather than replying from manual SQL/tool output.
 - `posthog_ad_hoc`: build a `PostHogQueryRequest` and run
   `scripts/run-posthog-query.ts`.
 - `combined_sources`: run Supabase and PostHog separately, then combine only
@@ -228,7 +236,17 @@ rows, date window, caveats, freshness, and the link.
 
 For arbitrary Supabase analytics questions, use the broad ad hoc runner instead
 of one-off Python date math or temporary query scripts. Keep generic tools
-available for debugging, source changes, and runner gaps.
+available for debugging, source changes, and runner gaps. When a plain Slack
+question falls through to `generic_tools`, the generic-tool step should be
+bounded and must ultimately feed a deterministic runner-backed answer with rows,
+metadata, and a dashboard link.
+
+Marketplace product/item ranking questions are a common ad hoc case. Use
+`references/marketplace-product-rankings.md` for the partner-specific
+`marketplace_order.order_details` extraction pattern; rank by units bought by
+default, include orders and gross GMV, and explicitly caveat that product names
+come from partner JSON payloads and refunds are not netted unless status moved
+out of `SUCCESS`/`CONFIRMED`.
 
 Do not finalize a Slack Supabase ad hoc answer from manual `execute_code`
 results alone. The final Slack response must include the runner's structured
