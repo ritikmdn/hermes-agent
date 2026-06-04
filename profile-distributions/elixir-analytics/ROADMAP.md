@@ -33,7 +33,7 @@ Verified:
   `codex/mock-single-dashboard`, not `main`, and deployed reads are missing
   `ANALYTICS_DATABASE_URL`.
 - Latest local verification is green: `npm run lint` has no warnings,
-  `npm test` passed 213 analytics tests, `npm run build` passed, strict
+  `npm test` passed 214 analytics tests, `npm run build` passed, strict
   analytics release packaging passed, the analytics smoke suite passed, and
   focused Hermes profile/plugin/toolset tests passed 55 tests with one
   external dependency warning.
@@ -47,6 +47,11 @@ Verified:
   `Socket Mode connected (recovered)` after a transport-drop self-heal, so
   log-based readiness can distinguish a recovered gateway from a stuck
   reconnecting one.
+- The analytics ops-readiness detector now treats a later
+  `Socket Mode connected (recovered)` event as healthy even if the same gateway
+  run had an earlier transient transport disconnect; the live readiness check is
+  back to two blockers only: branch not `main` and missing deployed
+  `ANALYTICS_DATABASE_URL`.
 - Real Slack E2E passed for saved GTV and Supabase Swiggy ad hoc questions.
 - The fresh Swiggy recheck used a direct `analytics.joinelixir.club/query?...`
   dashboard link, not a third-party shortener.
@@ -144,7 +149,7 @@ Verified:
   latest Hermes delta classifies cleanly into `profile-distribution` and
   `hermes-runtime`, with `.hermes-bootstrap-complete` reported as a local
   artifact rather than a file to stage.
-- Analytics commits through `664fa8f` are pushed to
+- Analytics commits through `3d60289` are pushed to
   `origin/codex/mock-single-dashboard`, and draft PR
   `ritikmdn/analytics-agent#4` is open against `main`.
 - Hermes commits through `8c147eab5` are pushed to the `ritikmdn/hermes-agent`
