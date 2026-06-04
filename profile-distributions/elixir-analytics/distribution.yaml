@@ -40,5 +40,7 @@ distribution_owned:
   - config.yaml
   - skills
   - profile_plugins
+  - HOSTED_GATEWAY.md
+  - deploy
   - distribution.yaml
   - README.md

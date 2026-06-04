@@ -24,8 +24,10 @@ def test_elixir_analytics_distribution_manifest_is_installable():
     assert "SOUL.md" in manifest.owned_paths()
     assert "ROADMAP.md" in manifest.owned_paths()
     assert "RELEASE_PACKAGING.md" in manifest.owned_paths()
+    assert "HOSTED_GATEWAY.md" in manifest.owned_paths()
     assert "config.yaml" in manifest.owned_paths()
     assert "profile_plugins" in manifest.owned_paths()
+    assert "deploy" in manifest.owned_paths()
 
     required_env = {req.name for req in manifest.env_requires if req.required}
     assert {"SLACK_APP_TOKEN", "SLACK_BOT_TOKEN"}.issubset(required_env)
@@ -220,15 +222,32 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
 def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
     readme = (DIST_DIR / "README.md").read_text(encoding="utf-8")
     body = (DIST_DIR / "HOSTED_GATEWAY.md").read_text(encoding="utf-8")
+    compose = (DIST_DIR / "deploy" / "docker-compose.gateway.yml").read_text(encoding="utf-8")
+    compose_env = (DIST_DIR / "deploy" / ".env.hosted-gateway.example").read_text(encoding="utf-8")
+    systemd_unit = (
+        DIST_DIR / "deploy" / "systemd" / "hermes-elixir-analytics-gateway.service"
+    ).read_text(encoding="utf-8")
+    systemd_env = (
+        DIST_DIR / "deploy" / "systemd" / "elixir-analytics-gateway.env.example"
+    ).read_text(encoding="utf-8")
 
     assert "HOSTED_GATEWAY.md" in readme
+    assert "deploy/` directory includes Docker Compose and systemd" in readme
     assert "Slack `macros` independent of the\nlocal laptop" in body
     assert "hermes -p elixir-analytics gateway run" in body
+    assert "deploy/docker-compose.gateway.yml" in body
+    assert "deploy/systemd/hermes-elixir-analytics-gateway.service" in body
     assert "SLACK_APP_TOKEN" in body
     assert "SLACK_BOT_TOKEN" in body
     assert "ANALYTICS_DATABASE_URL" in body
     assert "Socket Mode connected" in body
     assert "Do not leave hosted and local gateways connected" in body
+    assert 'command: ["--profile", "elixir-analytics", "gateway", "run"]' in compose
+    assert "Socket Mode connected" in compose
+    assert "SLACK_APP_TOKEN=" in compose_env
+    assert "ExecStart=/srv/hermes-agent/venv/bin/python -m hermes_cli.main --profile elixir-analytics gateway run" in systemd_unit
+    assert "Restart=on-failure" in systemd_unit
+    assert "HERMES_HOME=/var/lib/hermes" in systemd_env
 
 
 def test_elixir_analytics_soul_requires_dashboard_links_for_data_answers():

@@ -76,6 +76,68 @@ hermes profile install ./profile-distributions/elixir-analytics --name elixir-an
 Then copy only the required profile secrets into the installed profile `.env`.
 Do not copy default-profile Slack tokens into this profile.
 
+## Deployment Templates
+
+This distribution ships two deployable templates:
+
+- `deploy/docker-compose.gateway.yml` for a container host
+- `deploy/systemd/hermes-elixir-analytics-gateway.service` for a plain Linux VM
+
+Both templates run the same profile command and keep the `macros` Slack tokens
+scoped to the `elixir-analytics` profile.
+
+### Docker Compose Host
+
+From the Hermes repo root:
+
+```bash
+cp profile-distributions/elixir-analytics/deploy/.env.hosted-gateway.example .env.hosted-gateway
+$EDITOR .env.hosted-gateway
+docker compose -f profile-distributions/elixir-analytics/deploy/docker-compose.gateway.yml \
+  --env-file .env.hosted-gateway \
+  run --rm gateway profile install /opt/hermes/profile-distributions/elixir-analytics --name elixir-analytics
+docker compose -f profile-distributions/elixir-analytics/deploy/docker-compose.gateway.yml \
+  --env-file .env.hosted-gateway \
+  up -d --build
+```
+
+Useful checks:
+
+```bash
+docker compose -f profile-distributions/elixir-analytics/deploy/docker-compose.gateway.yml ps
+docker logs hermes-elixir-analytics-gateway --tail 200
+```
+
+### Systemd Host
+
+Expected host layout:
+
+```text
+/srv/hermes-agent
+/var/lib/hermes
+/etc/hermes/elixir-analytics-gateway.env
+```
+
+Install the profile and service:
+
+```bash
+sudo install -d -o hermes -g hermes /var/lib/hermes
+sudo install -d -o root -g root /etc/hermes
+sudo cp profile-distributions/elixir-analytics/deploy/systemd/elixir-analytics-gateway.env.example /etc/hermes/elixir-analytics-gateway.env
+sudo chmod 600 /etc/hermes/elixir-analytics-gateway.env
+sudo -u hermes HERMES_HOME=/var/lib/hermes /srv/hermes-agent/venv/bin/python -m hermes_cli.main profile install /srv/hermes-agent/profile-distributions/elixir-analytics --name elixir-analytics
+sudo cp profile-distributions/elixir-analytics/deploy/systemd/hermes-elixir-analytics-gateway.service /etc/systemd/system/hermes-elixir-analytics-gateway.service
+sudo systemctl daemon-reload
+sudo systemctl enable --now hermes-elixir-analytics-gateway
+```
+
+Useful checks:
+
+```bash
+systemctl status hermes-elixir-analytics-gateway
+journalctl -u hermes-elixir-analytics-gateway -n 200 --no-pager
+```
+
 ## Process Supervision
 
 The supervisor should:
@@ -152,4 +214,3 @@ Milestone 12A is done when:
 - hosted logs are accessible for Slack E2E verification
 - rollback to the local launchd gateway is documented and tested
 - ops readiness can be run with explicit hosted gateway evidence
-

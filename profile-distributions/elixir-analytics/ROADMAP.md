@@ -299,7 +299,8 @@ path.
 
 Use `HOSTED_GATEWAY.md` as the cutover runbook. The remaining product decision
 is the host itself; the required process shape, secrets, health checks, smoke
-prompts, and rollback steps are documented there.
+prompts, rollback steps, Docker Compose template, and systemd unit are
+documented there.
 
 Milestone 13A: choose Hermes upstream/private sync path.
 

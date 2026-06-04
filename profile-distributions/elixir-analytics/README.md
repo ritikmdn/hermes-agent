@@ -35,4 +35,5 @@ remaining external blockers, and the Slack E2E prompts that must pass before
 calling the analytics agent production-ready.
 
 Use `HOSTED_GATEWAY.md` for the always-on Slack gateway cutover runbook once a
-host is chosen.
+host is chosen. The `deploy/` directory includes Docker Compose and systemd
+templates for the hosted `macros` gateway.
