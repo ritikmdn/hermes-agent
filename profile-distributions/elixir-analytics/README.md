@@ -34,6 +34,10 @@ checklist for this profile. It tracks local implementation milestones,
 remaining external blockers, and the Slack E2E prompts that must pass before
 calling the analytics agent production-ready.
 
+Use `INTERNAL_LAUNCH_RUNBOOK.md` for the v1 internal-team launch on the current
+local `launchd` gateway. It documents health checks, Slack acceptance prompts,
+dashboard checks, restart steps, and known incident responses.
+
 Use `HOSTED_GATEWAY.md` for the always-on Slack gateway cutover runbook once a
 host is chosen. The `deploy/` directory includes Docker Compose and systemd
 templates for the hosted `macros` gateway.

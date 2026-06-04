@@ -209,16 +209,17 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
     assert "HTTP 429 usage-limit" in body
     assert "ops-readiness status from analytics `main` is `ready`" in body
     assert 'overallStatus: "ready"' in body
-    assert "signed-in browser proof pending" in body
+    assert "signed-in dashboard proof passed" in body
+    assert "INTERNAL_LAUNCH_RUNBOOK.md" in body
     assert "Slack E2E Checklist" in body
-    assert "Milestone 10A: finish production dashboard signed-in proof." in body
+    assert "Milestone 12A: operate internal-team launch v1." in body
     assert "show GTV last 30 days by week" in body
     assert "which users spent on Swiggy this week?" in body
     assert "top_card_spenders_30d" in body
     assert "2 API calls, 15 rows" in body
     assert "2 API calls, dashboard link present" in body
     assert "row_cap_truncation" in body
-    assert "Milestone 12A: choose and implement hosted gateway." in body
+    assert "Milestone 12B: choose and implement hosted gateway." in body
     assert "Milestone 13A: choose Hermes upstream/private sync path." in body
     assert "Milestone 14A: compact Slack answer links." in body
     assert "active users this week" in body
@@ -229,6 +230,7 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
 
 def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
     readme = (DIST_DIR / "README.md").read_text(encoding="utf-8")
+    internal = (DIST_DIR / "INTERNAL_LAUNCH_RUNBOOK.md").read_text(encoding="utf-8")
     body = (DIST_DIR / "HOSTED_GATEWAY.md").read_text(encoding="utf-8")
     compose = (DIST_DIR / "deploy" / "docker-compose.gateway.yml").read_text(encoding="utf-8")
     compose_env = (DIST_DIR / "deploy" / ".env.hosted-gateway.example").read_text(encoding="utf-8")
@@ -239,6 +241,11 @@ def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
         DIST_DIR / "deploy" / "systemd" / "elixir-analytics-gateway.env.example"
     ).read_text(encoding="utf-8")
 
+    assert "INTERNAL_LAUNCH_RUNBOOK.md" in readme
+    assert "ai.hermes.gateway-elixir-analytics" in internal
+    assert "launchctl print gui/501/ai.hermes.gateway-elixir-analytics" in internal
+    assert "scripts/check-slack-e2e-logs.ts" in internal
+    assert "Internal launch is ready when" in internal
     assert "HOSTED_GATEWAY.md" in readme
     assert "deploy/` directory includes Docker Compose and systemd" in readme
     assert "Slack `macros` independent of the\nlocal laptop" in body

@@ -211,9 +211,10 @@ Verified:
 
 Known gaps:
 
-- The gateway is supervised and Socket Mode connected locally, but the product
-  still needs a hosted always-on gateway decision before calling Slack analytics
-  fully production-ready.
+- The gateway is supervised and Socket Mode connected locally, and the
+  internal-team launch runbook now documents how to operate that v1 pilot. The
+  product still needs a hosted always-on gateway decision before calling Slack
+  analytics laptop-independent production.
 - Hermes profile distribution branch `codex/elixir-analytics-profile` is pushed
   to `ritikmdn/hermes-agent`, dry-merges cleanly into current
   `NousResearch/hermes-agent` `main`, and focused Hermes verification passes
@@ -238,7 +239,8 @@ Known gaps:
 | 9 | Slack smoke suite | Core Slack scenarios can be dry-run verified. | Done |
 | 10 | Production deploy | Analytics branch is merged, deployed, and env-backed. | PR #9 merged, Vercel production Ready, readiness ready with production env pull, signed-in dashboard proof passed |
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Passed via live logs after PR #6 |
-| 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
+| 12 | Internal launch ops | The team can run a v1 Slack pilot on the supervised local gateway. | Done; `INTERNAL_LAUNCH_RUNBOOK.md` added |
+| 12B | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Templates/runbook done; host decision pending |
 | 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Branch pushed/tested; public upstream PR decision pending |
 | 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, links, and clean provider-failure messages. | PR #9 short links merged/deployed; Slack 429 hygiene tested; post-restart saved-GTV Slack smoke passes |
 | 15 | Operating cadence | Self-improvement review runs on a regular query-log cadence. | Checker built; scheduled/live usage pending |
@@ -264,6 +266,10 @@ Do not call the agent or dashboard production-ready until all gates pass:
     raw HTTP/provider error bodies.
 11. Signed-in production `/query` pages render saved-topic and temporary ad hoc
     result data with no console errors.
+
+For internal-team v1 launch, the current local `launchd` gateway is acceptable
+when `INTERNAL_LAUNCH_RUNBOOK.md` checks pass. For laptop-independent
+production, complete the `HOSTED_GATEWAY.md` cutover.
 
 ## Packaging Plan
 
@@ -311,7 +317,7 @@ npm run lint
 npm test
 npm run build
 node --import tsx scripts/run-analytics-smoke-suite.ts --query-log QUERY_LOG.md --current-branch '<branch>' --env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env --provider-authenticated openai-codex --smart-approvals --generic-tools
-node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --profile-home /Users/ritik/.hermes/profiles/elixir-analytics --provider-authenticated openai-codex --smart-approvals --generic-tools
+node --import tsx scripts/check-ops-readiness.ts --current-branch '<branch>' --profile-home /Users/ritik/.hermes/profiles/elixir-analytics --env-file .env.production.local --provider-authenticated openai-codex --smart-approvals --generic-tools
 ```
 
 Run this from the Hermes repo after profile changes:
@@ -336,22 +342,23 @@ Verify these exact prompts in Slack:
 
 ## Next Execution Milestone
 
-Milestone 10A: finish production dashboard signed-in proof.
+Milestone 12A: operate internal-team launch v1.
 
-Done means the production saved-topic link opens with non-empty data after
-sign-in from an authenticated browser session. Env/readiness reconciliation is
-already complete.
+Done means Slack `macros` can be used by the internal team while the local
+launchd-managed `elixir-analytics` gateway is online. The local service state,
+ops readiness, live Slack E2E logs, signed-in dashboard checks, restart steps,
+and incident responses are documented in `INTERNAL_LAUNCH_RUNBOOK.md`.
 
 Execution order:
 
-1. Use an authenticated browser profile or ask the user to sign in through the
-   controlled Chrome profile.
-2. Recheck `https://analytics.joinelixir.club/query?topic=card-gtv-weekly&range=30d`
-   and confirm rows render.
-3. Record whether the page shows `Weekly GTV`, row count/table data, and zero
-   console errors.
+1. Keep the local `ai.hermes.gateway-elixir-analytics` launchd service running.
+2. Run the pre-launch checks from `INTERNAL_LAUNCH_RUNBOOK.md`.
+3. Share the Slack acceptance prompts with the first internal users.
+4. Monitor `gateway.log`, `agent.log`, and `QUERY_LOG.md` during the pilot.
+5. Treat provider 429s, expired temporary visualization links, and laptop sleep
+   as known v1 operational risks.
 
-Milestone 12A: choose and implement hosted gateway.
+Milestone 12B: choose and implement hosted gateway.
 
 Done means Slack `macros` does not depend on the laptop: the gateway has an
 always-on host, restart policy, health check, log access, and documented rollback
@@ -384,13 +391,13 @@ to production at
 `https://analytics.joinelixir.club`. Saved dashboard URLs format as `Open
 dashboard`; temporary payload and result URLs format as `Open visualization` in
 Slack-facing text. Verification passed focused visualization tests, the full
-228-test analytics suite, lint, Next.js build, strict release packaging, smoke
+230-test analytics suite, lint, Next.js build, strict release packaging, smoke
 suite, production-env ops readiness, Vercel production inspection, a synthetic
 Upstash write/read probe, and a live local Swiggy runner smoke with
 `/query?result=...`.
 
-Remaining work: rerun one live Slack answer check after the profile inference
-provider is out of HTTP 429 usage-limit state.
+Current live evidence now also includes signed-in Chrome verification for saved
+weekly GTV and the latest Swiggy result link.
 
 ## Current Open Decisions
 
@@ -399,3 +406,5 @@ These are not solved by local code alone:
 - Choose where the always-on Slack gateway should run after local supervision.
 - Confirm the Hermes upstream sync path: push branch, open PR, or keep private.
 - Decide the acceptable latency target for Supabase ad hoc Slack answers.
+- Re-authenticate `gh` locally before doing more GitHub CLI work; `gh auth
+  status` currently reports an invalid token.

@@ -37,6 +37,7 @@ distribution_owned:
   - SOUL.md
   - ROADMAP.md
   - RELEASE_PACKAGING.md
+  - INTERNAL_LAUNCH_RUNBOOK.md
   - config.yaml
   - skills
   - profile_plugins
