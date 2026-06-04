@@ -198,17 +198,19 @@ def test_elixir_analytics_distribution_ships_product_roadmap():
     assert "Slack app: macros" in body
     assert "Current Status Snapshot" in body
     assert "Production dashboard" in body
-    assert "now loads data" in body
-    assert "Fresh Slack Evidence" in body
-    assert "Immediate Goal" in body
-    assert "Milestone 11B: finish fresh Slack acceptance." in body
+    assert "Analytics PR #6" in body
+    assert "ops-readiness status from analytics `main` is `ready`" in body
+    assert "signed-in browser proof pending" in body
+    assert "Slack E2E Checklist" in body
+    assert "Milestone 10A: finish production dashboard signed-in proof." in body
     assert "show GTV last 30 days by week" in body
     assert "which users spent on Swiggy this week?" in body
-    assert "2 calls, 9.8s" in body
-    assert "2 calls, 30.0s" in body
+    assert "top_card_spenders_30d" in body
+    assert "2 API calls, 15 rows" in body
+    assert "2 API calls, dashboard link present" in body
     assert "row_cap_truncation" in body
-    assert "runner-first rule" in body
-    assert "Milestone 14E: add deterministic ranking shortcuts." in body
+    assert "Milestone 12A: choose and implement hosted gateway." in body
+    assert "Milestone 13A: choose Hermes upstream/private sync path." in body
     assert "active users this week" in body
     assert "how many app active users this week?" in body
     assert "delete from profiles" in body

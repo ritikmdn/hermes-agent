@@ -18,9 +18,16 @@ For every plain Slack data question, the first tool call must be
 Slack question. Do not plan, inspect files, write SQL, run `execute_code`, edit
 the repo, or expand the question before this first call.
 
-Use `max_rows: 25` for user lists, merchant lists, rankings, breakdowns, or
-other row/table answers unless the user explicitly asks for a larger export.
-The shortcut runner handles promoted saved topics and common Supabase/PostHog
+Use `max_rows: 25` for user lists, merchant lists, rankings, and breakdowns
+unless the user explicitly asks for a larger export.
+
+For Slack-facing ranked user answers, keep the visualization payload compact and
+non-sensitive so a dashboard link can be generated: omit phone/mobile/email/raw
+IDs unless explicitly requested, and prefer top 10–25 rows with fields such as
+rank, display name, segment/program, amount, and count. If an ad hoc run returns
+rows but no `dashboardUrl`/`dashboardUrlPath`, rerun with a compact projection
+rather than finalizing without a link.
+
 questions. Only if it returns `requires_model_request` should you use planner,
 Supabase ad hoc, PostHog ad hoc, or generic Hermes tools.
 
