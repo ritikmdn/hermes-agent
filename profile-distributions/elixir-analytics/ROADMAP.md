@@ -33,9 +33,10 @@ Verified:
   `codex/mock-single-dashboard`, not `main`, and deployed reads are missing
   `ANALYTICS_DATABASE_URL`.
 - Latest local verification is green: `npm run lint` has no warnings,
-  `npm test` passed 210 analytics tests, `npm run build` passed, and focused
-  Hermes profile/plugin/toolset tests passed 55 tests with one external
-  dependency warning.
+  `npm test` passed 213 analytics tests, `npm run build` passed, strict
+  analytics release packaging passed, the analytics smoke suite passed, and
+  focused Hermes profile/plugin/toolset tests passed 55 tests with one
+  external dependency warning.
 - `/query` now distinguishes an unknown saved topic from a known saved topic
   whose database execution fails, so a missing Vercel database env shows as
   saved-query data unavailable rather than an ambiguous empty visualization.
@@ -129,11 +130,15 @@ Verified:
 - Temporary visualization payloads now strip both Supabase SQL and PostHog
   HogQL before encoding `/query?payload=...`, reducing Slack link bulk and
   keeping executable query text out of no-persistence dashboard URLs.
+- Oversized temporary visualization payloads now compact before falling back to
+  no-link answers: rows are bounded, long text is trimmed, sensitive fields are
+  dropped, metadata is shortened, and pathological payloads still refuse to
+  emit a dashboard link.
 - The analytics repo now has `scripts/check-release-packaging.ts` and
   `docs/release-packaging.md`. The current dirty analytics worktree classifies
-  cleanly into `analytics-runtime`, `executive-dashboard`, and `release-docs`
-  with no unclassified files, so runtime and dashboard changes can be packaged
-  separately instead of merged as one broad release.
+  cleanly into `analytics-runtime` and `release-docs` with no unclassified
+  files, so runtime and docs changes can be packaged without dragging in
+  unrelated dashboard work.
 - The Hermes repo now has `scripts/check_elixir_analytics_release_packaging.py`
   and `profile-distributions/elixir-analytics/RELEASE_PACKAGING.md`. The
   latest Hermes delta classifies cleanly into `profile-distribution` and
@@ -162,9 +167,8 @@ Known gaps:
   the `answer_question` fast-path sync to prove the model chooses the shortcut
   tool and meets the latency target.
 - A local Hermes one-shot answered Swiggy correctly after the sync, but still
-  took about 64 seconds end-to-end and produced a verbose direct payload URL.
-  If Slack shows the same behavior, the next polish step is a stronger
-  Slack-specific answer formatter or payload compaction.
+  took about 64 seconds end-to-end. If Slack shows the same behavior, the next
+  polish step is a stronger Slack-specific fast-path or answer formatter.
 
 ## Milestones
 
@@ -173,7 +177,7 @@ Known gaps:
 | 1 | Profile foundation | Slack `macros` uses the isolated analytics profile. | Done |
 | 2 | Saved query vertical slice | Known questions such as weekly GTV use saved topics. | Done |
 | 3 | Supabase ad hoc runner | Arbitrary business analytics questions use a JSON runner. | Done; fast-path polish pending |
-| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Direct-link passed locally/live once; production env recheck pending |
+| 4 | Temporary visualization handoff | Arbitrary results can link to a no-persistence visual. | Built with SQL/HogQL stripping and compact payload fallback; production env recheck pending |
 | 5 | PostHog runner | App/product analytics route to read-only HogQL. | Passed live; fast-path polish pending |
 | 6 | Source-of-truth workflow | Definitions, glossary, topics, and dashboard changes become PR work. | Built, scope-checkable, runner-accessible; first live change request pending |
 | 7 | Self-improvement loop | Repeated questions become promotion candidates. | Built, runner-accessible, and cadence-checkable |
@@ -183,7 +187,7 @@ Known gaps:
 | 11 | Slack end-to-end validation | Real Slack prompts prove saved, ad hoc, PostHog, clarification, and rejection flows. | Functional history exists; fresh post-fix pass pending |
 | 12 | Hosted gateway | The Slack gateway is restart-safe beyond the local machine. | Local supervised; host decision pending |
 | 13 | Hermes upstream sync | The profile distribution is pushed or PR'd upstream. | Pending GitHub permission |
-| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | `payload.slackText` built/tested; live Slack latency recheck pending |
+| 14 | Answer polish | Slack responses consistently include rows, assumptions, caveats, timings, and links. | `payload.slackText` and compact visualization links built/tested; live Slack latency recheck pending |
 | 15 | Operating cadence | Self-improvement review runs on a regular query-log cadence. | Checker built; scheduled/live usage pending |
 
 ## Production Gates
