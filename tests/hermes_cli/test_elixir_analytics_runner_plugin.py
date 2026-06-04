@@ -284,8 +284,13 @@ def test_answer_question_mode_returns_compact_slack_handoff(monkeypatch):
         "Users who spent on Swiggy this week"
     )
     assert (
-        "Dashboard: https://analytics.joinelixir.club/query?payload=compact"
+        "Dashboard: <https://analytics.joinelixir.club/query?payload=compact|"
+        "Open visualization>"
         in result["hermes_direct_final_response"]
+    )
+    assert (
+        "Dashboard: https://analytics.joinelixir.club/query?payload=compact"
+        not in result["hermes_direct_final_response"]
     )
     assert "More rows in the dashboard." in result["hermes_direct_final_response"]
     assert len(result["hermes_direct_final_response"]) < 5000
@@ -308,6 +313,57 @@ def test_answer_question_mode_returns_compact_slack_handoff(monkeypatch):
     assert "ada@example.com" not in serialized
     assert "+910000000000" not in serialized
     assert "logEntry" not in serialized
+
+
+def test_answer_question_mode_labels_saved_topic_dashboard_links(monkeypatch):
+    module = _load_plugin_module()
+    payload = {
+        "ok": True,
+        "route": "saved_topic",
+        "shortcut": "card_gtv_weekly_30d",
+        "payload": {
+            "ok": True,
+            "topicId": "card-gtv-weekly",
+            "title": "Weekly Card GTV",
+            "rowCount": 5,
+            "dashboardUrlPath": "/query?topic=card-gtv-weekly&range=30d",
+            "dashboardUrl": (
+                "https://analytics.joinelixir.club/query?"
+                "topic=card-gtv-weekly&range=30d"
+            ),
+            "slackText": (
+                "Weekly Card GTV\n"
+                "Rows: 5\n"
+                "1. week_start: 2026-05-04, gtv: 557638.14\n"
+                "Dashboard: <https://analytics.joinelixir.club/query?"
+                "topic=card-gtv-weekly&range=30d|Open dashboard>"
+            ),
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "show GTV last 30 days by week",
+        }
+    )
+
+    assert result["ok"] is True
+    assert (
+        "Dashboard: <https://analytics.joinelixir.club/query?"
+        "topic=card-gtv-weekly&range=30d|Open dashboard>"
+        in result["hermes_direct_final_response"]
+    )
+    assert (
+        "Dashboard: https://analytics.joinelixir.club/query?"
+        "topic=card-gtv-weekly&range=30d"
+        not in result["hermes_direct_final_response"]
+    )
 
 
 def test_runner_logs_safe_route_summary_without_rows_or_sql(monkeypatch, caplog):

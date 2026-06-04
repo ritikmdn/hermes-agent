@@ -338,6 +338,15 @@ def _direct_dashboard_link(answer_payload: dict[str, Any]) -> str | None:
     return None
 
 
+def _slack_dashboard_link(answer_payload: dict[str, Any]) -> str | None:
+    dashboard_link = _direct_dashboard_link(answer_payload)
+    if not dashboard_link:
+        return None
+
+    label = "Open visualization" if "payload=" in dashboard_link else "Open dashboard"
+    return f"<{dashboard_link}|{label}>"
+
+
 def _direct_final_response_for_answer_payload(payload: Any) -> str | None:
     if not isinstance(payload, dict):
         return None
@@ -352,7 +361,7 @@ def _direct_final_response_for_answer_payload(payload: Any) -> str | None:
         return None
 
     final_text = _compact_direct_final_slack_text(slack_text)
-    dashboard_link = _direct_dashboard_link(answer_payload)
+    dashboard_link = _slack_dashboard_link(answer_payload)
     if dashboard_link and "dashboard:" not in final_text.lower():
         final_text = f"{final_text}\n\nDashboard: {dashboard_link}"
     return final_text
