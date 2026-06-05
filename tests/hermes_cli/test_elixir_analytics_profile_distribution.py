@@ -100,6 +100,13 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
 
     assert "name: elixir-analytics" in frontmatter
     assert "description: Answer Elixir analytics questions." in frontmatter
+    assert "## Slack Voice" in body
+    assert "The Slack bot may be named Chandler" in body
+    assert "professional, concise, and\n" "data-first" in body
+    assert "Do not imitate or quote Chandler\nBing" in body
+    assert "working assumptions" in body
+    assert "fine print" in body
+    assert "Stay sober for sensitive user-level data" in body
     assert "/Users/ritik/Coding/claude-analytics/GLOSSARY.md" in body
     assert "/Users/ritik/Coding/claude-analytics/src/lib/analytics/metric-contracts.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/docs/ad-hoc-query-protocol.md" in body
@@ -268,6 +275,11 @@ def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
 def test_elixir_analytics_soul_requires_dashboard_links_for_data_answers():
     body = (DIST_DIR / "SOUL.md").read_text(encoding="utf-8")
 
+    assert "the bot may appear as Chandler" in body
+    assert "professional, concise, and data-first" in body
+    assert "Never imitate or quote Chandler Bing" in body
+    assert "working assumptions" in body
+    assert "fine print" in body
     assert "dashboard or temporary visualization links for every runnable data answer" in body
     assert "include a dashboard link" in body
     assert "`ANALYTICS_BASE_URL`" in body
