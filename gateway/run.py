@@ -6231,6 +6231,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
         #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
+        #   {"action": "respond", "text":  ...}     -> send text, stop dispatch
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
@@ -6265,6 +6266,38 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event = dataclasses.replace(event, text=_new_text)
                         source = event.source
                     break
+                if _action == "respond":
+                    _text = _result.get("text") or _result.get("content")
+                    if not isinstance(_text, str) or not _text.strip():
+                        continue
+                    _adapter = self.adapters.get(source.platform)
+                    if _adapter is None:
+                        logger.warning(
+                            "pre_gateway_dispatch respond had no adapter: reason=%s platform=%s chat=%s",
+                            _result.get("reason"),
+                            source.platform.value if source.platform else "unknown",
+                            source.chat_id or "unknown",
+                        )
+                        return None
+                    _metadata = _result.get("metadata")
+                    if not isinstance(_metadata, dict):
+                        _metadata = self._thread_metadata_for_source(
+                            source,
+                            self._reply_anchor_for_event(event),
+                        )
+                    await _adapter.send(
+                        source.chat_id,
+                        _text.strip(),
+                        metadata=_metadata,
+                    )
+                    logger.info(
+                        "pre_gateway_dispatch respond: reason=%s platform=%s chat=%s response=%d chars",
+                        _result.get("reason"),
+                        source.platform.value if source.platform else "unknown",
+                        source.chat_id or "unknown",
+                        len(_text.strip()),
+                    )
+                    return None
                 if _action == "allow":
                     break
 

@@ -2143,6 +2143,25 @@ class TestFormatMessage:
         """Emoji shortcodes like :smile: pass through unchanged."""
         assert adapter.format_message(":smile: hello :wave:") == ":smile: hello :wave:"
 
+    def test_detects_markdown_table_outside_code_fence(self, adapter):
+        text = (
+            "Scores:\n\n"
+            "| Player | Score |\n"
+            "|--------|-------|\n"
+            "| Alice  | 150   |\n"
+        )
+        assert adapter._contains_markdown_table(text) is True
+
+    def test_does_not_detect_markdown_table_inside_code_fence(self, adapter):
+        text = (
+            "```\n"
+            "| Player | Score |\n"
+            "|--------|-------|\n"
+            "| Alice  | 150   |\n"
+            "```"
+        )
+        assert adapter._contains_markdown_table(text) is False
+
 
 # ---------------------------------------------------------------------------
 # TestEditMessage
@@ -2183,6 +2202,19 @@ class TestEditMessage:
         await adapter.edit_message("C123", "1234.5678", "AT&T < 5 > 3")
         kwargs = adapter._app.client.chat_update.call_args.kwargs
         assert kwargs["text"] == "AT&amp;T &lt; 5 &gt; 3"
+
+    @pytest.mark.asyncio
+    async def test_edit_message_uses_markdown_block_for_table(self, adapter):
+        """Edited Slack messages with tables should use native markdown blocks."""
+        table = "| Name | Value |\n|------|-------|\n| A | 1 |"
+        adapter._app.client.chat_update = AsyncMock(return_value={"ok": True})
+
+        result = await adapter.edit_message("C123", "1234.5678", table)
+
+        assert result.success is True
+        kwargs = adapter._app.client.chat_update.call_args.kwargs
+        assert kwargs["text"] == table
+        assert kwargs["blocks"] == [{"type": "markdown", "text": table}]
 
 
 # ---------------------------------------------------------------------------
@@ -2964,6 +2996,74 @@ class TestMessageSplitting:
     """Test that long messages are split before sending."""
 
     @pytest.mark.asyncio
+    async def test_send_uses_markdown_block_for_markdown_table(self, adapter):
+        """Markdown pipe tables should use Slack's native markdown block."""
+        table = (
+            "Scores:\n\n"
+            "| Player | Score |\n"
+            "|--------|-------|\n"
+            "| Alice  | 150   |\n"
+        )
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", table)
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs["text"].startswith("Scores:")
+        assert kwargs["blocks"] == [{"type": "markdown", "text": table}]
+        assert "mrkdwn" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_send_keeps_text_path_for_non_table_markdown(self, adapter):
+        """Non-table Slack replies should keep the existing mrkdwn text path."""
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", "**hello** from [Hermes](https://example.com)")
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert kwargs["text"] == "*hello* from <https://example.com|Hermes>"
+        assert kwargs["mrkdwn"] is True
+        assert "blocks" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_send_oversized_table_falls_back_to_fenced_text(self, adapter):
+        """Tables over Slack's markdown block limit should remain readable."""
+        body = "\n".join(f"| row {i} | {'x' * 60} |" for i in range(230))
+        table = f"| Name | Value |\n|------|-------|\n{body}"
+        adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
+
+        await adapter.send("C123", table)
+
+        kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
+        assert "blocks" not in kwargs
+        assert kwargs["mrkdwn"] is True
+        assert kwargs["text"].startswith("```")
+        assert "| Name" in kwargs["text"]
+        assert kwargs["text"].rstrip().endswith("```")
+
+    @pytest.mark.asyncio
+    async def test_send_retries_with_fallback_when_markdown_block_rejected(self, adapter):
+        """If Slack rejects markdown blocks, retry with fenced fallback text."""
+        table = "| Name | Value |\n|------|-------|\n| A | 1 |"
+        adapter._app.client.chat_postMessage = AsyncMock(
+            side_effect=[
+                Exception("invalid_blocks"),
+                {"ts": "ts2"},
+            ]
+        )
+
+        result = await adapter.send("C123", table)
+
+        assert result.success is True
+        assert adapter._app.client.chat_postMessage.await_count == 2
+        first = adapter._app.client.chat_postMessage.await_args_list[0].kwargs
+        second = adapter._app.client.chat_postMessage.await_args_list[1].kwargs
+        assert first["blocks"] == [{"type": "markdown", "text": table}]
+        assert "blocks" not in second
+        assert second["text"].startswith("```")
+        assert second["mrkdwn"] is True
+
+    @pytest.mark.asyncio
     async def test_long_message_split_into_chunks(self, adapter):
         """Messages over MAX_MESSAGE_LENGTH should be split."""
         long_text = "x" * 45000  # Over Slack's 40k API limit
@@ -3020,6 +3120,52 @@ class TestMessageSplitting:
         await adapter.send("C123", "See [Foo](https://en.wikipedia.org/wiki/Foo_(bar))")
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "<https://en.wikipedia.org/wiki/Foo_(bar)|Foo>" in kwargs["text"]
+
+
+class TestSlackNativeTableNotices:
+    """Private and slash-response paths should share native table rendering."""
+
+    @pytest.mark.asyncio
+    async def test_private_notice_uses_markdown_block_for_table(self, adapter):
+        table = "| Name | Value |\n|------|-------|\n| A | 1 |"
+        adapter._app.client.chat_postEphemeral = AsyncMock(
+            return_value={"message_ts": "ephemeral_ts"}
+        )
+
+        result = await adapter.send_private_notice("C123", "U123", table)
+
+        assert result.success is True
+        kwargs = adapter._app.client.chat_postEphemeral.call_args.kwargs
+        assert kwargs["text"] == table
+        assert kwargs["blocks"] == [{"type": "markdown", "text": table}]
+        assert "mrkdwn" not in kwargs
+
+    @pytest.mark.asyncio
+    async def test_slash_ephemeral_uses_markdown_block_for_table(self, adapter):
+        table = "| Name | Value |\n|------|-------|\n| A | 1 |"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_session = AsyncMock()
+        mock_session.post = MagicMock(return_value=mock_resp)
+        mock_session.__aenter__ = AsyncMock(return_value=mock_session)
+        mock_session.__aexit__ = AsyncMock(return_value=False)
+
+        with patch(
+            "gateway.platforms.slack.aiohttp.ClientSession", return_value=mock_session
+        ):
+            result = await adapter._send_slash_ephemeral(
+                {"response_url": "https://hooks.slack.com/commands/test"},
+                table,
+            )
+
+        assert result.success is True
+        payload = mock_session.post.call_args.kwargs["json"]
+        assert payload["text"] == table
+        assert payload["blocks"] == [{"type": "markdown", "text": table}]
 
 
 # ---------------------------------------------------------------------------

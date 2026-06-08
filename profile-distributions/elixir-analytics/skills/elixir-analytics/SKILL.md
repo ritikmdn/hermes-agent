@@ -24,7 +24,7 @@ Bing, use catchphrases, or turn analytics answers into bits.
 
 Use this posture:
 
-- Lead with the answer, rows, date window, and dashboard link.
+- Lead with the answer, rows, date window, and any runner-provided dashboard link.
 - Use clear labels such as "working assumptions" and "fine print".
 - Add at most one understated aside when the result is routine and already
   clear.
@@ -32,6 +32,22 @@ Use this posture:
   write-query rejections, production blockers, errors, or surprising results.
 - Never let personality override metadata, caveats, freshness, or source
   clarity.
+
+## Self-Serve Boundary
+
+Read-only analytics questions are self-serve in Slack channels and DMs. For
+questions like "what can Chandler do?", use `elixir_analytics_runner` with
+`mode: "answer_question"`; the deterministic runner returns `route: "help"` and
+a Slack-ready example menu without querying data.
+
+Target under 10 seconds for Slack answers, clarifications, and safe rejections.
+The live E2E checker enforces this with `SLACK_RESPONSE_SLA_SECONDS = 10`.
+
+Source-of-truth changes, source-control actions, commits, pushes, and PRs are
+Ritik-only unless `ELIXIR_ANALYTICS_SOURCE_CHANGE_ALLOWED_USERS` explicitly
+allowlists another Slack user id/name. For non-Ritik users, answer read-only
+questions normally, but summarize source-change requests as PR candidates for
+Ritik instead of editing, committing, pushing, or opening PRs.
 
 ## Mandatory First Call
 
@@ -44,11 +60,13 @@ Use `max_rows: 25` for user lists, merchant lists, rankings, and breakdowns
 unless the user explicitly asks for a larger export.
 
 For Slack-facing ranked user answers, keep the visualization payload compact and
-non-sensitive so a dashboard link can be generated: omit phone/mobile/email/raw
-IDs unless explicitly requested, and prefer top 10–25 rows with fields such as
-rank, display name, segment/program, amount, and count. If an ad hoc run returns
-rows but no `dashboardUrl`/`dashboardUrlPath`, rerun with a compact projection
-rather than finalizing without a link.
+non-sensitive so a dashboard link can be generated when useful: omit
+phone/mobile/email/raw IDs unless explicitly requested, and prefer top 10–25
+rows with fields such as rank, display name, segment/program, amount, and count.
+Single-number KPI answers and tiny exact tables do not need visualization links.
+If a ranking, trend, breakdown, or large table returns rows but no
+`dashboardUrl`/`dashboardUrlPath`, rerun with a compact projection rather than
+finalizing without the useful drill-down.
 
 questions. Only if it returns `requires_model_request` should you use planner,
 Supabase ad hoc, PostHog ad hoc, or generic Hermes tools.
@@ -154,10 +172,13 @@ Read only the files needed for the question:
     patches, source-change planning, or self-improvement planning. Answer first
     from the deterministic runner contract; treat logging/promotion as follow-up
     maintenance unless the user explicitly asked for it.
-18. Include a dashboard link in Slack answers whenever a runner returns
-    `dashboardUrl` or `dashboardUrlPath`. Use `ANALYTICS_BASE_URL` as the
-    executive Next.js origin; if it is absent, default to
-    `https://analytics.joinelixir.club` rather than omitting the link.
+18. Include a dashboard link only when the runner includes one in
+    `payload.slackText`. Do not add a dashboard link merely because `dashboardUrl`
+    or `dashboardUrlPath` exists; single-number KPI answers usually stay
+    Slack-only.
+19. Keep source-control and PR work Ritik-only in Slack. Do not call
+    source-change modes, edit files, commit, push, or open PRs for other Slack
+    users; provide the source-change summary for Ritik instead.
 
 ## Fast Slack Answer Path
 
@@ -180,8 +201,8 @@ For a plain Slack data question, optimize for a direct answer:
 5. If it returns `saved_topic`, `supabase_ad_hoc`, or `posthog_ad_hoc`, run the
    matching deterministic runner through `elixir_analytics_runner` and answer
    from its structured JSON.
-6. Include rows or a compact summary, metadata, caveats, freshness, and a direct
-   dashboard link.
+6. Include rows or a compact summary, metadata, caveats, freshness, and any
+   direct dashboard link already present in the runner's `slackText`.
 7. Do not use `patch`, edit files, append `QUERY_LOG.md`, run source-change
    planners, or run self-improvement planners before replying to the Slack data
    question.
@@ -244,10 +265,9 @@ cd /Users/ritik/Coding/claude-analytics
 node --import tsx scripts/run-saved-query-topic.ts card-gtv-weekly --range 30d
 ```
 
-Use `--dry-run` only when checking metadata without querying Supabase. Prefer
-the returned `dashboardUrl` for Slack links. If it is null, append
-`dashboardUrlPath` to the executive Next.js base URL. Answer Slack with the
-rows, date window, caveats, freshness, and the link.
+Use `--dry-run` only when checking metadata without querying Supabase. Answer
+Slack with the runner's `slackText`; it decides whether a link belongs in the
+answer and what label the link should use.
 
 ## Ad Hoc Runtime
 
@@ -256,7 +276,8 @@ of one-off Python date math or temporary query scripts. Keep generic tools
 available for debugging, source changes, and runner gaps. When a plain Slack
 question falls through to `generic_tools`, the generic-tool step should be
 bounded and must ultimately feed a deterministic runner-backed answer with rows,
-metadata, and a dashboard link.
+metadata, and a dashboard link only when the deterministic runner includes that
+link in `slackText`.
 
 Marketplace product/item ranking questions are a common ad hoc case. Use
 `references/marketplace-product-rankings.md` for the partner-specific
@@ -267,8 +288,8 @@ out of `SUCCESS`/`CONFIRMED`.
 
 Do not finalize a Slack Supabase ad hoc answer from manual `execute_code`
 results alone. The final Slack response must include the runner's structured
-output contract and a dashboard link. If a runner gap forces manual execution,
-create the same bounded visualization payload and link before replying.
+output contract. Create the same bounded visualization payload and link before
+replying only when the answer needs a chart, ranking, breakdown, or full table.
 
 The runner accepts an `AdHocQueryRequest` JSON payload via `--request-json` or
 stdin:
@@ -286,12 +307,15 @@ and returns user id/name, spend, transaction count, date window, freshness,
 caveats, and source tables.
 
 After a successful ad hoc runner result, answer Slack with the bounded rows or
-summary, metadata, and a "Dashboard" link. Prefer `dashboardUrl`. If only
-`dashboardUrlPath` is present, prefix it with `ANALYTICS_BASE_URL`, defaulting to
-`https://analytics.joinelixir.club` for the production executive app.
+summary, metadata, and any "Dashboard" line already present in `slackText`.
+Do not add a link yourself when the runner intentionally omitted one.
+If only `dashboardUrlPath` is present inside a link-bearing payload, prefix it
+with `ANALYTICS_BASE_URL`, defaulting to `https://analytics.joinelixir.club` for
+the production executive app.
 Do not use third-party URL shorteners. If the direct dashboard URL plus a full
 row table would make the Slack response too long, send a compact summary,
-metadata, and the direct dashboard URL instead of shortening it.
+metadata, and any direct dashboard URL already present in `slackText` instead of
+shortening it.
 
 ## PostHog Runtime
 

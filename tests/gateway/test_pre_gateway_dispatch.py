@@ -2,7 +2,7 @@
 
 The hook allows plugins to intercept incoming messages before auth and
 agent dispatch. It runs in _handle_message and acts on returned action
-dicts: {"action": "skip"|"rewrite"|"allow"}.
+dicts: {"action": "skip"|"rewrite"|"respond"|"allow"}.
 """
 
 from types import SimpleNamespace
@@ -106,6 +106,37 @@ async def test_hook_rewrite_replaces_event_text(monkeypatch):
     await runner._handle_message(_make_event("original"))
 
     assert seen_text.get("value") == "REWRITTEN"
+
+
+@pytest.mark.asyncio
+async def test_hook_respond_sends_message_and_short_circuits_dispatch(monkeypatch):
+    """A plugin returning {'action': 'respond'} sends text before auth."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [
+                {
+                    "action": "respond",
+                    "text": "FAST",
+                    "reason": "deterministic-fast-path",
+                }
+            ]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.WHATSAPP)
+
+    result = await runner._handle_message(_make_event("hi"))
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "15551234567@s.whatsapp.net",
+        "FAST",
+        metadata=None,
+    )
+    runner.pairing_store.generate_code.assert_not_called()
 
 
 @pytest.mark.asyncio

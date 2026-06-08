@@ -107,6 +107,13 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "working assumptions" in body
     assert "fine print" in body
     assert "Stay sober for sensitive user-level data" in body
+    assert "Read-only analytics questions are self-serve in Slack channels and DMs" in body
+    assert 'questions like "what can Chandler do?"' in body
+    assert 'route: "help"' in body
+    assert "SLACK_RESPONSE_SLA_SECONDS = 10" in body
+    assert "Source-of-truth changes, source-control actions, commits, pushes, and PRs are" in body
+    assert "Ritik-only" in body
+    assert "ELIXIR_ANALYTICS_SOURCE_CHANGE_ALLOWED_USERS" in body
     assert "/Users/ritik/Coding/claude-analytics/GLOSSARY.md" in body
     assert "/Users/ritik/Coding/claude-analytics/src/lib/analytics/metric-contracts.ts" in body
     assert "/Users/ritik/Coding/claude-analytics/docs/ad-hoc-query-protocol.md" in body
@@ -165,6 +172,9 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "Call\n   `scripts/plan-analytics-question.ts` once" in body
     assert "Do not use `patch`, edit files, append `QUERY_LOG.md`" in body
     assert "Do not block a plain Slack data answer on source edits" in body
+    assert "Do not add a dashboard link merely because `dashboardUrl`" in body
+    assert "single-number KPI answers" in body
+    assert "Keep source-control and PR work Ritik-only in Slack" in body
     assert "Do not use generic `execute_code` for the first pass" in body
     assert "Only after `answer_question` returns `requires_model_request`, call the\n" in body
     assert "deterministic planner" in body
@@ -181,8 +191,8 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert "`logEntry` in stdout" in body
     assert "do not create a duplicate query number" in body
     assert "`dashboardUrl`" in body
-    assert "Include a dashboard link in Slack answers" in body
-    assert "default to\n    `https://analytics.joinelixir.club`" in body
+    assert 'any "Dashboard" line already present in `slackText`' in body
+    assert "defaulting to `https://analytics.joinelixir.club`" in body
     assert "Ask clarification" in body
     assert "--env-file /Users/ritik/.hermes/profiles/elixir-analytics/.env" in body
     assert (
@@ -272,7 +282,7 @@ def test_elixir_analytics_distribution_ships_hosted_gateway_runbook():
     assert "HERMES_HOME=/var/lib/hermes" in systemd_env
 
 
-def test_elixir_analytics_soul_requires_dashboard_links_for_data_answers():
+def test_elixir_analytics_soul_uses_selective_visualization_and_permissions():
     body = (DIST_DIR / "SOUL.md").read_text(encoding="utf-8")
 
     assert "the bot may appear as Chandler" in body
@@ -280,9 +290,10 @@ def test_elixir_analytics_soul_requires_dashboard_links_for_data_answers():
     assert "Never imitate or quote Chandler Bing" in body
     assert "working assumptions" in body
     assert "fine print" in body
-    assert "dashboard or temporary visualization links for every runnable data answer" in body
-    assert "include a dashboard link" in body
-    assert "`ANALYTICS_BASE_URL`" in body
+    assert "dashboard or temporary visualization links only when they materially help" in body
+    assert "Single KPI\n  answers usually stay in Slack" in body
+    assert "read-only analytics questions as self-serve in Slack channels and DMs" in body
+    assert "Source-of-truth changes, source-control actions, commits, pushes, and PRs are\n  Ritik-only" in body
     assert "Do not use third-party URL shorteners" in body
     assert re.search(
         r"Do not finalize a Slack ad hoc data answer from manual `execute_code` output\s+alone",
