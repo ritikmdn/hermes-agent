@@ -787,12 +787,14 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     for chunk in chunks:
         if platform == Platform.SLACK:
             if slack_blocks:
+                slack_kwargs = {"blocks": slack_blocks}
+                if thread_id:
+                    slack_kwargs["thread_ts"] = thread_id
                 result = await _send_slack(
                     pconfig.token,
                     chat_id,
                     chunk,
-                    thread_ts=thread_id,
-                    blocks=slack_blocks,
+                    **slack_kwargs,
                 )
             else:
                 result = await _send_slack(
