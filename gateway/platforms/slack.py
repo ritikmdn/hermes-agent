@@ -1183,8 +1183,17 @@ class SlackAdapter(BasePlatformAdapter):
             # Controlled via platform config: gateway.slack.reply_broadcast
             broadcast = self.config.extra.get("reply_broadcast", False)
             message_payload = self._build_message_payload(content)
+            table_detected = _contains_markdown_table(content)
+            delivery_trace: Dict[str, Any] = {
+                "mode": "markdown_block" if "blocks" in message_payload else (
+                    "table_text_fallback" if table_detected else "mrkdwn_text"
+                ),
+                "table_detected": table_detected,
+                "fallback": False,
+                "chunks": 1,
+            }
 
-            async def _send_text_chunks(text: str) -> Any:
+            async def _send_text_chunks(text: str) -> tuple[Any, int]:
                 chunks = self.truncate_message(text, self.MAX_MESSAGE_LENGTH)
                 result = None
                 for i, chunk in enumerate(chunks):
@@ -1202,7 +1211,7 @@ class SlackAdapter(BasePlatformAdapter):
                     result = await self._get_client(chat_id).chat_postMessage(
                         **kwargs
                     )
-                return result
+                return result, len(chunks)
 
             if "blocks" in message_payload:
                 kwargs = {
@@ -1226,9 +1235,18 @@ class SlackAdapter(BasePlatformAdapter):
                     fallback_payload = self._build_message_payload(
                         content, force_text_fallback=True
                     )
-                    last_result = await _send_text_chunks(fallback_payload["text"])
+                    last_result, _chunks = await _send_text_chunks(fallback_payload["text"])
+                    delivery_trace.update(
+                        {
+                            "mode": "markdown_block_rejected_text_fallback",
+                            "fallback": True,
+                            "fallback_reason": str(exc),
+                            "chunks": _chunks,
+                        }
+                    )
             else:
-                last_result = await _send_text_chunks(message_payload["text"])
+                last_result, _chunks = await _send_text_chunks(message_payload["text"])
+                delivery_trace["chunks"] = _chunks
 
             # Clear Slack Assistant status as soon as the final message is posted.
             if thread_ts:
@@ -1247,10 +1265,22 @@ class SlackAdapter(BasePlatformAdapter):
                     for old_ts in list(self._bot_message_ts)[:excess]:
                         self._bot_message_ts.discard(old_ts)
 
+            traced_response = self._attach_delivery_trace(last_result, delivery_trace)
+            logger.info(
+                "[Slack] delivery mode=%s table=%s fallback=%s chunks=%s chat=%s thread=%s ts=%s",
+                delivery_trace.get("mode"),
+                delivery_trace.get("table_detected"),
+                delivery_trace.get("fallback"),
+                delivery_trace.get("chunks"),
+                chat_id,
+                bool(thread_ts),
+                sent_ts or "",
+            )
+
             return SendResult(
                 success=True,
                 message_id=sent_ts,
-                raw_response=last_result,
+                raw_response=traced_response,
             )
 
         except Exception as e:  # pragma: no cover - defensive logging
@@ -1696,6 +1726,18 @@ class SlackAdapter(BasePlatformAdapter):
             payload["mrkdwn"] = True
         return payload
 
+    @staticmethod
+    def _attach_delivery_trace(response: Any, trace: Dict[str, Any]) -> Any:
+        if isinstance(response, dict):
+            enriched = dict(response)
+            enriched["hermes_delivery"] = trace
+            return enriched
+        try:
+            response["hermes_delivery"] = trace
+            return response
+        except Exception:
+            return {"slack_response": repr(response), "hermes_delivery": trace}
+
     def format_message(self, content: str) -> str:
         """Convert standard markdown to Slack mrkdwn format.
 
@@ -1877,6 +1919,13 @@ class SlackAdapter(BasePlatformAdapter):
             return ""
         if user_id in self._user_name_cache:
             return self._user_name_cache[user_id]
+
+        # Thread recovery sometimes passes literal bot/user display names
+        # (for example a bot-posted parent with username="cron"). Only call
+        # users.info for Slack-shaped user IDs; cache literals as-is.
+        if not re.match(r"^[UW][A-Z0-9_]+$", user_id):
+            self._user_name_cache[user_id] = user_id
+            return user_id
 
         if not self._app:
             return user_id
@@ -2594,6 +2643,7 @@ class SlackAdapter(BasePlatformAdapter):
                 thread_ts=event_thread_ts,
                 current_ts=ts,
                 team_id=team_id,
+                include_self_bot_replies=True,
             )
             if thread_context:
                 text = thread_context + text
@@ -3310,6 +3360,7 @@ class SlackAdapter(BasePlatformAdapter):
         current_ts: str,
         team_id: str = "",
         limit: int = 30,
+        include_self_bot_replies: bool = False,
     ) -> str:
         """Fetch recent thread messages to provide context when the bot is
         mentioned mid-thread for the first time.
@@ -3326,7 +3377,10 @@ class SlackAdapter(BasePlatformAdapter):
         Returns a formatted string with prior thread history, or empty string
         on failure or if the thread has no prior messages.
         """
-        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        cache_key = (
+            f"{channel_id}:{thread_ts}:{team_id}:"
+            f"self={int(include_self_bot_replies)}"
+        )
         now = time.monotonic()
         cached = self._thread_context_cache.get(cache_key)
         if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
@@ -3392,13 +3446,17 @@ class SlackAdapter(BasePlatformAdapter):
                     self._team_bot_user_ids.get(msg_team) if msg_team else None
                 ) or self._bot_user_id
 
-                # Exclude only our own prior bot replies (circular context).
+                # Exclude only our own prior bot replies by default (circular context).
                 # Keep:
                 #   - the thread parent even if it was posted by a bot
                 #     (e.g. a cron job summary we are now replying to);
                 #   - other bots' child messages (useful third-party context).
+                # When the caller is recovering a thread with no active
+                # Hermes session, prior Chandler replies may be the only copy
+                # of a clarification prompt, so the caller can opt in.
                 if (
-                    is_bot
+                    not include_self_bot_replies
+                    and is_bot
                     and not is_parent
                     and self_bot_uid
                     and msg_user == self_bot_uid
@@ -3458,9 +3516,13 @@ class SlackAdapter(BasePlatformAdapter):
         Returns empty string on any failure — callers should treat an empty
         return as "no parent context to inject".
         """
-        cache_key = f"{channel_id}:{thread_ts}:{team_id}"
+        cache_key = f"{channel_id}:{thread_ts}:{team_id}:self=0"
         now = time.monotonic()
         cached = self._thread_context_cache.get(cache_key)
+        if not cached:
+            cached = self._thread_context_cache.get(
+                f"{channel_id}:{thread_ts}:{team_id}:self=1"
+            )
         if cached and (now - cached.fetched_at) < self._THREAD_CACHE_TTL:
             return cached.parent_text
 

@@ -3006,24 +3006,27 @@ class TestMessageSplitting:
         )
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", table)
+        result = await adapter.send("C123", table)
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert kwargs["text"].startswith("Scores:")
         assert kwargs["blocks"] == [{"type": "markdown", "text": table}]
         assert "mrkdwn" not in kwargs
+        assert result.raw_response["hermes_delivery"]["mode"] == "markdown_block"
+        assert result.raw_response["hermes_delivery"]["table_detected"] is True
 
     @pytest.mark.asyncio
     async def test_send_keeps_text_path_for_non_table_markdown(self, adapter):
         """Non-table Slack replies should keep the existing mrkdwn text path."""
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", "**hello** from [Hermes](https://example.com)")
+        result = await adapter.send("C123", "**hello** from [Hermes](https://example.com)")
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert kwargs["text"] == "*hello* from <https://example.com|Hermes>"
         assert kwargs["mrkdwn"] is True
         assert "blocks" not in kwargs
+        assert result.raw_response["hermes_delivery"]["mode"] == "mrkdwn_text"
 
     @pytest.mark.asyncio
     async def test_send_oversized_table_falls_back_to_fenced_text(self, adapter):
@@ -3032,7 +3035,7 @@ class TestMessageSplitting:
         table = f"| Name | Value |\n|------|-------|\n{body}"
         adapter._app.client.chat_postMessage = AsyncMock(return_value={"ts": "ts1"})
 
-        await adapter.send("C123", table)
+        result = await adapter.send("C123", table)
 
         kwargs = adapter._app.client.chat_postMessage.call_args.kwargs
         assert "blocks" not in kwargs
@@ -3040,6 +3043,7 @@ class TestMessageSplitting:
         assert kwargs["text"].startswith("```")
         assert "| Name" in kwargs["text"]
         assert kwargs["text"].rstrip().endswith("```")
+        assert result.raw_response["hermes_delivery"]["mode"] == "table_text_fallback"
 
     @pytest.mark.asyncio
     async def test_send_retries_with_fallback_when_markdown_block_rejected(self, adapter):
@@ -3062,6 +3066,7 @@ class TestMessageSplitting:
         assert "blocks" not in second
         assert second["text"].startswith("```")
         assert second["mrkdwn"] is True
+        assert result.raw_response["hermes_delivery"]["mode"] == "markdown_block_rejected_text_fallback"
 
     @pytest.mark.asyncio
     async def test_long_message_split_into_chunks(self, adapter):

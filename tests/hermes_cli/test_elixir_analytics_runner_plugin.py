@@ -102,7 +102,7 @@ class _FakeSessionStore:
         return self.transcript
 
 
-def test_registers_pre_gateway_fast_path_hook():
+def test_registers_pre_gateway_agent_handoff_hook():
     module = _load_plugin_module()
     ctx = _Ctx()
 
@@ -111,7 +111,7 @@ def test_registers_pre_gateway_fast_path_hook():
     assert "pre_gateway_dispatch" in ctx.hooks
 
 
-def test_pre_gateway_fast_path_strips_slack_context_and_responds(monkeypatch):
+def test_pre_gateway_agent_handoff_strips_slack_context(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -146,22 +146,16 @@ def test_pre_gateway_fast_path_strips_slack_context_and_responds(monkeypatch):
         session_store=None,
     )
 
-    assert result == {
-        "action": "respond",
-        "text": "Swiggy answer",
-        "reason": "elixir_analytics_fast_path",
-    }
-    assert calls == [
-        {
-            "mode": "answer_question",
-            "question": "which users spent on Swiggy this week?",
-            "max_rows": 25,
-            "timeout_seconds": 8,
-        }
-    ]
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert "which users spent on Swiggy this week?" in result["text"]
+    assert "Ritik Madan: old question" in result["context"]
+    assert "*Sent using*" not in result["text"]
+    assert calls == []
 
 
-def test_pre_gateway_fast_path_allows_unauthorized_slack_user_without_query(monkeypatch):
+def test_pre_gateway_agent_handoff_allows_unauthorized_slack_user(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -184,7 +178,7 @@ def test_pre_gateway_fast_path_allows_unauthorized_slack_user_without_query(monk
     assert calls == []
 
 
-def test_pre_gateway_fast_path_allows_model_required_questions(monkeypatch):
+def test_pre_gateway_agent_handoff_keeps_model_required_questions_in_agent(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
 
@@ -206,10 +200,17 @@ def test_pre_gateway_fast_path_allows_model_required_questions(monkeypatch):
         session_store=None,
     )
 
-    assert result == {"action": "allow"}
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert "how have spends on swiggy evolved over last 10 days" in result["text"]
+    assert "analytics-capable Hermes profile" in result["context"]
+    assert "This Slack analytics request" not in result["context"]
+    assert "Call `elixir_analytics_runner`" in result["context"]
+    assert "You do not need `skill_view`" in result["context"]
 
 
-def test_pre_gateway_fast_path_clarifies_ambiguous_active_users_without_model(monkeypatch):
+def test_pre_gateway_agent_handoff_annotates_ambiguous_active_users(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -229,14 +230,16 @@ def test_pre_gateway_fast_path_clarifies_ambiguous_active_users_without_model(mo
     )
 
     assert result is not None
-    assert result["action"] == "respond"
-    assert result["reason"] == "elixir_analytics_active_users_clarification"
-    assert "Which active user definition" in result["text"]
-    assert "Highest card spender" in result["text"]
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert "who was our most active user in last 7 days" in result["text"]
+    assert "active user definition is ambiguous" in result["context"]
+    assert "Most card-active user" in result["context"]
+    assert "Highest card spender" in result["context"]
     assert calls == []
 
 
-def test_pre_gateway_fast_path_resolves_active_users_clarification_reply(monkeypatch):
+def test_pre_gateway_agent_handoff_preserves_active_users_clarification_reply(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -270,22 +273,16 @@ def test_pre_gateway_fast_path_resolves_active_users_clarification_reply(monkeyp
         session_store=None,
     )
 
-    assert result == {
-        "action": "respond",
-        "text": "Highest spender answer",
-        "reason": "elixir_analytics_fast_path",
-    }
-    assert calls == [
-        {
-            "mode": "answer_question",
-            "question": "highest spender in last 7 days",
-            "max_rows": 25,
-            "timeout_seconds": 8,
-        }
-    ]
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "highest spender sorry"
+    assert "Call `elixir_analytics_runner`" in result["context"]
+    assert "who was our most active user in last 7 days" in result["context"]
+    assert calls == []
 
 
-def test_pre_gateway_fast_path_resolves_highest_spender_spend_breakdown_followup(monkeypatch):
+def test_pre_gateway_agent_handoff_preserves_spend_breakdown_followup(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -321,22 +318,15 @@ def test_pre_gateway_fast_path_resolves_highest_spender_spend_breakdown_followup
         session_store=None,
     )
 
-    assert result == {
-        "action": "respond",
-        "text": "Spend breakdown answer",
-        "reason": "elixir_analytics_fast_path",
-    }
-    assert calls == [
-        {
-            "mode": "answer_question",
-            "question": "what did the highest spender spend on in last 7 days",
-            "max_rows": 25,
-            "timeout_seconds": 8,
-        }
-    ]
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "what did he spend on?"
+    assert "Highest spender in the last 7 IST days was *Nagendra G*." in result["context"]
+    assert calls == []
 
 
-def test_pre_gateway_fast_path_resolves_breakdown_followup_from_session_history(monkeypatch):
+def test_pre_gateway_agent_handoff_preserves_session_history_followup(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -385,22 +375,15 @@ def test_pre_gateway_fast_path_resolves_breakdown_followup_from_session_history(
         ),
     )
 
-    assert result == {
-        "action": "respond",
-        "text": "Spend breakdown answer",
-        "reason": "elixir_analytics_fast_path",
-    }
-    assert calls == [
-        {
-            "mode": "answer_question",
-            "question": "what did the highest spender spend on in last 7 days",
-            "max_rows": 25,
-            "timeout_seconds": 8,
-        }
-    ]
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "what did he spend on?"
+    assert "Highest spender in the last 7 IST days was *Nagendra G*." in result["context"]
+    assert calls == []
 
 
-def test_pre_gateway_fast_path_refuses_destructive_analytics_mutation(monkeypatch):
+def test_pre_gateway_agent_handoff_refuses_destructive_analytics_mutation(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
     calls = []
@@ -436,6 +419,7 @@ def test_tool_schema_tells_model_to_use_answer_question_first():
     schema = ctx.tools[0]["schema"]
     assert "Use mode='answer_question' first" in schema["description"]
     assert "payload.slackText" in schema["description"]
+    assert "use `clarify`" in schema["description"]
     assert "answer_question" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "source_change_plan" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "source_change_scope_check" in schema["parameters"]["properties"]["mode"]["enum"]
@@ -695,6 +679,50 @@ def test_answer_question_mode_returns_compact_slack_handoff(monkeypatch):
     assert "ada@example.com" not in serialized
     assert "+910000000000" not in serialized
     assert "logEntry" not in serialized
+
+
+def test_answer_question_mode_clarification_requires_clarify_tool(monkeypatch):
+    module = _load_plugin_module()
+    payload = {
+        "ok": True,
+        "route": "clarify",
+        "payload": {
+            "ok": False,
+            "requiresClarification": True,
+            "clarificationQuestion": (
+                "Which active user definition should I use?"
+            ),
+            "choices": [
+                "card active",
+                "app active",
+                "combined active",
+            ],
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "active users this week",
+        }
+    )
+
+    assert result["ok"] is True
+    assert "hermes_direct_final_response" not in result
+    assert result["hermes_agent_instruction"].startswith("Call `clarify`")
+    assert result["payload"]["payload"]["clarificationQuestion"] == (
+        "Which active user definition should I use?"
+    )
+    assert result["payload"]["payload"]["choices"] == [
+        "card active",
+        "app active",
+        "combined active",
+    ]
 
 
 def test_answer_question_mode_handles_highest_spender_last_7_days(monkeypatch):
@@ -1562,6 +1590,151 @@ def test_answer_question_mode_handles_card_gtv_last_7_days(monkeypatch):
         "Card GTV for the last 7 completed IST days was *₹928,183*."
     )
     assert "Dashboard:" not in result["hermes_direct_final_response"]
+
+
+def test_answer_question_mode_handles_card_gtv_last_12_days(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    payload = {
+        "ok": True,
+        "dryRun": False,
+        "rows": [
+            {
+                "gtv": 2242224.39,
+                "transactions": 1014,
+                "users": 243,
+                "source_freshness": "2026-06-08 18:10:13",
+            }
+        ],
+        "rowCount": 1,
+        "truncated": False,
+        "maxRows": 25,
+        "metadata": {},
+        "dashboardUrlPath": None,
+        "dashboardUrl": None,
+        "logEntry": "## Query #0",
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "answer_question", "question": "gtv over last 12 days"}
+    )
+
+    request = json.loads(calls[0][1]["input"])
+    assert result["ok"] is True
+    assert result["payload"]["shortcut"] == "card_gtv_last_12d"
+    assert request["resultType"] == "kpi"
+    assert request["metricIds"] == ["gtv"]
+    assert "last 12 completed" in request["interpretedDefinition"]
+    assert "classified_transactions" in request["sql"]
+    assert "is_card_spend = true" in request["sql"]
+    assert "is_reward_reconciliation = false" in request["sql"]
+    assert result["hermes_direct_final_response"].startswith(
+        "Card GTV for the last 12 completed IST days was *₹2,242,224*."
+    )
+
+
+def test_answer_question_mode_handles_gym_milestone_average_monthly_spend(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    payload = {
+        "ok": True,
+        "dryRun": False,
+        "rows": [
+            {
+                "period": "overall_3mo_avg",
+                "month_start": None,
+                "gym_users": 103,
+                "total_gtv": 5267234.61,
+                "transactions": 1866,
+                "spending_users": None,
+                "avg_monthly_spend_per_gym_user": 17046.0666990291,
+                "avg_monthly_spend_per_spending_user": 36567.0114424392,
+                "source_freshness": "2026-05-31 17:38:06.159+00",
+            },
+            {
+                "period": "2026-03",
+                "month_start": "2026-03-01T00:00:00.000Z",
+                "gym_users": 103,
+                "total_gtv": 1542908.78,
+                "transactions": 573,
+                "spending_users": 46,
+                "avg_monthly_spend_per_gym_user": 14979.6968932039,
+                "avg_monthly_spend_per_spending_user": 33541.4952173913,
+                "source_freshness": "2026-03-31 18:06:45.915+00",
+            },
+            {
+                "period": "2026-04",
+                "month_start": "2026-04-01T00:00:00.000Z",
+                "gym_users": 103,
+                "total_gtv": 2051138.31,
+                "transactions": 660,
+                "spending_users": 46,
+                "avg_monthly_spend_per_gym_user": 19913.9641747573,
+                "avg_monthly_spend_per_spending_user": 44589.9632608696,
+                "source_freshness": "2026-04-30 18:10:13.032+00",
+            },
+            {
+                "period": "2026-05",
+                "month_start": "2026-05-01T00:00:00.000Z",
+                "gym_users": 103,
+                "total_gtv": 1673187.52,
+                "transactions": 633,
+                "spending_users": 53,
+                "avg_monthly_spend_per_gym_user": 16244.5390291262,
+                "avg_monthly_spend_per_spending_user": 31569.5758490566,
+                "source_freshness": "2026-05-31 17:38:06.159+00",
+            },
+        ],
+        "rowCount": 4,
+        "truncated": False,
+        "maxRows": 25,
+        "metadata": {},
+        "dashboardUrlPath": None,
+        "dashboardUrl": None,
+        "logEntry": "## Query #0",
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "what is the average monthly spend of gym milestone users over last 3 months?",
+        }
+    )
+
+    request = json.loads(calls[0][1]["input"])
+    direct = result["hermes_direct_final_response"]
+    assert result["ok"] is True
+    assert result["payload"]["shortcut"] == "gym_milestone_avg_monthly_spend_3mo"
+    assert request["resultType"] == "timeseries"
+    assert request["metricIds"] == ["gym_milestone_users", "gtv"]
+    assert request["sources"] == [
+        "milestone_program_instances",
+        "customer_vouchers",
+        "profiles",
+        "transactions",
+        "marketplace_order",
+    ]
+    assert "generate_series" in request["sql"]
+    assert "mpi.status = 'active'" in request["sql"]
+    assert "avg_monthly_spend_per_gym_user" in request["sql"]
+    assert direct.startswith(
+        "For current active gym milestone users, average monthly card spend "
+        "over the last 3 completed months was:"
+    )
+    assert "*₹17,046.07* per gym milestone user / month" in direct
+    assert "| 2026-03 | 103 | 46 | ₹1,542,909 | 573 | ₹14,979.70 | ₹33,541.50 |" in direct
 
 
 def test_answer_question_mode_handles_card_gtv_today(monkeypatch):

@@ -147,8 +147,8 @@ unless the user explicitly asks for a larger export.
 - PostHog app questions: use `answer_question` first, then `posthog_ad_hoc`
   only if needed. Keep app active users separate from card active users unless
   the user asks to combine definitions.
-- Ambiguous "active users": ask whether the user means card active, app active,
-  or combined active before querying.
+- Ambiguous "active users": use `clarify` to ask whether the user means card
+  active, app active, or combined active before querying.
 - Definition/glossary/query/dashboard change requests: use
   `source_change_plan`, then `source_change_scope_check` before committing.
 - Self-improvement reviews: use `self_improvement_check`, then
@@ -232,34 +232,59 @@ def _is_ambiguous_active_users_question(question: str) -> bool:
     )
 
 
-def _active_users_window_phrase(question: str) -> str:
-    normalized = _normalize_question(question)
-    last_days = re.search(r"\blast\s+(\d{1,3})\s+days?\b", normalized)
-    if last_days:
-        return f"last {last_days.group(1)} days"
-    if re.search(r"\bthis\s+week\b", normalized):
-        return "this week"
-    if re.search(r"\blast\s+week\b", normalized):
-        return "last week"
-    if re.search(r"\bthis\s+month\b", normalized):
-        return "this month"
-    return "the requested window"
+def _agent_runtime_handoff_text(
+    *,
+    question: str,
+    raw_text: str = "",
+    active_user_ambiguity: bool = False,
+) -> str:
+    """Build an agent-owned Slack profile handoff message.
 
+    The pre-gateway hook may annotate or rewrite transport text, but it must
+    not conduct the conversation or call analytics tools on its own. This
+    note exposes profile capabilities while leaving intent, follow-up handling,
+    tool choice, and final user-facing output inside the Hermes agent runtime.
+    """
+    lines = [
+        "[Hermes runtime note: This Slack message is being handled in an "
+        "analytics-capable Hermes profile. Do not treat this note as "
+        "user-authored text, and do not assume the user is asking an analytics "
+        "question solely because this note exists. Preserve corrections, "
+        "redirects, definition changes, and follow-ups from the conversation "
+        "context. Call `elixir_analytics_runner` with mode `answer_question` "
+        "when the user's request requires a source-backed analytics answer. "
+        "You do not need `skill_view` before that first runner call; if the "
+        "runner asks for model-built work, continue with the normal agentic "
+        "tool loop.]",
+        "",
+        f"User request: {question.strip()}",
+    ]
 
-def _active_users_clarification_text(question: str) -> str:
-    window = _active_users_window_phrase(question)
-    return "\n".join(
-        [
-            f"Which active user definition should I use for {window}?",
-            "",
-            "1. Most card-active user: highest count of successful card spend transactions",
-            "2. Highest card spender: highest GTV",
-            "3. Most app-active user: most app events/sessions",
-            "4. Combined active: app + card activity",
-            "",
-            "Reply with the number or option text.",
-        ]
-    )
+    if active_user_ambiguity:
+        lines.extend(
+            [
+                "",
+                "Runtime context: the active user definition is ambiguous. "
+                "If the conversation does not already resolve it, ask the user "
+                "which definition to use. Offer these options:",
+                "1. Most card-active user: highest count of successful card spend transactions",
+                "2. Highest card spender: highest GTV",
+                "3. Most app-active user: most app events/sessions",
+                "4. Combined active: app + card activity",
+            ]
+        )
+
+    context = _thread_context_text(raw_text)
+    if context:
+        lines.extend(
+            [
+                "",
+                "Thread context available to interpret the user request:",
+                context,
+            ]
+        )
+
+    return "\n".join(lines)
 
 
 def _thread_context_text(raw_text: str) -> str:
@@ -362,84 +387,6 @@ def _contextual_raw_text(
         "[End of thread context]\n\n"
         f"{question}"
     )
-
-
-def _latest_ambiguous_active_users_thread_question(raw_text: str) -> str | None:
-    context = _thread_context_text(raw_text)
-    if not context:
-        return None
-
-    candidates: list[str] = []
-    for line in context.splitlines():
-        line = line.strip()
-        if not line:
-            continue
-        if ":" in line:
-            speaker, message = line.split(":", 1)
-            if speaker.strip().lower() in {"chandler", "coach"}:
-                continue
-            candidates.append(message.strip())
-        else:
-            candidates.append(line)
-
-    for candidate in reversed(candidates):
-        if _is_ambiguous_active_users_question(candidate):
-            return candidate
-    return None
-
-
-def _resolve_active_users_clarification_reply(
-    *,
-    raw_text: str,
-    question: str,
-) -> str | None:
-    original_question = _latest_ambiguous_active_users_thread_question(raw_text)
-    if not original_question:
-        return None
-
-    normalized_reply = _normalize_question(question)
-    if re.fullmatch(r"(2|option\s*2|two)", normalized_reply) or re.search(
-        r"\b(highest|biggest|top)\b[\s\S]*\b(spender|spenders|spend|gtv)\b",
-        normalized_reply,
-    ):
-        return f"highest spender in {_active_users_window_phrase(original_question)}"
-
-    return None
-
-
-def _is_top_spender_spend_breakdown_followup(question: str) -> bool:
-    normalized = _normalize_question(question)
-    if re.search(r"\bspend\s+breakdown\b", normalized):
-        return True
-    return bool(
-        (
-            re.search(r"\bwhat\b[\s\S]*\b(spend|spent)\b[\s\S]*\bon\b", normalized)
-            or re.search(r"\bwhere\b[\s\S]*\b(spend|spent)\b", normalized)
-        )
-        and re.search(r"\b(he|she|they|them|highest\s+spender|top\s+spender)\b", normalized)
-    )
-
-
-def _resolve_top_spender_spend_breakdown_followup(
-    *,
-    raw_text: str,
-    question: str,
-) -> str | None:
-    if not _is_top_spender_spend_breakdown_followup(question):
-        return None
-
-    context = _thread_context_text(raw_text)
-    normalized_context = _normalize_question(context)
-    if not re.search(r"\b(highest|top)\s+(card\s+)?spender\b", normalized_context):
-        return None
-    if re.search(r"\blast\s+7(?:\s+\w+)?\s+days?\b", normalized_context):
-        return "what did the highest spender spend on in last 7 days"
-
-    original_question = _latest_ambiguous_active_users_thread_question(raw_text)
-    if original_question and _active_users_window_phrase(original_question) == "last 7 days":
-        return "what did the highest spender spend on in last 7 days"
-
-    return None
 
 
 def _gateway_authorizes_event(gateway: Any, event: Any) -> bool:
@@ -642,6 +589,28 @@ def _india_completed_days_window(days: int) -> dict[str, str]:
     return {
         "from": from_date.isoformat(),
         "toExclusive": today.isoformat(),
+        "today": today.isoformat(),
+        "timezone": "Asia/Kolkata",
+    }
+
+
+def _shift_month(month_start: Any, months: int) -> Any:
+    month_index = month_start.month - 1 + months
+    year = month_start.year + month_index // 12
+    month = month_index % 12 + 1
+    return month_start.replace(year=year, month=month, day=1)
+
+
+def _india_completed_months_window(months: int) -> dict[str, str]:
+    now = datetime.now(ZoneInfo("Asia/Kolkata"))
+    today = now.date()
+    current_month = today.replace(day=1)
+    from_date = _shift_month(current_month, -months)
+    last_month = _shift_month(current_month, -1)
+    return {
+        "from": from_date.isoformat(),
+        "toExclusive": current_month.isoformat(),
+        "lastMonth": last_month.isoformat(),
         "today": today.isoformat(),
         "timezone": "Asia/Kolkata",
     }
@@ -918,6 +887,42 @@ def _card_gtv_daily_days(question: str) -> int | None:
     return days
 
 
+def _definition_change_intent(question: str) -> bool:
+    normalized = _normalize_question(question)
+    return bool(
+        re.search(
+            r"\b(change|update|modify|define|definition|instead|rather\s+than|"
+            r"use\s+.+\s+as|count\s+as|exclude|include)\b",
+            normalized,
+        )
+    )
+
+
+def _card_gtv_completed_days(question: str) -> int | None:
+    normalized = _normalize_question(question)
+    if not re.search(r"\b(gtv|card\s+spend)\b", normalized):
+        return None
+    if re.search(
+        r"\b(daily|by\s+day|day\s*wise|day-by-day|day\s+by\s+day|trend|"
+        r"weekly|by\s+week|transaction|transactions|txn|txns|users?|"
+        r"spender|spenders|merchant|merchants|vendor|vendors|top|highest|"
+        r"biggest|largest)\b",
+        normalized,
+    ):
+        return None
+    if _definition_change_intent(question) or _extract_simple_merchant_query(question):
+        return None
+    days_match = re.search(r"\b(?:over\s+(?:the\s+)?)?last\s+(\d{1,3})\s+days?\b", normalized)
+    if not days_match:
+        days_match = re.search(r"\b(?:past|previous)\s+(\d{1,3})\s+days?\b", normalized)
+    if not days_match:
+        return None
+    days = int(days_match.group(1))
+    if days == 7 or days < 2 or days > 31:
+        return None
+    return days
+
+
 def _card_gtv_period_key(question: str) -> str | None:
     normalized = _normalize_question(question)
     if not re.search(r"\b(gtv|card\s+spend)\b", normalized):
@@ -1076,6 +1081,29 @@ def _matches_swiggy_spend_trend_10d(question: str) -> bool:
     )
 
 
+def _matches_gym_milestone_avg_monthly_spend_3mo(question: str) -> bool:
+    if _definition_change_intent(question):
+        return False
+    normalized = _normalize_question(question)
+    if not re.search(r"\bgym\b", normalized):
+        return False
+    if not re.search(r"\bmilestone\b", normalized):
+        return False
+    if not re.search(r"\b(avg|average|mean)\b", normalized):
+        return False
+    if not re.search(r"\bmonthly\b", normalized):
+        return False
+    if not re.search(r"\b(spend|spends|spent|spending|gtv)\b", normalized):
+        return False
+    return bool(
+        re.search(
+            r"\b(?:over\s+(?:the\s+)?)?last\s+(?:3|three)\s+months?\b",
+            normalized,
+        )
+        or re.search(r"\b(?:past|previous)\s+(?:3|three)\s+months?\b", normalized)
+    )
+
+
 def _card_gtv_7d_request(question: str) -> dict[str, Any]:
     window = _india_completed_days_window(7)
     sql = f"""
@@ -1149,6 +1177,41 @@ def _card_period_kpi_sql(window: dict[str, str]) -> str:
     where ct.is_card_spend = true
       and ct.is_reward_reconciliation = false
   """
+
+
+def _card_gtv_completed_days_request(question: str, *, days: int) -> dict[str, Any]:
+    window = _india_completed_days_window(days)
+    sql = _card_period_kpi_sql(window)
+
+    return {
+        "question": question,
+        "interpretedDefinition": (
+            f"Card GTV over the last {days} completed Asia/Kolkata days, "
+            "excluding today."
+        ),
+        "metricIds": ["gtv"],
+        "sql": sql,
+        "resultType": "kpi",
+        "sources": ["transactions", "marketplace_order", "profiles"],
+        "dateWindow": f"{window['from']} to {window['toExclusive']}",
+        "timezone": window["timezone"],
+        "assumptions": (
+            f"Last {days} days follows the completed dashboard window convention: "
+            f"the {days} India days ending before today."
+        ),
+        "caveats": (
+            "GTV is gross successful card spend only; wallet loads, refunds, "
+            "and marketplace reward reconciliation rows are excluded."
+        ),
+        "freshness": f"Live Supabase read at query runtime on {window['today']}.",
+        "resultSummary": (
+            "Returns total GTV, successful card transaction count, card users, "
+            f"and source freshness for the completed {days}-day window."
+        ),
+        "friction": "none",
+        "conventionAdded": "none",
+        "repeatPromoteCandidate": True,
+    }
 
 
 def _card_gtv_period_request(question: str, *, period_key: str) -> dict[str, Any]:
@@ -2032,6 +2095,137 @@ def _swiggy_spend_trend_10d_request(question: str) -> dict[str, Any]:
     }
 
 
+def _gym_milestone_avg_monthly_spend_3mo_request(question: str) -> dict[str, Any]:
+    window = _india_completed_months_window(3)
+    sql = f"""
+    with
+    gym_users as (
+      select distinct mpi.user_id
+      from milestone_program_instances mpi
+      join customer_vouchers cv on cv.id = mpi.program_id
+      join profiles p on p.id = mpi.user_id
+      where mpi.status = 'active'
+        and coalesce(p.is_deleted, false) = false
+        and mpi.user_id is not null
+    ),
+    months as (
+      select generate_series(
+        '{_escape_sql_literal(window["from"])}'::date,
+        '{_escape_sql_literal(window["lastMonth"])}'::date,
+        interval '1 month'
+      )::date as month_start
+    ),
+    {_classified_transactions_cte_sql(window["from"], window["toExclusive"])},
+    monthly as (
+      select
+        date_trunc('month', ct.business_transaction_timestamp)::date as month_start,
+        coalesce(sum(ct.debit_amount), 0)::float as gtv,
+        count(*)::int as transactions,
+        count(distinct ct.user_id)::int as spending_users,
+        max(coalesce(
+          ct.updated_at,
+          ct.created_at at time zone 'UTC',
+          ct.transaction_timestamp at time zone 'UTC'
+        ))::text as source_freshness
+      from classified_transactions ct
+      join gym_users gu on gu.user_id = ct.user_id
+      where ct.is_card_spend = true
+        and ct.is_reward_reconciliation = false
+      group by 1
+    ),
+    cohort_size as (
+      select count(*)::int as gym_users from gym_users
+    ),
+    monthly_with_zeroes as (
+      select
+        m.month_start,
+        cs.gym_users,
+        coalesce(mon.gtv, 0)::float as gtv,
+        coalesce(mon.transactions, 0)::int as transactions,
+        coalesce(mon.spending_users, 0)::int as spending_users,
+        case
+          when cs.gym_users > 0 then (coalesce(mon.gtv, 0) / cs.gym_users)::float
+          else null
+        end as avg_spend_per_gym_user,
+        case
+          when coalesce(mon.spending_users, 0) > 0
+            then (coalesce(mon.gtv, 0) / mon.spending_users)::float
+          else null
+        end as avg_spend_per_spending_user,
+        mon.source_freshness
+      from months m
+      cross join cohort_size cs
+      left join monthly mon on mon.month_start = m.month_start
+    )
+    select
+      'overall_3mo_avg'::text as period,
+      null::date as month_start,
+      max(gym_users)::int as gym_users,
+      sum(gtv)::float as total_gtv,
+      sum(transactions)::int as transactions,
+      null::int as spending_users,
+      avg(avg_spend_per_gym_user)::float as avg_monthly_spend_per_gym_user,
+      avg(avg_spend_per_spending_user)::float as avg_monthly_spend_per_spending_user,
+      max(source_freshness)::text as source_freshness
+    from monthly_with_zeroes
+    union all
+    select
+      to_char(month_start, 'YYYY-MM')::text as period,
+      month_start,
+      gym_users,
+      gtv as total_gtv,
+      transactions,
+      spending_users,
+      avg_spend_per_gym_user as avg_monthly_spend_per_gym_user,
+      avg_spend_per_spending_user as avg_monthly_spend_per_spending_user,
+      source_freshness
+    from monthly_with_zeroes
+    order by month_start nulls first
+  """
+
+    return {
+        "question": question,
+        "interpretedDefinition": (
+            "Gym milestone users are current active milestone-program users; "
+            "spend is gross successful card spend / GTV."
+        ),
+        "metricIds": ["gym_milestone_users", "gtv"],
+        "sql": sql,
+        "resultType": "timeseries",
+        "sources": [
+            "milestone_program_instances",
+            "customer_vouchers",
+            "profiles",
+            "transactions",
+            "marketplace_order",
+        ],
+        "dateWindow": f"{window['from']} to {window['toExclusive']}",
+        "timezone": window["timezone"],
+        "assumptions": (
+            "Gym milestone users are current active milestone users with "
+            "non-deleted profiles. Monthly spend is gross successful card "
+            "spend by that cohort, averaged per completed calendar month. "
+            "The window is the last 3 completed calendar months before the "
+            "current partial month."
+        ),
+        "caveats": (
+            "Cohort membership is current active status, not historical "
+            "membership as-of each month. Users with zero card spend in a "
+            "month are included in avg_spend_per_gym_user; "
+            "avg_spend_per_spending_user excludes zero-spend users."
+        ),
+        "freshness": f"Live Supabase read at query runtime on {window['today']}.",
+        "resultSummary": (
+            "Returns the 3-month average monthly card spend per active gym "
+            "milestone user, plus monthly GTV, transaction count, spending "
+            "users, and source freshness."
+        ),
+        "friction": "none",
+        "conventionAdded": "none",
+        "repeatPromoteCandidate": True,
+    }
+
+
 def _profile_answer_question_shortcut(
     args: dict[str, Any],
     *,
@@ -2049,6 +2243,12 @@ def _profile_answer_question_shortcut(
     if daily_gtv_days:
         shortcut = f"card_gtv_daily_{daily_gtv_days}d"
         request = _card_gtv_daily_request(question, days=daily_gtv_days)
+    elif completed_gtv_days := _card_gtv_completed_days(question):
+        shortcut = f"card_gtv_last_{completed_gtv_days}d"
+        request = _card_gtv_completed_days_request(question, days=completed_gtv_days)
+    elif _matches_gym_milestone_avg_monthly_spend_3mo(question):
+        shortcut = "gym_milestone_avg_monthly_spend_3mo"
+        request = _gym_milestone_avg_monthly_spend_3mo_request(question)
     elif _matches_top_merchants_card_spend_7d(question):
         shortcut = "top_merchants_card_spend_7d"
         request = _top_merchants_card_spend_7d_request(question)
@@ -2155,6 +2355,14 @@ def _format_inr(value: Any) -> str:
     return f"₹{amount:,.0f}"
 
 
+def _format_inr_decimal(value: Any, *, digits: int = 2) -> str:
+    try:
+        amount = float(value or 0)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"₹{amount:,.{digits}f}"
+
+
 def _format_number(value: Any) -> str:
     try:
         return f"{round(float(value or 0)):,.0f}"
@@ -2212,6 +2420,41 @@ def _card_gtv_7d_slack_text(payload: dict[str, Any]) -> str:
         lines = [
             (
                 "Card GTV for the last 7 completed IST days was "
+                f"*{_format_inr(first_row.get('gtv'))}*."
+            ),
+            "",
+            f"- *Transactions:* {_format_number(first_row.get('transactions'))}",
+            f"- *Card users:* {_format_number(first_row.get('users'))}",
+        ]
+        date_window = _metadata_value(payload, "dateWindow")
+        if date_window:
+            lines.append(f"- *Window:* {date_window}")
+        freshness = first_row.get("source_freshness") or _metadata_value(payload, "freshness")
+        if freshness:
+            lines.append(f"- *Freshness:* {freshness}")
+        lines.extend(["", fine_print])
+
+    return "\n".join(lines)
+
+
+def _card_gtv_completed_days_slack_text(payload: dict[str, Any], *, days: int) -> str:
+    rows = payload.get("rows")
+    first_row = rows[0] if isinstance(rows, list) and rows and isinstance(rows[0], dict) else None
+    fine_print = (
+        "Fine print: completed-window card GTV is gross successful card spend "
+        "only; wallet loads, refunds, and reward reconciliation rows are excluded."
+    )
+
+    if not first_row:
+        lines = [
+            f"I did not find card GTV in the last {days} completed IST days.",
+            "",
+            fine_print,
+        ]
+    else:
+        lines = [
+            (
+                f"Card GTV for the last {days} completed IST days was "
                 f"*{_format_inr(first_row.get('gtv'))}*."
             ),
             "",
@@ -3027,6 +3270,81 @@ def _swiggy_spend_trend_10d_slack_text(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
+def _gym_milestone_avg_monthly_spend_3mo_slack_text(payload: dict[str, Any]) -> str:
+    raw_rows = payload.get("rows")
+    rows = [
+        row
+        for row in raw_rows
+        if isinstance(row, dict)
+    ] if isinstance(raw_rows, list) else []
+    overall = next(
+        (row for row in rows if str(row.get("period") or "") == "overall_3mo_avg"),
+        rows[0] if rows else None,
+    )
+    month_rows = sorted(
+        [
+            row
+            for row in rows
+            if str(row.get("period") or "") != "overall_3mo_avg"
+        ],
+        key=lambda row: str(row.get("period") or ""),
+    )
+    fine_print = (
+        "Fine print: cohort is current active gym milestone users with "
+        "non-deleted profiles. Spend is gross successful card spend; zero-spend "
+        "users are included in avg / gym user."
+    )
+
+    if not overall:
+        lines = [
+            "I did not find monthly card spend for current active gym milestone users.",
+            "",
+            fine_print,
+        ]
+    else:
+        lines = [
+            (
+                "For current active gym milestone users, average monthly card spend "
+                "over the last 3 completed months was:"
+            ),
+            "",
+            (
+                f"*{_format_inr_decimal(overall.get('avg_monthly_spend_per_gym_user'))}* "
+                "per gym milestone user / month"
+            ),
+            (
+                f"*{_format_inr_decimal(overall.get('avg_monthly_spend_per_spending_user'))}* "
+                "per spending gym user / month"
+            ),
+            "",
+            "| Period | Gym users | Spending users | GTV | Txns | Avg / gym user | Avg / spending user |",
+            "|---|---:|---:|---:|---:|---:|---:|",
+        ]
+        for row in month_rows:
+            lines.append(
+                "| "
+                f"{_slack_table_cell(row.get('period'))} | "
+                f"{_format_number(row.get('gym_users'))} | "
+                f"{_format_number(row.get('spending_users'))} | "
+                f"{_format_inr(row.get('total_gtv'))} | "
+                f"{_format_number(row.get('transactions'))} | "
+                f"{_format_inr_decimal(row.get('avg_monthly_spend_per_gym_user'))} | "
+                f"{_format_inr_decimal(row.get('avg_monthly_spend_per_spending_user'))} |"
+            )
+        date_window = _metadata_value(payload, "dateWindow")
+        if date_window:
+            lines.extend(["", f"- *Window:* {date_window}"])
+        freshness = overall.get("source_freshness") or _metadata_value(payload, "freshness")
+        if freshness:
+            lines.append(f"- *Freshness:* {freshness}")
+        lines.extend(["", fine_print])
+
+    dashboard_line = _profile_shortcut_dashboard_line(payload)
+    if dashboard_line:
+        lines.extend(["", dashboard_line])
+    return "\n".join(lines)
+
+
 def _profile_answer_question_payload(
     *,
     shortcut: str,
@@ -3147,6 +3465,12 @@ def _profile_answer_question_payload(
             answer_payload,
             period_key="this_week",
         )
+    elif shortcut.startswith("card_gtv_last_") and shortcut.endswith("d"):
+        days_text = shortcut.removeprefix("card_gtv_last_").removesuffix("d")
+        answer_payload["slackText"] = _card_gtv_completed_days_slack_text(
+            answer_payload,
+            days=_coerce_int(days_text, 0, minimum=1, maximum=31),
+        )
     elif shortcut == "card_gtv_7d":
         answer_payload["slackText"] = _card_gtv_7d_slack_text(answer_payload)
     elif shortcut == "card_gtv_today":
@@ -3176,6 +3500,10 @@ def _profile_answer_question_payload(
         )
     elif shortcut == "card_gtv_weekly_30d":
         answer_payload["slackText"] = _card_gtv_weekly_30d_slack_text(answer_payload)
+    elif shortcut == "gym_milestone_avg_monthly_spend_3mo":
+        answer_payload["slackText"] = _gym_milestone_avg_monthly_spend_3mo_slack_text(
+            answer_payload
+        )
 
     return {
         "ok": True,
@@ -3359,6 +3687,7 @@ def _compact_answer_question_payload(payload: Any) -> Any:
         "resultType",
         "requiresClarification",
         "clarificationQuestion",
+        "choices",
         "rowCount",
         "truncated",
         "dryRun",
@@ -3427,9 +3756,6 @@ def _direct_final_response_for_answer_payload(payload: Any) -> str | None:
     answer_payload = nested_payload if isinstance(nested_payload, dict) else payload
     slack_text = answer_payload.get("slackText")
     if not isinstance(slack_text, str) or not slack_text.strip():
-        clarification = answer_payload.get("clarificationQuestion")
-        if isinstance(clarification, str) and clarification.strip():
-            return clarification.strip()
         return None
 
     final_text = _compact_direct_final_slack_text(slack_text)
@@ -3439,6 +3765,23 @@ def _direct_final_response_for_answer_payload(payload: Any) -> str | None:
     if dashboard_line and "dashboard:" not in final_text.lower():
         final_text = f"{final_text}\n\n{dashboard_line.strip()}"
     return final_text
+
+
+def _clarify_instruction_for_answer_payload(payload: Any) -> str | None:
+    if not isinstance(payload, dict):
+        return None
+
+    nested_payload = payload.get("payload")
+    answer_payload = nested_payload if isinstance(nested_payload, dict) else payload
+    clarification = answer_payload.get("clarificationQuestion")
+    if not isinstance(clarification, str) or not clarification.strip():
+        return None
+
+    return (
+        "Call `clarify` with `payload.payload.clarificationQuestion` before "
+        "answering or querying. Do not send the clarification as a final "
+        "assistant response."
+    )
 
 
 def _is_elixir_analytics_skill_request(args: dict[str, Any]) -> bool:
@@ -3542,7 +3885,7 @@ def _block_non_ritik_source_control_tool(
     return {"action": "block", "message": RITIK_ONLY_MESSAGE}
 
 
-def _pre_gateway_elixir_analytics_fast_path(
+def _pre_gateway_elixir_analytics_agent_handoff(
     *,
     event: Any,
     gateway: Any,
@@ -3566,6 +3909,7 @@ def _pre_gateway_elixir_analytics_fast_path(
         return {
             "action": "respond",
             "text": READ_ONLY_GUARD_MESSAGE,
+            "response_type": "guardrail",
             "reason": "elixir_analytics_read_only_guard",
         }
 
@@ -3576,48 +3920,29 @@ def _pre_gateway_elixir_analytics_fast_path(
         source=source,
     )
 
-    resolved_question = _resolve_active_users_clarification_reply(
-        raw_text=context_raw_text,
-        question=question,
-    )
-    if resolved_question:
-        question = resolved_question
-    else:
-        resolved_question = _resolve_top_spender_spend_breakdown_followup(
-            raw_text=context_raw_text,
+    if _is_ambiguous_active_users_question(question):
+        return {
+            "action": "annotate",
+            "text": question,
+            "text_type": "transport_normalization",
+            "context": _agent_runtime_handoff_text(
+                question=question,
+                raw_text=context_raw_text,
+                active_user_ambiguity=True,
+            ),
+            "reason": "elixir_analytics_agent_runtime_handoff",
+        }
+
+    return {
+        "action": "annotate",
+        "text": question,
+        "text_type": "transport_normalization",
+        "context": _agent_runtime_handoff_text(
             question=question,
-        )
-        if resolved_question:
-            question = resolved_question
-
-    if not resolved_question and _is_ambiguous_active_users_question(question):
-        return {
-            "action": "respond",
-            "text": _active_users_clarification_text(question),
-            "reason": "elixir_analytics_active_users_clarification",
-        }
-
-    try:
-        result = run_elixir_analytics_runner(
-            {
-                "mode": "answer_question",
-                "question": question,
-                "max_rows": DEFAULT_FAST_PATH_MAX_ROWS,
-                "timeout_seconds": DEFAULT_FAST_PATH_TIMEOUT_SECONDS,
-            }
-        )
-    except Exception:
-        LOGGER.debug("pre_gateway_dispatch fast path failed", exc_info=True)
-        return {"action": "allow"}
-
-    direct_final = result.get("hermes_direct_final_response")
-    if isinstance(direct_final, str) and direct_final.strip():
-        return {
-            "action": "respond",
-            "text": direct_final.strip(),
-            "reason": "elixir_analytics_fast_path",
-        }
-    return {"action": "allow"}
+            raw_text=context_raw_text,
+        ),
+        "reason": "elixir_analytics_agent_runtime_handoff",
+    }
 
 
 def _runner_command(args: dict[str, Any]) -> tuple[list[str], str | None]:
@@ -3866,6 +4191,9 @@ def run_elixir_analytics_runner(args: dict[str, Any]) -> dict[str, Any]:
         direct_final_response = _direct_final_response_for_answer_payload(payload)
         if direct_final_response:
             result["hermes_direct_final_response"] = direct_final_response
+        clarify_instruction = _clarify_instruction_for_answer_payload(payload)
+        if clarify_instruction:
+            result["hermes_agent_instruction"] = clarify_instruction
     _log_runner_result(result)
     return result
 
@@ -3877,7 +4205,7 @@ def _handler(args: dict[str, Any], **_: Any) -> str:
 def register(ctx) -> None:
     ctx.register_hook("pre_tool_call", _block_non_ritik_source_control_tool)
     ctx.register_hook("transform_tool_result", _transform_tool_result)
-    ctx.register_hook("pre_gateway_dispatch", _pre_gateway_elixir_analytics_fast_path)
+    ctx.register_hook("pre_gateway_dispatch", _pre_gateway_elixir_analytics_agent_handoff)
     ctx.register_tool(
         name="elixir_analytics_runner",
         toolset=TOOLSET,
@@ -3889,7 +4217,9 @@ def register(ctx) -> None:
                 "or self-improvement runners without shell/code-execution setup. "
                 "Use mode='answer_question' first for plain Slack analytics "
                 "questions. If a completed answer_question payload includes "
-                "payload.slackText, use it as the Slack-facing final answer."
+                "payload.slackText, use it as the Slack-facing final answer. "
+                "For ambiguous business terms, use `clarify` so the next Slack "
+                "reply is captured inside the same agent run."
             ),
             "parameters": {
                 "type": "object",

@@ -10,6 +10,7 @@ from hermes_cli.tools_config import _get_platform_tools
 REPO_ROOT = Path(__file__).resolve().parents[2]
 DIST_DIR = REPO_ROOT / "profile-distributions" / "elixir-analytics"
 SKILL_PATH = DIST_DIR / "skills" / "elixir-analytics" / "SKILL.md"
+SOUL_PATH = DIST_DIR / "SOUL.md"
 
 
 def _load_yaml(name: str):
@@ -209,6 +210,20 @@ def test_elixir_analytics_distribution_ships_analytics_skill():
     assert 'mode: "self_improvement_check"' in body
     assert 'mode: "self_improvement_plan"' in body
     assert "short redirect is acceptable" not in body
+
+
+def test_elixir_analytics_skill_uses_durable_clarify_for_ambiguity():
+    body = SKILL_PATH.read_text(encoding="utf-8")
+    soul = SOUL_PATH.read_text(encoding="utf-8")
+
+    assert "use the `clarify` tool" in body
+    assert "Do not ask the clarification as an ordinary final answer" in body
+    assert "the next Slack reply is captured as the answer" in body
+    assert "If the planner returns `clarify`, call `clarify`" in body
+    assert "If the user replies by changing the definition" in body
+    assert "use `clarify` to ask whether they mean card active" in body
+    assert "If it returns `requiresClarification`, use `clarify` before editing" in body
+    assert "Use `clarify` for ambiguous business terms" in soul
 
 
 def test_elixir_analytics_distribution_ships_product_roadmap():

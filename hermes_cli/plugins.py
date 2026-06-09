@@ -151,8 +151,14 @@ VALID_HOOKS: Set[str] = {
     # after the internal-event guard but BEFORE auth/pairing and agent
     # dispatch. Plugins may return a dict to influence flow:
     #   {"action": "skip",    "reason": "..."}  -> drop message (no reply)
-    #   {"action": "rewrite", "text": "..."}    -> replace event.text, continue
-    #   {"action": "respond", "text": "..."}    -> send text and stop dispatch
+    #   {"action": "rewrite", "text": "...",
+    #    "rewrite_type": "transport_normalization"}
+    #                                             -> clean platform wrappers, continue
+    #   {"action": "annotate", "context": "...",
+    #    "text": "...",
+    #    "text_type": "transport_normalization"} -> agent-only runtime context, continue
+    #   {"action": "respond", "text": "...",
+    #    "response_type": "guardrail"}          -> send non-conversational guard text and stop dispatch
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",

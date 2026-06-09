@@ -139,8 +139,10 @@ Read only the files needed for the question:
    when a model-built request is needed.
 2. Plan remaining Slack analytics questions with
    `scripts/plan-analytics-question.ts`.
-3. If the planner returns `clarify`, ask its clarification question before
-   querying.
+3. If the planner returns `clarify`, use the `clarify` tool with its
+   clarification question before querying. Do not ask the clarification as an
+   ordinary final answer; `clarify` creates a pending prompt so the next Slack
+   reply is captured as the answer inside the same agent run.
 4. Plan every definition/glossary/schema/dashboard source-change request with
    `elixir_analytics_runner` mode `source_change_plan`.
 5. Check self-improvement cadence with `elixir_analytics_runner` mode
@@ -197,7 +199,11 @@ For a plain Slack data question, optimize for a direct answer:
 3. If `answer_question` returns `requires_model_request`, use mode `plan`
    instead of a generic terminal or `execute_code` call. Call
    `scripts/plan-analytics-question.ts` once through the runner tool path.
-4. If the planner returns `clarify`, ask the clarification question and stop.
+4. If the planner returns `clarify`, call `clarify` with the planner's
+   `clarificationQuestion` and choices when present. Do not ask the
+   clarification as an ordinary final answer; `clarify` creates a pending
+   prompt so the next Slack reply is captured as the answer inside the same
+   agent run.
 5. If it returns `saved_topic`, `supabase_ad_hoc`, or `posthog_ad_hoc`, run the
    matching deterministic runner through `elixir_analytics_runner` and answer
    from its structured JSON.
@@ -235,7 +241,8 @@ node --import tsx scripts/plan-analytics-question.ts --question '<Slack question
 
 Use the planner output as the routing contract:
 
-- `clarify`: ask `clarificationQuestion` in Slack before running anything.
+- `clarify`: call `clarify` with `clarificationQuestion` in Slack before
+  running anything. Do not ask the clarification as an ordinary final answer.
 - `saved_topic`: run `recommendedCommand`.
 - `supabase_ad_hoc`: build an `AdHocQueryRequest` and run
   `scripts/run-ad-hoc-query.ts`.
@@ -335,8 +342,8 @@ For "how many app active users this week", use metric contract
 `active_app_user`, default "this week" to India business week-to-date, query
 PostHog `events` with read-only HogQL, and return user count/event count/date
 window/freshness/caveats/source metadata. If the user only says "active users",
-ask whether they mean card active, app active, or combined active before
-querying.
+use `clarify` to ask whether they mean card active, app active, or combined
+active before querying.
 
 After a successful PostHog runner result, include the same dashboard-link
 handoff rule as Supabase ad hoc queries.
@@ -408,6 +415,17 @@ handoff rule as Supabase ad hoc queries.
 
 ## Clarification Triggers
 
+For these cases, use the `clarify` tool rather than a plain final-answer
+question. If the user replies by changing the definition, correcting the
+question, or redirecting to another metric, treat that reply as the new
+instruction and continue agentically from the updated meaning.
+
+Gateway/profile hooks may supply runtime context, read-only guardrails, or
+transport normalization, but they must not run the conversation. Do not assume
+that a short reply like "1", "take 1", "instead use app active", or "why that?"
+belongs to a fixed menu; interpret it against the live thread and agent
+history, then clarify or continue from the updated meaning.
+
 Ask clarification for:
 
 - active users: card active, app active, or combined active
@@ -426,10 +444,11 @@ Call `elixir_analytics_runner` with `mode: "source_change_plan"` and
 `request: "<Slack request>"`. This runs `scripts/plan-source-change.ts` without
 generic shell setup.
 
-If it returns `requiresClarification`, ask before editing. Otherwise, edit the
-returned `requiredFiles` and update the returned `testFiles`. Before committing,
-call `elixir_analytics_runner` with `mode: "source_change_scope_check"`, the
-original request, and the changed file paths. This runs
+If it returns `requiresClarification`, use `clarify` before editing. Otherwise,
+edit the returned `requiredFiles` and update the returned `testFiles`. Before
+committing, call `elixir_analytics_runner` with
+`mode: "source_change_scope_check"`, the original request, and the changed file
+paths. This runs
 `scripts/check-source-change-scope.ts`. If it returns `status: "blocked"`,
 resolve the blockers before running the verification commands. Then open a PR
 using `prTitle`. Do not silently change production metric behavior.

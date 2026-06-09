@@ -53,6 +53,13 @@ from typing import Dict, Optional, Any, List, Union
 from agent.account_usage import fetch_account_usage, render_account_usage_lines
 from agent.async_utils import safe_schedule_threadsafe
 from agent.i18n import t
+from gateway.agentic_router import maybe_build_middle_model_advisory, route_pre_gateway_hooks
+from gateway.canary import (
+    build_runtime_fingerprint,
+    detect_stale_runtime,
+    run_pre_gateway_contract_canary,
+)
+from gateway.decision_ledger import GatewayDecisionLedger
 from hermes_cli.config import cfg_get
 from hermes_cli.fallback_config import get_fallback_chain
 
@@ -1929,6 +1936,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         global _gateway_runner_ref
         self.config = config or load_gateway_config()
         self.adapters: Dict[Platform, BasePlatformAdapter] = {}
+        try:
+            self._runtime_fingerprint = build_runtime_fingerprint()
+        except Exception:
+            self._runtime_fingerprint = {}
         self._warn_if_docker_media_delivery_is_risky()
         _gateway_runner_ref = _weakref.ref(self)
 
@@ -4479,6 +4490,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except RuntimeError:
             self._gateway_loop = None
         logger.info("Session storage: %s", self.config.sessions_dir)
+        try:
+            _fp = getattr(self, "_runtime_fingerprint", None) or build_runtime_fingerprint()
+            self._runtime_fingerprint = _fp
+            logger.info(
+                "Agentic gateway contract: version=%s digest=%s git=%s dirty_files=%d",
+                _fp.get("contract_version") or "unknown",
+                _fp.get("digest") or "unknown",
+                _fp.get("git_head") or "unknown",
+                len(_fp.get("dirty_files") or []),
+            )
+            _cwd = Path.cwd()
+            if (_cwd / "gateway" / "run.py").exists():
+                _expected_fp = build_runtime_fingerprint(_cwd)
+                _stale_warning = detect_stale_runtime(expected=_expected_fp, actual=_fp)
+                if _stale_warning:
+                    logger.warning("%s", _stale_warning)
+            _canary = run_pre_gateway_contract_canary()
+            if _canary.get("ok"):
+                logger.info(
+                    "Agentic gateway canary passed: route=%s blocked_reason=%s",
+                    _canary.get("route"),
+                    _canary.get("blocked_reason"),
+                )
+            else:
+                logger.warning("Agentic gateway canary FAILED: %s", _canary)
+        except Exception as _agentic_contract_exc:
+            logger.warning(
+                "Agentic gateway contract fingerprint/canary failed: %s",
+                _agentic_contract_exc,
+            )
 
         # Sanity-check that systemd's TimeoutStopSec covers our drain
         # window.  When the user upgraded hermes-agent without re-running
@@ -6208,6 +6249,51 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         await adapter.send(source.chat_id, content, metadata=metadata)
 
+    def _new_gateway_decision_ledger(self, event: MessageEvent) -> GatewayDecisionLedger:
+        source = event.source
+        return GatewayDecisionLedger(
+            platform=source.platform.value if source.platform else "unknown",
+            chat_id=source.chat_id or "",
+            user_id=source.user_id,
+            message_id=event.message_id,
+            original_text=event.text or "",
+            runtime_fingerprint=getattr(self, "_runtime_fingerprint", None),
+        )
+
+    def _persist_gateway_decision_ledger(
+        self,
+        ledger: GatewayDecisionLedger,
+        *,
+        session_id: str | None = None,
+    ) -> None:
+        if not ledger:
+            return
+        resolved_session_id = session_id or ledger.session_id
+        if not isinstance(resolved_session_id, str) or not resolved_session_id:
+            resolved_session_id = ledger.turn_id
+        if not ledger.session_id:
+            ledger.session_id = resolved_session_id
+        store = getattr(self, "_session_db", None) or getattr(self, "session_store", None)
+        append = getattr(store, "append_gateway_turn", None)
+        if not callable(append):
+            return
+        try:
+            summary = ledger.summary()
+            append(resolved_session_id, summary)
+            runtime_fp = summary.get("runtime_fingerprint") or {}
+            logger.info(
+                "gateway turn decision: turn_id=%s session=%s action=%s reason=%s decisions=%s digest=%s",
+                summary.get("turn_id") or "",
+                resolved_session_id,
+                summary.get("final_action") or "",
+                summary.get("final_reason") or "",
+                summary.get("decision_count") or 0,
+                runtime_fp.get("digest") or "",
+            )
+            ledger.persisted = True
+        except Exception as exc:
+            logger.debug("Gateway decision ledger persistence failed: %s", exc)
+
     async def _handle_message(self, event: MessageEvent) -> Optional[str]:
         """
         Handle an incoming message from any platform.
@@ -6222,6 +6308,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         7. Return response
         """
         source = event.source
+        _decision_ledger = self._new_gateway_decision_ledger(event)
 
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
@@ -6230,9 +6317,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
         # Plugins receive the MessageEvent and may return a dict influencing flow:
         #   {"action": "skip",    "reason": ...}    -> drop (no reply, plugin handled)
-        #   {"action": "rewrite", "text":  ...}     -> replace event.text, continue
-        #   {"action": "respond", "text":  ...}     -> send text, stop dispatch
+        #   {"action": "rewrite", "text":  ...,
+        #    "rewrite_type": "transport_normalization"}
+        #                                             -> clean platform wrappers, continue
+        #   {"action": "annotate", "context": ...,
+        #    "text": optional,
+        #    "text_type": "transport_normalization"} -> agent-only context, continue
+        #   {"action": "respond", "text":  ...,
+        #    "response_type": "guardrail"|...}      -> send text, stop dispatch
         #   {"action": "allow"}   /   None          -> normal dispatch
+        # Conversational responses are deliberately not allowed here: hooks
+        # may guard, annotate, normalize transport noise, or drop, but Chandler's
+        # dialogue and semantic interpretation must stay inside the agent
+        # runtime so session state owns the meaning.
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
         if not is_internal:
@@ -6248,58 +6345,108 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
                 _hook_results = []
 
-            for _result in _hook_results:
-                if not isinstance(_result, dict):
-                    continue
-                _action = _result.get("action")
-                if _action == "skip":
-                    logger.info(
-                        "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
-                        _result.get("reason"),
+            _route_decision = route_pre_gateway_hooks(_hook_results)
+            for _hook_decision in _route_decision.hook_decisions:
+                _payload = _hook_decision.payload
+                _decision_ledger.record_hook_result(
+                    _hook_decision.actor,
+                    _payload,
+                    applied=_hook_decision.applied,
+                    blocked_reason=_hook_decision.blocked_reason,
+                )
+                if _hook_decision.blocked_reason == "untyped_text_mutation":
+                    logger.warning(
+                        "pre_gateway_dispatch ignored untyped %s text: "
+                        "reason=%s platform=%s chat=%s",
+                        _hook_decision.action,
+                        _hook_decision.reason,
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
                     )
-                    return None
-                if _action == "rewrite":
-                    _new_text = _result.get("text")
-                    if isinstance(_new_text, str):
-                        event = dataclasses.replace(event, text=_new_text)
-                        source = event.source
-                    break
-                if _action == "respond":
-                    _text = _result.get("text") or _result.get("content")
-                    if not isinstance(_text, str) or not _text.strip():
-                        continue
-                    _adapter = self.adapters.get(source.platform)
-                    if _adapter is None:
-                        logger.warning(
-                            "pre_gateway_dispatch respond had no adapter: reason=%s platform=%s chat=%s",
-                            _result.get("reason"),
-                            source.platform.value if source.platform else "unknown",
-                            source.chat_id or "unknown",
-                        )
-                        return None
-                    _metadata = _result.get("metadata")
-                    if not isinstance(_metadata, dict):
-                        _metadata = self._thread_metadata_for_source(
-                            source,
-                            self._reply_anchor_for_event(event),
-                        )
-                    await _adapter.send(
-                        source.chat_id,
-                        _text.strip(),
-                        metadata=_metadata,
-                    )
-                    logger.info(
-                        "pre_gateway_dispatch respond: reason=%s platform=%s chat=%s response=%d chars",
-                        _result.get("reason"),
+                elif _hook_decision.blocked_reason == "conversational_respond_not_allowed":
+                    logger.warning(
+                        "pre_gateway_dispatch ignored conversational respond: "
+                        "reason=%s platform=%s chat=%s response_type=%s",
+                        _hook_decision.reason,
                         source.platform.value if source.platform else "unknown",
                         source.chat_id or "unknown",
-                        len(_text.strip()),
+                        str(
+                            _payload.get("response_type")
+                            or _payload.get("kind")
+                            or "missing"
+                        ).strip().lower(),
                     )
+
+            if _route_decision.rewritten_text is not None:
+                event = dataclasses.replace(event, text=_route_decision.rewritten_text)
+                source = event.source
+
+            if _route_decision.runtime_context.strip():
+                _existing_context = getattr(event, "runtime_context", None)
+                event = dataclasses.replace(
+                    event,
+                    runtime_context=(
+                        f"{_existing_context}\n\n{_route_decision.runtime_context.strip()}"
+                        if _existing_context
+                        else _route_decision.runtime_context.strip()
+                    ),
+                )
+                source = event.source
+
+            if _route_decision.route == "skip":
+                _decision_ledger.set_final_action(
+                    "skip",
+                    reason=_route_decision.final_reason,
+                )
+                self._persist_gateway_decision_ledger(_decision_ledger)
+                logger.info(
+                    "pre_gateway_dispatch skip: reason=%s platform=%s chat=%s",
+                    _route_decision.final_reason,
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                )
+                return None
+
+            if _route_decision.route == "respond":
+                _text = _route_decision.response_text or ""
+                _adapter = self.adapters.get(source.platform)
+                if _adapter is None:
+                    logger.warning(
+                        "pre_gateway_dispatch respond had no adapter: reason=%s platform=%s chat=%s",
+                        _route_decision.final_reason,
+                        source.platform.value if source.platform else "unknown",
+                        source.chat_id or "unknown",
+                    )
+                    _decision_ledger.set_final_action(
+                        "respond_no_adapter",
+                        reason=_route_decision.final_reason,
+                    )
+                    self._persist_gateway_decision_ledger(_decision_ledger)
                     return None
-                if _action == "allow":
-                    break
+                _decision_ledger.set_final_action(
+                    "respond",
+                    reason=_route_decision.final_reason,
+                )
+                _metadata = _route_decision.metadata
+                if not isinstance(_metadata, dict):
+                    _metadata = self._thread_metadata_for_source(
+                        source,
+                        self._reply_anchor_for_event(event),
+                    )
+                await _adapter.send(
+                    source.chat_id,
+                    _text.strip(),
+                    metadata=_metadata,
+                )
+                self._persist_gateway_decision_ledger(_decision_ledger)
+                logger.info(
+                    "pre_gateway_dispatch respond: reason=%s platform=%s chat=%s response=%d chars",
+                    _route_decision.final_reason,
+                    source.platform.value if source.platform else "unknown",
+                    source.chat_id or "unknown",
+                    len(_text.strip()),
+                )
+                return None
 
         if is_internal:
             pass
@@ -6311,10 +6458,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
             if not self._is_user_authorized(source):
+                _decision_ledger.record_gateway_decision(
+                    "authorization",
+                    reason="missing_user_id_denied",
+                    applied=True,
+                )
+                _decision_ledger.set_final_action(
+                    "auth_denied",
+                    reason="missing_user_id_denied",
+                    session_id=self._session_key_for_source(source),
+                )
+                self._persist_gateway_decision_ledger(_decision_ledger)
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
         elif not self._is_user_authorized(source):
             logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+            _auth_final_action = "auth_denied"
+            _auth_reason = "unauthorized_user"
             # In DMs: offer pairing code. In groups: silently ignore.
             if source.chat_type == "dm" and self._get_unauthorized_dm_behavior(source.platform) == "pair":
                 platform_name = source.platform.value if source.platform else "unknown"
@@ -6322,11 +6482,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
                 if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                    _decision_ledger.record_gateway_decision(
+                        "authorization",
+                        reason="pairing_rate_limited",
+                        applied=True,
+                    )
+                    _decision_ledger.set_final_action(
+                        "auth_rate_limited",
+                        reason="pairing_rate_limited",
+                        session_id=self._session_key_for_source(source),
+                    )
+                    self._persist_gateway_decision_ledger(_decision_ledger)
                     return None
                 code = self.pairing_store.generate_code(
                     platform_name, source.user_id, source.user_name or ""
                 )
                 if code:
+                    _auth_final_action = "auth_pairing"
+                    _auth_reason = "pairing_code_sent"
                     adapter = self.adapters.get(source.platform)
                     if adapter:
                         await adapter.send(
@@ -6346,6 +6519,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         )
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    _auth_final_action = "auth_rate_limited"
+                    _auth_reason = "pairing_code_unavailable"
+            _decision_ledger.record_gateway_decision(
+                "authorization",
+                reason=_auth_reason,
+                applied=True,
+            )
+            _decision_ledger.set_final_action(
+                _auth_final_action,
+                reason=_auth_reason,
+                session_id=self._session_key_for_source(source),
+            )
+            self._persist_gateway_decision_ledger(_decision_ledger)
             return None
         
         # Intercept messages that are responses to a pending /update prompt.
@@ -6357,6 +6543,48 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Otherwise control/session commands like /new or /help get silently
         # consumed as update answers instead of being dispatched normally.
         _quick_key = self._session_key_for_source(source)
+
+        async def _finalize_gateway_turn_result(
+            result_or_awaitable,
+            *,
+            action: str,
+            reason: str,
+            capability: str = "gateway",
+            details: dict[str, Any] | None = None,
+            session_id: str | None = None,
+        ):
+            result = (
+                await result_or_awaitable
+                if inspect.isawaitable(result_or_awaitable)
+                else result_or_awaitable
+            )
+            if not getattr(_decision_ledger, "persisted", False):
+                _ledger_session_id = session_id or _quick_key
+                if session_id is None:
+                    try:
+                        _ledger_entry = self.session_store.get_or_create_session(source)
+                        _entry_session_id = getattr(_ledger_entry, "session_id", None)
+                        if isinstance(_entry_session_id, str) and _entry_session_id:
+                            _ledger_session_id = _entry_session_id
+                    except Exception:
+                        pass
+                _decision_ledger.record_gateway_decision(
+                    capability,
+                    reason=reason,
+                    applied=True,
+                    details=details or {},
+                )
+                _decision_ledger.set_final_action(
+                    action,
+                    reason=reason,
+                    session_id=_ledger_session_id,
+                )
+                self._persist_gateway_decision_ledger(
+                    _decision_ledger,
+                    session_id=_ledger_session_id,
+                )
+            return result
+
         _update_prompts = getattr(self, "_update_prompt_pending", {})
         if _update_prompts.get(_quick_key):
             raw = (event.text or "").strip()
@@ -6393,10 +6621,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     prompt_path.unlink(missing_ok=True)
                 except OSError as e:
                     logger.warning("Failed to write update response: %s", e)
-                    return f"✗ Failed to send response to update process: {e}"
+                    return await _finalize_gateway_turn_result(
+                        f"✗ Failed to send response to update process: {e}",
+                        action="update_prompt_error",
+                        reason="update_prompt_write_failed",
+                        capability="update_prompt",
+                    )
                 _update_prompts.pop(_quick_key, None)
                 label = response_text if len(response_text) <= 20 else response_text[:20] + "…"
-                return f"✓ Sent `{label}` to the update process."
+                return await _finalize_gateway_turn_result(
+                    f"✓ Sent `{label}` to the update process.",
+                    action="update_prompt",
+                    reason="update_prompt_response",
+                    capability="update_prompt",
+                    details={"response_chars": len(response_text)},
+                )
             # Recognized slash command during a pending update prompt:
             # unblock the detached update subprocess by writing a blank
             # response so ``_gateway_prompt`` returns the prompt's default
@@ -6453,7 +6692,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Acknowledge with empty string so adapters that emit
                     # the agent's response don't double-post.  The agent
                     # itself will produce the next user-facing message.
-                    return ""
+                    return await _finalize_gateway_turn_result(
+                        "",
+                        action="clarify_reply",
+                        reason="gateway_clarify_resolved",
+                        capability="clarify",
+                        details={"clarify_id": _pending_clarify.clarify_id},
+                    )
 
         # Intercept messages that are responses to a pending /reload-mcp
         # (or future) slash-confirm prompt.  Recognized confirm replies are
@@ -6493,7 +6738,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _resolved = await _slash_confirm_mod.resolve(
                     _quick_key, _pending_confirm.get("confirm_id"), _confirm_choice,
                 )
-                return _resolved or ""
+                return await _finalize_gateway_turn_result(
+                    _resolved or "",
+                    action="slash_confirm",
+                    reason=f"slash_confirm_{_confirm_choice}",
+                    capability="slash_confirm",
+                    details={"choice": _confirm_choice},
+                )
             # Stale pending + unrelated command: drop the pending state so
             # the confirm doesn't block normal usage indefinitely.  The user
             # clearly moved on.
@@ -6561,7 +6812,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         if _quick_key in self._running_agents:
             if event.get_command() == "status":
-                return await self._handle_status_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_status_command(event),
+                    action="command",
+                    reason="/status",
+                    capability="slash_command",
+                    details={"command": "status", "active_session": True},
+                )
 
             # Resolve the command once for all early-intercept checks below.
             from hermes_cli.commands import (
@@ -6580,17 +6837,35 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _evt_cmd and _cmd_def_inner is not None:
                 _denied = self._check_slash_access(source, _cmd_def_inner.name)
                 if _denied is not None:
-                    return _denied
+                    return await _finalize_gateway_turn_result(
+                        _denied,
+                        action="command_denied",
+                        reason=f"/{_cmd_def_inner.name}",
+                        capability="slash_access",
+                        details={"command": _cmd_def_inner.name, "active_session": True},
+                    )
 
             # Telegram sends /start for bot launches/deep-links. Treat it as a
             # platform ping, not a user command: no help dump, no agent
             # interrupt, no queued text.
             if _cmd_def_inner and _cmd_def_inner.name == "start":
                 logger.info("Ignoring /start platform ping for active session %s", _quick_key)
-                return ""
+                return await _finalize_gateway_turn_result(
+                    "",
+                    action="command",
+                    reason="/start",
+                    capability="slash_command",
+                    details={"command": "start", "active_session": True},
+                )
 
             if _cmd_def_inner and _cmd_def_inner.name == "restart":
-                return await self._handle_restart_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_restart_command(event),
+                    action="command",
+                    reason="/restart",
+                    capability="slash_command",
+                    details={"command": "restart", "active_session": True},
+                )
 
             # /stop must hard-kill the session when an agent is running.
             # A soft interrupt (agent.interrupt()) doesn't help when the agent
@@ -6605,7 +6880,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     invalidation_reason="stop_command",
                 )
                 logger.info("STOP for session %s — agent interrupted, session lock released", _quick_key)
-                return EphemeralReply(t("gateway.stop.stopped"))
+                return await _finalize_gateway_turn_result(
+                    EphemeralReply(t("gateway.stop.stopped")),
+                    action="command",
+                    reason="/stop",
+                    capability="slash_command",
+                    details={"command": "stop", "active_session": True},
+                )
 
             # /reset and /new must bypass the running-agent guard so they
             # actually dispatch as commands instead of being queued as user
@@ -6624,7 +6905,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 # Clean up the running agent entry so the reset handler
                 # doesn't think an agent is still active.
-                return await self._handle_reset_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_reset_command(event),
+                    action="command",
+                    reason="/new",
+                    capability="slash_command",
+                    details={"command": "new", "active_session": True},
+                )
 
             # /queue <prompt> — queue without interrupting.
             # Semantics: each /queue invocation produces its own full agent
@@ -6633,7 +6920,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if event.get_command() in {"queue", "q"}:
                 queued_text = event.get_command_args().strip()
                 if not queued_text:
-                    return "Usage: /queue <prompt>"
+                    return await _finalize_gateway_turn_result(
+                        "Usage: /queue <prompt>",
+                        action="command",
+                        reason="/queue",
+                        capability="slash_command",
+                        details={"command": "queue", "active_session": True, "valid": False},
+                    )
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     queued_event = MessageEvent(
@@ -6646,8 +6939,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self._enqueue_fifo(_quick_key, queued_event, adapter)
                 depth = self._queue_depth(_quick_key, adapter=self.adapters.get(source.platform))
                 if depth <= 1:
-                    return "Queued for the next turn."
-                return f"Queued for the next turn. ({depth} queued)"
+                    return await _finalize_gateway_turn_result(
+                        "Queued for the next turn.",
+                        action="queued",
+                        reason="/queue",
+                        capability="slash_command",
+                        details={"command": "queue", "active_session": True, "depth": depth},
+                    )
+                return await _finalize_gateway_turn_result(
+                    f"Queued for the next turn. ({depth} queued)",
+                    action="queued",
+                    reason="/queue",
+                    capability="slash_command",
+                    details={"command": "queue", "active_session": True, "depth": depth},
+                )
 
             # /steer <prompt> — inject mid-run after the next tool call.
             # Unlike /queue (turn boundary), /steer lands BETWEEN tool-call
@@ -6657,7 +6962,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "steer":
                 steer_text = event.get_command_args().strip()
                 if not steer_text:
-                    return "Usage: /steer <prompt>"
+                    return await _finalize_gateway_turn_result(
+                        "Usage: /steer <prompt>",
+                        action="command",
+                        reason="/steer",
+                        capability="slash_command",
+                        details={"command": "steer", "active_session": True, "valid": False},
+                    )
                 running_agent = self._running_agents.get(_quick_key)
                 if running_agent is _AGENT_PENDING_SENTINEL:
                     # Agent hasn't started yet — queue as turn-boundary fallback.
@@ -6671,17 +6982,41 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             channel_prompt=event.channel_prompt,
                         )
                         adapter._pending_messages[_quick_key] = queued_event
-                    return "Agent still starting — /steer queued for the next turn."
+                    return await _finalize_gateway_turn_result(
+                        "Agent still starting — /steer queued for the next turn.",
+                        action="queued",
+                        reason="/steer_pending_agent",
+                        capability="slash_command",
+                        details={"command": "steer", "active_session": True},
+                    )
                 if running_agent and hasattr(running_agent, "steer"):
                     try:
                         accepted = running_agent.steer(steer_text)
                     except Exception as exc:
                         logger.warning("Steer failed for session %s: %s", _quick_key, exc)
-                        return f"⚠️ Steer failed: {exc}"
+                        return await _finalize_gateway_turn_result(
+                            f"⚠️ Steer failed: {exc}",
+                            action="command_error",
+                            reason="/steer_failed",
+                            capability="slash_command",
+                            details={"command": "steer", "active_session": True},
+                        )
                     if accepted:
                         preview = steer_text[:60] + ("..." if len(steer_text) > 60 else "")
-                        return f"⏩ Steer queued — arrives after the next tool call: '{preview}'"
-                    return "Steer rejected (empty payload)."
+                        return await _finalize_gateway_turn_result(
+                            f"⏩ Steer queued — arrives after the next tool call: '{preview}'",
+                            action="steered",
+                            reason="/steer",
+                            capability="slash_command",
+                            details={"command": "steer", "active_session": True},
+                        )
+                    return await _finalize_gateway_turn_result(
+                        "Steer rejected (empty payload).",
+                        action="command_denied",
+                        reason="/steer_rejected",
+                        capability="slash_command",
+                        details={"command": "steer", "active_session": True},
+                    )
                 # Running agent is missing or lacks steer() — fall back to queue.
                 adapter = self.adapters.get(source.platform)
                 if adapter:
@@ -6693,17 +7028,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         channel_prompt=event.channel_prompt,
                     )
                     adapter._pending_messages[_quick_key] = queued_event
-                return "No active agent — /steer queued for the next turn."
+                return await _finalize_gateway_turn_result(
+                    "No active agent — /steer queued for the next turn.",
+                    action="queued",
+                    reason="/steer_no_agent",
+                    capability="slash_command",
+                    details={"command": "steer", "active_session": True},
+                )
 
             # /model must not be used while the agent is running.
             if _cmd_def_inner and _cmd_def_inner.name == "model":
-                return "Agent is running — wait or /stop first, then switch models."
+                return await _finalize_gateway_turn_result(
+                    "Agent is running — wait or /stop first, then switch models.",
+                    action="command_denied",
+                    reason="/model_active_session",
+                    capability="slash_command",
+                    details={"command": "model", "active_session": True},
+                )
 
             # /codex-runtime must not be used while the agent is running.
             # Switching mid-turn would split a turn across two transports.
             if _cmd_def_inner and _cmd_def_inner.name == "codex-runtime":
-                return ("Agent is running — wait or /stop first, then "
-                        "change runtime.")
+                return await _finalize_gateway_turn_result(
+                    "Agent is running — wait or /stop first, then change runtime.",
+                    action="command_denied",
+                    reason="/codex-runtime_active_session",
+                    capability="slash_command",
+                    details={"command": "codex-runtime", "active_session": True},
+                )
 
             # /approve and /deny must bypass the running-agent interrupt path.
             # The agent thread is blocked on a threading.Event inside
@@ -6711,19 +7063,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Route directly to the approval handler so the event is signalled.
             if _cmd_def_inner and _cmd_def_inner.name in {"approve", "deny"}:
                 if _cmd_def_inner.name == "approve":
-                    return await self._handle_approve_command(event)
-                return await self._handle_deny_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_approve_command(event),
+                        action="command",
+                        reason="/approve",
+                        capability="slash_command",
+                        details={"command": "approve", "active_session": True},
+                    )
+                return await _finalize_gateway_turn_result(
+                    self._handle_deny_command(event),
+                    action="command",
+                    reason="/deny",
+                    capability="slash_command",
+                    details={"command": "deny", "active_session": True},
+                )
 
             # /agents (/tasks alias) should be query-only and never interrupt.
             if _cmd_def_inner and _cmd_def_inner.name == "agents":
-                return await self._handle_agents_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_agents_command(event),
+                    action="command",
+                    reason="/agents",
+                    capability="slash_command",
+                    details={"command": "agents", "active_session": True},
+                )
 
             # /background must bypass the running-agent guard — it starts a
             # parallel task and must never interrupt the active conversation.
             # /btw is an alias of /background and resolves to the same canonical
             # name, so this branch handles both commands.
             if _cmd_def_inner and _cmd_def_inner.name == "background":
-                return await self._handle_background_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_background_command(event),
+                    action="command",
+                    reason="/background",
+                    capability="slash_command",
+                    details={"command": "background", "active_session": True},
+                )
 
             # /kanban must bypass the guard. It writes to a profile-agnostic
             # DB (kanban.db), not to the running agent's state. In fact
@@ -6731,7 +7107,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # has blocked waiting for a peer — letting that be dispatched
             # mid-run is the whole point of the board.
             if _cmd_def_inner and _cmd_def_inner.name == "kanban":
-                return await self._handle_kanban_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_kanban_command(event),
+                    action="command",
+                    reason="/kanban",
+                    capability="slash_command",
+                    details={"command": "kanban", "active_session": True},
+                )
 
             # /goal is safe mid-run for status/pause/clear (inspection and
             # control-plane only — doesn't interrupt the running turn).
@@ -6741,14 +7123,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _cmd_def_inner and _cmd_def_inner.name == "goal":
                 _goal_arg = (event.get_command_args() or "").strip().lower()
                 if not _goal_arg or _goal_arg in {"status", "pause", "resume", "clear", "stop", "done"}:
-                    return await self._handle_goal_command(event)
-                return "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal."
+                    return await _finalize_gateway_turn_result(
+                        self._handle_goal_command(event),
+                        action="command",
+                        reason="/goal",
+                        capability="slash_command",
+                        details={"command": "goal", "active_session": True},
+                    )
+                return await _finalize_gateway_turn_result(
+                    "Agent is running — use /goal status / pause / clear mid-run, or /stop before setting a new goal.",
+                    action="command_denied",
+                    reason="/goal_active_session",
+                    capability="slash_command",
+                    details={"command": "goal", "active_session": True},
+                )
 
             # /subgoal is safe mid-run — it only modifies the goal's
             # subgoals list, which the judge reads at the next turn
             # boundary. No race with the running turn.
             if _cmd_def_inner and _cmd_def_inner.name == "subgoal":
-                return await self._handle_subgoal_command(event)
+                return await _finalize_gateway_turn_result(
+                    self._handle_subgoal_command(event),
+                    action="command",
+                    reason="/subgoal",
+                    capability="slash_command",
+                    details={"command": "subgoal", "active_session": True},
+                )
 
             # Session-level toggles that are safe to run mid-agent —
             # /yolo can unblock a pending approval prompt, /verbose cycles
@@ -6760,25 +7160,73 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # below — users should wait and set them between turns.
             if _cmd_def_inner and _cmd_def_inner.name in {"yolo", "verbose"}:
                 if _cmd_def_inner.name == "yolo":
-                    return await self._handle_yolo_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_yolo_command(event),
+                        action="command",
+                        reason="/yolo",
+                        capability="slash_command",
+                        details={"command": "yolo", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "verbose":
-                    return await self._handle_verbose_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_verbose_command(event),
+                        action="command",
+                        reason="/verbose",
+                        capability="slash_command",
+                        details={"command": "verbose", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "footer":
-                    return await self._handle_footer_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_footer_command(event),
+                        action="command",
+                        reason="/footer",
+                        capability="slash_command",
+                        details={"command": "footer", "active_session": True},
+                    )
 
             # Gateway-handled info/control commands with dedicated
             # running-agent handlers.
             if _cmd_def_inner and _cmd_def_inner.name in _DEDICATED_HANDLERS:
                 if _cmd_def_inner.name == "help":
-                    return await self._handle_help_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_help_command(event),
+                        action="command",
+                        reason="/help",
+                        capability="slash_command",
+                        details={"command": "help", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "commands":
-                    return await self._handle_commands_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_commands_command(event),
+                        action="command",
+                        reason="/commands",
+                        capability="slash_command",
+                        details={"command": "commands", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "profile":
-                    return await self._handle_profile_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_profile_command(event),
+                        action="command",
+                        reason="/profile",
+                        capability="slash_command",
+                        details={"command": "profile", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "update":
-                    return await self._handle_update_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_update_command(event),
+                        action="command",
+                        reason="/update",
+                        capability="slash_command",
+                        details={"command": "update", "active_session": True},
+                    )
                 if _cmd_def_inner.name == "version":
-                    return await self._handle_version_command(event)
+                    return await _finalize_gateway_turn_result(
+                        self._handle_version_command(event),
+                        action="command",
+                        reason="/version",
+                        capability="slash_command",
+                        details={"command": "version", "active_session": True},
+                    )
 
             # Catch-all: any other recognized slash command reached the
             # running-agent guard. Reject gracefully rather than falling
@@ -6790,9 +7238,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # silently discarded by the slash-command safety net,
             # producing a zero-char response. See #5057, #6252, #10370.
             if _cmd_def_inner:
-                return (
-                    f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
-                    f"mid-turn. Wait for the current response or `/stop` first."
+                return await _finalize_gateway_turn_result(
+                    (
+                        f"⏳ Agent is running — `/{_cmd_def_inner.name}` can't run "
+                        f"mid-turn. Wait for the current response or `/stop` first."
+                    ),
+                    action="command_denied",
+                    reason=f"/{_cmd_def_inner.name}_active_session",
+                    capability="slash_command",
+                    details={"command": _cmd_def_inner.name, "active_session": True},
                 )
 
             if event.message_type == MessageType.PHOTO:
@@ -6800,7 +7254,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 adapter = self.adapters.get(source.platform)
                 if adapter:
                     merge_pending_message_event(adapter._pending_messages, _quick_key, event)
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="active_session_photo_followup",
+                    capability="active_session",
+                )
 
             _telegram_followup_grace = float(
                 os.getenv("HERMES_TELEGRAM_FOLLOWUP_GRACE_SECONDS", "3.0")
@@ -6829,7 +7288,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             event,
                             merge_text=True,
                         )
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="telegram_followup_grace",
+                    capability="active_session",
+                )
 
             running_agent = self._running_agents.get(_quick_key)
             if running_agent is _AGENT_PENDING_SENTINEL:
@@ -6838,7 +7302,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Force-clean the sentinel so the session is unlocked.
                     self._release_running_agent_state(_quick_key)
                     logger.info("HARD STOP (pending) for session %s — sentinel cleared", _quick_key)
-                    return EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked.")
+                    return await _finalize_gateway_turn_result(
+                        EphemeralReply("⚡ Force-stopped. The agent was still starting — session unlocked."),
+                        action="command",
+                        reason="/stop_pending_agent",
+                        capability="slash_command",
+                        details={"command": "stop", "active_session": True},
+                    )
                 # Queue the message so it will be picked up after the
                 # agent starts.
                 adapter = self.adapters.get(source.platform)
@@ -6849,19 +7319,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         event,
                         merge_text=True,
                     )
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="pending_agent_setup",
+                    capability="active_session",
+                )
             if self._draining:
                 if self._queue_during_drain_enabled():
                     self._queue_or_replace_pending_event(_quick_key, event)
-                return (
-                    f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
-                    if self._queue_during_drain_enabled()
-                    else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                return await _finalize_gateway_turn_result(
+                    (
+                        f"⏳ Gateway {self._status_action_gerund()} — queued for the next turn after it comes back."
+                        if self._queue_during_drain_enabled()
+                        else f"⏳ Gateway is {self._status_action_gerund()} and is not accepting another turn right now."
+                    ),
+                    action="queued" if self._queue_during_drain_enabled() else "draining",
+                    reason="gateway_draining_active_session",
+                    capability="active_session",
                 )
             if self._busy_input_mode == "queue":
                 logger.debug("PRIORITY queue follow-up for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="busy_input_queue",
+                    capability="active_session",
+                )
             if self._busy_input_mode == "steer":
                 # Steer mode: inject text into the running agent mid-run via
                 # agent.steer().  Falls back to queue semantics if the payload
@@ -6876,10 +7361,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         steered = False
                 if steered:
                     logger.debug("PRIORITY steer for session %s", _quick_key)
-                    return None
+                    return await _finalize_gateway_turn_result(
+                        None,
+                        action="steered",
+                        reason="busy_input_steer",
+                        capability="active_session",
+                    )
                 logger.debug("PRIORITY steer-fallback-to-queue for session %s", _quick_key)
                 self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="busy_input_steer_fallback",
+                    capability="active_session",
+                )
             # #30170 — Subagent protection (PRIORITY path). Same rationale
             # as ``_handle_active_session_busy_message``: an interrupt
             # cascades through ``_active_children`` and aborts in-flight
@@ -6895,13 +7390,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _quick_key,
                 )
                 self._queue_or_replace_pending_event(_quick_key, event)
-                return None
+                return await _finalize_gateway_turn_result(
+                    None,
+                    action="queued",
+                    reason="active_subagents_interrupt_demoted",
+                    capability="active_session",
+                )
             logger.debug("PRIORITY interrupt for session %s", _quick_key)
             running_agent.interrupt(event.text)
             # NOTE: self._pending_messages was write-only (never consumed).
             # The actual interrupt message is delivered via adapter._pending_messages
             # which is read by _run_agent. Removed to prevent unbounded growth.
-            return None
+            return await _finalize_gateway_turn_result(
+                None,
+                action="interrupted",
+                reason="active_session_interrupt",
+                capability="active_session",
+            )
 
         # Check for commands
         command = event.get_command()
@@ -6948,7 +7453,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         if command and canonical and is_gateway_known_command(canonical):
             _denied = self._check_slash_access(source, canonical)
             if _denied is not None:
-                return _denied
+                return await _finalize_gateway_turn_result(
+                    _denied,
+                    action="command_denied",
+                    reason=f"/{canonical}",
+                    capability="slash_access",
+                    details={"command": canonical},
+                )
 
         # Fire the ``command:<canonical>`` hook for any recognized slash
         # command — built-in OR plugin-registered. Handlers can return a
@@ -6987,11 +7498,29 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if decision == "deny":
                     message = hook_result.get("message")
                     if isinstance(message, str) and message:
-                        return message
-                    return f"Command `/{command}` was blocked by a hook."
+                        return await _finalize_gateway_turn_result(
+                            message,
+                            action="command_denied",
+                            reason=f"command_hook_deny:/{canonical}",
+                            capability="command_hook",
+                            details={"command": canonical},
+                        )
+                    return await _finalize_gateway_turn_result(
+                        f"Command `/{command}` was blocked by a hook.",
+                        action="command_denied",
+                        reason=f"command_hook_deny:/{canonical}",
+                        capability="command_hook",
+                        details={"command": canonical},
+                    )
                 if decision == "handled":
                     message = hook_result.get("message")
-                    return message if isinstance(message, str) and message else None
+                    return await _finalize_gateway_turn_result(
+                        message if isinstance(message, str) and message else None,
+                        action="command",
+                        reason=f"command_hook_handled:/{canonical}",
+                        capability="command_hook",
+                        details={"command": canonical},
+                    )
                 if decision == "rewrite":
                     new_command = str(
                         hook_result.get("command_name", "")
@@ -7005,85 +7534,166 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     canonical = _cmd_def.name if _cmd_def else command
                     break
 
+        async def _finalize_gateway_command_result(result_or_awaitable, *, command_name: str):
+            return await _finalize_gateway_turn_result(
+                result_or_awaitable,
+                action="command",
+                reason=f"/{command_name}",
+                capability="slash_command",
+                details={"command": command_name},
+            )
+
         if canonical == "new":
             if self._is_telegram_topic_root_lobby(source):
-                return self._telegram_topic_root_new_message()
+                return await _finalize_gateway_command_result(
+                    self._telegram_topic_root_new_message(),
+                    command_name=canonical,
+                )
             async def _do_reset():
                 return await self._handle_reset_command(event)
-            return await self._maybe_confirm_destructive_slash(
-                event=event,
-                command="new",
-                title="/new",
-                detail=(
-                    "This starts a fresh session and discards the current "
-                    "conversation history."
+            return await _finalize_gateway_command_result(
+                self._maybe_confirm_destructive_slash(
+                    event=event,
+                    command="new",
+                    title="/new",
+                    detail=(
+                        "This starts a fresh session and discards the current "
+                        "conversation history."
+                    ),
+                    execute=_do_reset,
                 ),
-                execute=_do_reset,
+                command_name=canonical,
             )
 
         if canonical == "topic":
-            return await self._handle_topic_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_topic_command(event),
+                command_name=canonical,
+            )
         
         if canonical == "help":
-            return await self._handle_help_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_help_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "start":
             logger.info("Ignoring /start platform ping for session %s", _quick_key)
-            return ""
+            return await _finalize_gateway_command_result("", command_name=canonical)
 
         if canonical == "commands":
-            return await self._handle_commands_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_commands_command(event),
+                command_name=canonical,
+            )
         
         if canonical == "profile":
-            return await self._handle_profile_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_profile_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "whoami":
-            return await self._handle_whoami_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_whoami_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "status":
-            return await self._handle_status_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_status_command(event),
+                command_name=canonical,
+            )
+
+        if canonical == "turns":
+            return await _finalize_gateway_command_result(
+                self._handle_turns_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "agents":
-            return await self._handle_agents_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_agents_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "platform":
-            return await self._handle_platform_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_platform_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "restart":
-            return await self._handle_restart_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_restart_command(event),
+                command_name=canonical,
+            )
         
         if canonical == "stop":
-            return await self._handle_stop_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_stop_command(event),
+                command_name=canonical,
+            )
         
         if canonical == "reasoning":
-            return await self._handle_reasoning_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_reasoning_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "fast":
-            return await self._handle_fast_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_fast_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "verbose":
-            return await self._handle_verbose_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_verbose_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "footer":
-            return await self._handle_footer_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_footer_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "yolo":
-            return await self._handle_yolo_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_yolo_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "model":
-            return await self._handle_model_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_model_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "codex-runtime":
-            return await self._handle_codex_runtime_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_codex_runtime_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "personality":
-            return await self._handle_personality_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_personality_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "kanban":
-            return await self._handle_kanban_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_kanban_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "retry":
-            return await self._handle_retry_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_retry_command(event),
+                command_name=canonical,
+            )
         
         if canonical == "undo":
             async def _do_undo():
@@ -7100,64 +7710,118 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _undo_n == 1
                 else f"This removes the last {_undo_n} user turns from history."
             )
-            return await self._maybe_confirm_destructive_slash(
-                event=event,
-                command="undo",
-                title="/undo",
-                detail=_undo_detail,
-                execute=_do_undo,
+            return await _finalize_gateway_command_result(
+                self._maybe_confirm_destructive_slash(
+                    event=event,
+                    command="undo",
+                    title="/undo",
+                    detail=_undo_detail,
+                    execute=_do_undo,
+                ),
+                command_name=canonical,
             )
         
         if canonical == "sethome":
-            return await self._handle_set_home_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_set_home_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "compress":
-            return await self._handle_compress_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_compress_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "usage":
-            return await self._handle_usage_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_usage_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "insights":
-            return await self._handle_insights_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_insights_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "reload-mcp":
-            return await self._handle_reload_mcp_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_reload_mcp_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "reload-skills":
-            return await self._handle_reload_skills_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_reload_skills_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "bundles":
-            return await self._handle_bundles_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_bundles_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "approve":
-            return await self._handle_approve_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_approve_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "deny":
-            return await self._handle_deny_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_deny_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "update":
-            return await self._handle_update_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_update_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "version":
-            return await self._handle_version_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_version_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "debug":
-            return await self._handle_debug_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_debug_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "title":
-            return await self._handle_title_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_title_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "resume":
-            return await self._handle_resume_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_resume_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "branch":
-            return await self._handle_branch_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_branch_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "rollback":
-            return await self._handle_rollback_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_rollback_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "background":
-            return await self._handle_background_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_background_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "steer":
             # No active agent — /steer has no tool call to inject into.
@@ -7165,7 +7829,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # message. If the payload is empty, surface the usage hint.
             steer_payload = event.get_command_args().strip()
             if not steer_payload:
-                return "Usage: /steer <prompt>  (no agent is running; sending as a normal message)"
+                return await _finalize_gateway_command_result(
+                    "Usage: /steer <prompt>  (no agent is running; sending as a normal message)",
+                    command_name=canonical,
+                )
             try:
                 event.text = steer_payload
             except Exception:
@@ -7175,16 +7842,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # to the agent as a regular user turn.
 
         if canonical == "goal":
-            return await self._handle_goal_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_goal_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "subgoal":
-            return await self._handle_subgoal_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_subgoal_command(event),
+                command_name=canonical,
+            )
 
         if canonical == "voice":
-            return await self._handle_voice_command(event)
+            return await _finalize_gateway_command_result(
+                self._handle_voice_command(event),
+                command_name=canonical,
+            )
 
         if self._draining:
-            return f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now."
+            return await _finalize_gateway_command_result(
+                f"⏳ Gateway is {self._status_action_gerund()} and is not accepting new work right now.",
+                command_name=canonical or command or "unknown",
+            )
 
         # User-defined quick commands (bypass agent loop, no LLM call)
         if command:
@@ -7217,13 +7896,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             if output:
                                 from agent.redact import redact_sensitive_text
                                 output = redact_sensitive_text(output)
-                            return output if output else "Command returned no output."
+                            return await _finalize_gateway_turn_result(
+                                output if output else "Command returned no output.",
+                                action="command",
+                                reason=f"quick_command:/{command}",
+                                capability="quick_command",
+                                details={"command": command, "type": "exec"},
+                            )
                         except asyncio.TimeoutError:
-                            return "Quick command timed out (30s)."
+                            return await _finalize_gateway_turn_result(
+                                "Quick command timed out (30s).",
+                                action="command_error",
+                                reason=f"quick_command_timeout:/{command}",
+                                capability="quick_command",
+                                details={"command": command, "type": "exec"},
+                            )
                         except Exception as e:
-                            return f"Quick command error: {e}"
+                            return await _finalize_gateway_turn_result(
+                                f"Quick command error: {e}",
+                                action="command_error",
+                                reason=f"quick_command_error:/{command}",
+                                capability="quick_command",
+                                details={"command": command, "type": "exec"},
+                            )
                     else:
-                        return f"Quick command '/{command}' has no command defined."
+                        return await _finalize_gateway_turn_result(
+                            f"Quick command '/{command}' has no command defined.",
+                            action="command_error",
+                            reason=f"quick_command_missing_exec:/{command}",
+                            capability="quick_command",
+                            details={"command": command, "type": "exec"},
+                        )
                 elif qcmd.get("type") == "alias":
                     target = qcmd.get("target", "").strip()
                     if target:
@@ -7234,9 +7937,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         command = target_command.split()[0] if target_command else target_command
                         # Fall through to normal command dispatch below
                     else:
-                        return f"Quick command '/{command}' has no target defined."
+                        return await _finalize_gateway_turn_result(
+                            f"Quick command '/{command}' has no target defined.",
+                            action="command_error",
+                            reason=f"quick_command_missing_target:/{command}",
+                            capability="quick_command",
+                            details={"command": command, "type": "alias"},
+                        )
                 else:
-                    return f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias')."
+                    return await _finalize_gateway_turn_result(
+                        f"Quick command '/{command}' has unsupported type (supported: 'exec', 'alias').",
+                        action="command_error",
+                        reason=f"quick_command_unsupported:/{command}",
+                        capability="quick_command",
+                        details={"command": command, "type": qcmd.get("type")},
+                    )
 
         # Plugin-registered slash commands
         if command:
@@ -7251,7 +7966,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     result = plugin_handler(user_args)
                     if asyncio.iscoroutine(result):
                         result = await result
-                    return str(result) if result else None
+                    return await _finalize_gateway_turn_result(
+                        str(result) if result else None,
+                        action="command",
+                        reason=f"plugin_command:/{command}",
+                        capability="plugin_command",
+                        details={"command": command.replace("_", "-")},
+                    )
             except Exception as e:
                 logger.warning("Plugin command dispatch failed: %s", e)
 
@@ -7306,9 +8027,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     if _plat and _skill_name:
                         from agent.skill_utils import get_disabled_skill_names as _get_plat_disabled
                         if _skill_name in _get_plat_disabled(platform=_plat):
-                            return (
-                                f"The **{_skill_name}** skill is disabled for {_plat}.\n"
-                                f"Enable it with: `hermes skills config`"
+                            return await _finalize_gateway_turn_result(
+                                (
+                                    f"The **{_skill_name}** skill is disabled for {_plat}.\n"
+                                    f"Enable it with: `hermes skills config`"
+                                ),
+                                action="command_denied",
+                                reason=f"skill_disabled:/{command}",
+                                capability="skill_command",
+                                details={"command": command, "skill": _skill_name},
                             )
                     user_instruction = event.get_command_args().strip()
                     msg = build_skill_invocation_message(
@@ -7322,7 +8049,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # uninstalled skill and give actionable guidance.
                     _unavail_msg = _check_unavailable_skill(command)
                     if _unavail_msg:
-                        return _unavail_msg
+                        return await _finalize_gateway_turn_result(
+                            _unavail_msg,
+                            action="command_error",
+                            reason=f"skill_unavailable:/{command}",
+                            capability="skill_command",
+                            details={"command": command},
+                        )
                     # Genuinely unrecognized /command: not a built-in, not a
                     # plugin, not a skill, not a known-inactive skill. Warn
                     # the user instead of silently forwarding it to the LLM
@@ -7338,11 +8071,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             command,
                             source.platform.value if source.platform else "?",
                         )
-                        return (
-                            f"Unknown command `/{command}`. "
-                            f"Type /commands to see what's available, "
-                            f"or resend without the leading slash to send "
-                            f"as a regular message."
+                        return await _finalize_gateway_turn_result(
+                            (
+                                f"Unknown command `/{command}`. "
+                                f"Type /commands to see what's available, "
+                                f"or resend without the leading slash to send "
+                                f"as a regular message."
+                            ),
+                            action="command_error",
+                            reason=f"unknown_command:/{command}",
+                            capability="slash_command",
+                            details={"command": command},
                         )
             except Exception as e:
                 logger.debug("Skill command check failed (non-fatal): %s", e)
@@ -7355,8 +8094,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Debounce the lobby reminder so a user who forgets about
             # topic mode and fires ten prompts doesn't get ten copies.
             if self._should_send_telegram_lobby_reminder(source):
-                return self._telegram_topic_root_lobby_message()
-            return None
+                return await _finalize_gateway_turn_result(
+                    self._telegram_topic_root_lobby_message(),
+                    action="topic_lobby",
+                    reason="telegram_topic_root_lobby",
+                    capability="telegram_topic",
+                )
+            return await _finalize_gateway_turn_result(
+                None,
+                action="topic_lobby_suppressed",
+                reason="telegram_topic_root_lobby_debounced",
+                capability="telegram_topic",
+            )
+
+        try:
+            from hermes_cli.config import load_config as _load_full_config
+            _router_context = await maybe_build_middle_model_advisory(
+                event.text or "",
+                config=_load_full_config(),
+            )
+            if _router_context.strip():
+                _existing_context = getattr(event, "runtime_context", None)
+                event = dataclasses.replace(
+                    event,
+                    runtime_context=(
+                        f"{_existing_context}\n\n{_router_context.strip()}"
+                        if _existing_context
+                        else _router_context.strip()
+                    ),
+                )
+                source = event.source
+                _decision_ledger.record_gateway_decision(
+                    "middle_model_advisory",
+                    reason="agentic_router",
+                    applied=True,
+                    details={"context_chars": len(_router_context)},
+                )
+        except Exception as _router_exc:
+            logger.debug("Agentic advisory router skipped: %s", _router_exc)
 
         # ── Claim this session before any await ───────────────────────
         # Between here and _run_agent registering the real AIAgent, there
@@ -7385,6 +8160,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         try:
             _agent_result = await self._handle_message_with_agent(event, source, _quick_key, _run_generation)
+            try:
+                _ledger_session_id = _quick_key
+                _ledger_entry = None
+                try:
+                    _ledger_entry = self.session_store.get_or_create_session(source)
+                except Exception:
+                    _ledger_entry = None
+                _entry_session_id = getattr(_ledger_entry, "session_id", None)
+                if isinstance(_entry_session_id, str) and _entry_session_id:
+                    _ledger_session_id = _entry_session_id
+                _decision_ledger.set_final_action(
+                    "continue",
+                    reason="agent_dispatch",
+                    session_id=_ledger_session_id,
+                )
+                self._persist_gateway_decision_ledger(
+                    _decision_ledger,
+                    session_id=_ledger_session_id,
+                )
+            except Exception as _ledger_exc:
+                logger.debug("gateway decision ledger finalization failed: %s", _ledger_exc)
             # Goal continuation: after the agent returns a final response
             # for this turn, check any standing /goal — the judge will
             # either mark it done, pause it (budget), or enqueue a
@@ -8347,6 +9143,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if vc_context:
                     context_prompt += f"\n\n{vc_context}"
 
+        _runtime_context = getattr(event, "runtime_context", None)
+        if isinstance(_runtime_context, str) and _runtime_context.strip():
+            context_prompt += (
+                "\n\n[Agent-runtime context from gateway annotation]\n"
+                f"{_runtime_context.strip()}"
+            )
+
         # -----------------------------------------------------------------
         # Auto-analyze images sent by the user
         #
@@ -9043,11 +9846,384 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return f"⛔ /{canonical_cmd} is admin-only here. {suffix}"
 
+    async def _handle_whoami_command(self, event: MessageEvent) -> str:
+        """Handle /whoami — show the user's slash command access on this scope.
+
+        Always works (it's in the always-allowed floor of slash_access).
+        Reports: platform, scope (DM vs group), the user's tier
+        (admin / user / unrestricted), and the slash commands they can
+        actually run on this scope.
+        """
+        from gateway.slash_access import policy_for_source as _policy_for_source
+
+        source = event.source
+        policy = _policy_for_source(self.config, source)
+        platform = source.platform.value if source and source.platform else "?"
+        chat_type = (source.chat_type if source else "") or "dm"
+        scope = "DM" if chat_type.lower() in {"dm", "direct", "private", ""} else "group/channel"
+        user_id = (source.user_id if source else None) or "?"
+
+        if not policy.enabled:
+            return (
+                f"**You** — {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: unrestricted (no admin list configured for this scope)\n"
+                f"Slash commands: all available"
+            )
+
+        if policy.is_admin(user_id):
+            return (
+                f"**You** — {platform} ({scope})\n"
+                f"User ID: `{user_id}`\n"
+                f"Tier: **admin**\n"
+                f"Slash commands: all available"
+            )
+
+        # Non-admin user. Show what's actually reachable.
+        floor = ["help", "whoami"]  # mirrors slash_access._ALWAYS_ALLOWED_FOR_USERS
+        configured = sorted(policy.user_allowed_commands)
+        # Combine + dedupe, preserve order: floor first, then operator additions.
+        seen: set[str] = set()
+        runnable: list[str] = []
+        for c in floor + configured:
+            if c not in seen:
+                seen.add(c)
+                runnable.append(c)
+        runnable_str = ", ".join(f"/{c}" for c in runnable) if runnable else "(none)"
+        return (
+            f"**You** — {platform} ({scope})\n"
+            f"User ID: `{user_id}`\n"
+            f"Tier: user\n"
+            f"Slash commands you can run: {runnable_str}"
+        )
 
 
+    async def _handle_kanban_command(self, event: MessageEvent) -> str:
+        """Handle /kanban — delegate to the shared kanban CLI.
 
+        Run the potentially-blocking DB work in a thread pool so the
+        gateway event loop stays responsive.  Read operations (list,
+        show, context, tail) are permitted while an agent is running;
+        mutations are allowed too because the board is profile-agnostic
+        and does not touch the running agent's state.
 
+        For ``/kanban create`` invocations we also auto-subscribe the
+        originating gateway source (platform + chat + thread) to the new
+        task's terminal events, so the user hears back when the worker
+        completes / blocks / auto-blocks / crashes without having to poll.
+        """
+        import asyncio
+        import re
+        import shlex
+        from hermes_cli.kanban import run_slash
 
+        text = (event.text or "").strip()
+        # Strip the leading "/kanban" (with or without slash), leaving args.
+        if text.startswith("/"):
+            text = text.lstrip("/")
+        if text.startswith("kanban"):
+            text = text[len("kanban"):].lstrip()
+
+        tokens = shlex.split(text) if text else []
+        requested_board = None
+        action = None
+        i = 0
+        while i < len(tokens):
+            tok = tokens[i]
+            if tok == "--board":
+                if i + 1 >= len(tokens):
+                    break
+                requested_board = tokens[i + 1]
+                i += 2
+                continue
+            if tok.startswith("--board="):
+                requested_board = tok.split("=", 1)[1]
+                i += 1
+                continue
+            action = tok
+            break
+
+        is_create = action == "create"
+
+        try:
+            output = await asyncio.to_thread(run_slash, text)
+        except Exception as exc:  # pragma: no cover - defensive
+            return t("gateway.kanban.error_prefix", error=exc)
+
+        # Auto-subscribe on create. Parse the task id from the CLI's standard
+        # success line ("Created t_abcd  (ready, assignee=...)"). If the user
+        # passed --json we don't subscribe; they're clearly scripting and
+        # can call /kanban notify-subscribe explicitly.
+        if is_create and output:
+            m = re.search(r"Created\s+(t_[0-9a-f]+)\b", output)
+            if m:
+                task_id = m.group(1)
+                try:
+                    source = event.source
+                    platform = getattr(source, "platform", None)
+                    platform_str = (
+                        platform.value if hasattr(platform, "value") else str(platform or "")
+                    ).lower()
+                    chat_id = str(getattr(source, "chat_id", "") or "")
+                    thread_id = str(getattr(source, "thread_id", "") or "")
+                    user_id = str(getattr(source, "user_id", "") or "") or None
+                    if platform_str and chat_id:
+                        def _sub():
+                            from hermes_cli import kanban_db as _kb
+                            conn = _kb.connect(board=requested_board)
+                            try:
+                                _kb.add_notify_sub(
+                                    conn, task_id=task_id,
+                                    platform=platform_str, chat_id=chat_id,
+                                    thread_id=thread_id or None,
+                                    user_id=user_id,
+                                    notifier_profile=getattr(self, "_kanban_notifier_profile", None) or self._active_profile_name(),
+                                )
+                            finally:
+                                conn.close()
+                        await asyncio.to_thread(_sub)
+                        output = (
+                            output.rstrip()
+                            + "\n"
+                            + t("gateway.kanban.subscribed_suffix", task_id=task_id)
+                        )
+                except Exception as exc:
+                    logger.warning("kanban create auto-subscribe failed: %s", exc)
+
+        # Gateway messages have practical length caps; truncate long
+        # listings to keep the UX reasonable.
+        if len(output) > 3800:
+            output = output[:3800] + "\n" + t("gateway.kanban.truncated_suffix")
+        return output or t("gateway.kanban.no_output")
+
+    async def _handle_status_command(self, event: MessageEvent) -> str:
+        """Handle /status command."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+
+        connected_platforms = [p.value for p in self.adapters.keys()]
+
+        # Check if there's an active agent
+        session_key = session_entry.session_key
+        is_running = session_key in self._running_agents
+
+        # Count pending /queue follow-ups (slot + overflow).
+        adapter = self.adapters.get(source.platform) if source else None
+        queue_depth = self._queue_depth(session_key, adapter=adapter)
+
+        title = None
+        # Pull token totals from the SQLite session DB rather than the
+        # in-memory SessionStore.  The agent's per-turn token deltas are
+        # persisted into sessions_db (run_agent.py), not into SessionEntry,
+        # so session_entry.total_tokens is always 0.  SessionDB is the
+        # single source of truth; reading it here keeps /status accurate
+        # without duplicating token writes into two stores.
+        db_total_tokens = 0
+        if self._session_db:
+            try:
+                title = self._session_db.get_session_title(session_entry.session_id)
+            except Exception:
+                title = None
+            try:
+                row = self._session_db.get_session(session_entry.session_id)
+                if row:
+                    db_total_tokens = (
+                        (row.get("input_tokens") or 0)
+                        + (row.get("output_tokens") or 0)
+                        + (row.get("cache_read_tokens") or 0)
+                        + (row.get("cache_write_tokens") or 0)
+                        + (row.get("reasoning_tokens") or 0)
+                    )
+            except Exception:
+                db_total_tokens = 0
+
+        lines = [
+            t("gateway.status.header"),
+            "",
+            t("gateway.status.session_id", session_id=session_entry.session_id),
+        ]
+        if title:
+            lines.append(t("gateway.status.title", title=title))
+        lines.extend([
+            t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
+            t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
+            t("gateway.status.tokens", tokens=f"{db_total_tokens:,}"),
+            t("gateway.status.agent_running", state=t("gateway.status.state_yes") if is_running else t("gateway.status.state_no")),
+        ])
+        if queue_depth:
+            lines.append(t("gateway.status.queued", count=queue_depth))
+        lines.extend([
+            "",
+            t("gateway.status.platforms", platforms=', '.join(connected_platforms)),
+        ])
+
+        return "\n".join(lines)
+
+    async def _handle_turns_command(self, event: MessageEvent) -> str:
+        """Handle /turns command - show recent gateway decision ledgers."""
+        source = event.source
+        session_entry = self.session_store.get_or_create_session(source)
+
+        raw_args = event.get_command_args().strip()
+        limit = 5
+        if raw_args:
+            try:
+                limit = int(raw_args.split()[0])
+            except (ValueError, IndexError):
+                return "Usage: /turns [limit]"
+        limit = max(1, min(limit, 20))
+
+        session_db = getattr(self, "_session_db", None)
+        if session_db is None:
+            from hermes_state import format_session_db_unavailable
+            return format_session_db_unavailable(prefix="Gateway turn ledger unavailable")
+
+        try:
+            rows = session_db.get_gateway_turns(session_entry.session_id, limit=limit)
+        except Exception as exc:
+            logger.debug("Failed to read gateway turn ledgers: %s", exc)
+            return f"Gateway turn ledger unavailable: {exc}"
+
+        header = [
+            "Gateway turn ledger",
+            f"Session: `{session_entry.session_id}`",
+        ]
+        if not rows:
+            return "\n".join(
+                [
+                    *header,
+                    "",
+                    "No decision ledgers recorded for this session yet.",
+                ]
+            )
+
+        lines = [*header, ""]
+        for idx, row in enumerate(rows, start=1):
+            summary = row.get("summary") or {}
+            recorded_at = row.get("recorded_at")
+            if isinstance(recorded_at, (int, float)):
+                recorded = time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(recorded_at))
+            else:
+                recorded = "unknown time"
+            turn_id = str(row.get("turn_id") or summary.get("turn_id") or "")[:12]
+            action = row.get("final_action") or summary.get("final_action") or "unknown"
+            reason = row.get("final_reason") or summary.get("final_reason") or "unknown"
+            decision_count = row.get("decision_count") or summary.get("decision_count") or 0
+            runtime_fp = summary.get("runtime_fingerprint") or {}
+            digest = runtime_fp.get("digest") or ""
+            lines.append(
+                f"{idx}. `{recorded}` turn=`{turn_id}` action=`{action}` "
+                f"reason=`{reason}` decisions={decision_count}"
+            )
+            if digest:
+                lines.append(f"   digest=`{digest}`")
+            decision_bits: list[str] = []
+            for decision in (summary.get("decisions") or [])[:4]:
+                if not isinstance(decision, dict):
+                    continue
+                capability = str(decision.get("capability") or "?")
+                applied = decision.get("applied")
+                blocked = decision.get("blocked_reason")
+                if blocked:
+                    decision_bits.append(f"{capability}:blocked:{blocked}")
+                elif applied is False:
+                    decision_bits.append(f"{capability}:not-applied")
+                else:
+                    decision_bits.append(f"{capability}:applied")
+            if decision_bits:
+                lines.append("   " + ", ".join(decision_bits))
+
+        return "\n".join(lines)
+
+    async def _handle_agents_command(self, event: MessageEvent) -> str:
+        """Handle /agents command - list active agents and running tasks."""
+        from tools.process_registry import format_uptime_short, process_registry
+
+        now = time.time()
+        current_session_key = self._session_key_for_source(event.source)
+
+        running_agents: dict = getattr(self, "_running_agents", {}) or {}
+        running_started: dict = getattr(self, "_running_agents_ts", {}) or {}
+
+        agent_rows: list[dict] = []
+        for session_key, agent in running_agents.items():
+            started = float(running_started.get(session_key, now))
+            elapsed = max(0, int(now - started))
+            is_pending = agent is _AGENT_PENDING_SENTINEL
+            agent_rows.append(
+                {
+                    "session_key": session_key,
+                    "elapsed": elapsed,
+                    "state": t("gateway.agents.state_starting") if is_pending else t("gateway.agents.state_running"),
+                    "session_id": "" if is_pending else str(getattr(agent, "session_id", "") or ""),
+                    "model": "" if is_pending else str(getattr(agent, "model", "") or ""),
+                }
+            )
+
+        agent_rows.sort(key=lambda row: row["elapsed"], reverse=True)
+
+        running_processes: list[dict] = []
+        try:
+            running_processes = [
+                p for p in process_registry.list_sessions()
+                if p.get("status") == "running"
+            ]
+        except Exception:
+            running_processes = []
+
+        background_tasks = [
+            t for t in (getattr(self, "_background_tasks", set()) or set())
+            if hasattr(t, "done") and not t.done()
+        ]
+
+        lines = [
+            t("gateway.agents.header"),
+            "",
+            t("gateway.agents.active_agents", count=len(agent_rows)),
+        ]
+
+        if agent_rows:
+            for idx, row in enumerate(agent_rows[:12], 1):
+                current = t("gateway.agents.this_chat") if row["session_key"] == current_session_key else ""
+                sid = f" · `{row['session_id']}`" if row["session_id"] else ""
+                model = f" · `{row['model']}`" if row["model"] else ""
+                lines.append(
+                    f"{idx}. `{row['session_key']}` · {row['state']} · "
+                    f"{format_uptime_short(row['elapsed'])}{sid}{model}{current}"
+                )
+            if len(agent_rows) > 12:
+                lines.append(t("gateway.agents.more", count=len(agent_rows) - 12))
+
+        lines.extend(
+            [
+                "",
+                t("gateway.agents.running_processes", count=len(running_processes)),
+            ]
+        )
+        if running_processes:
+            for proc in running_processes[:12]:
+                cmd = " ".join(str(proc.get("command", "")).split())
+                if len(cmd) > 90:
+                    cmd = cmd[:87] + "..."
+                lines.append(
+                    f"- `{proc.get('session_id', '?')}` · "
+                    f"{format_uptime_short(int(proc.get('uptime_seconds', 0)))} · `{cmd}`"
+                )
+            if len(running_processes) > 12:
+                lines.append(t("gateway.agents.more", count=len(running_processes) - 12))
+
+        lines.extend(
+            [
+                "",
+                t("gateway.agents.async_jobs", count=len(background_tasks)),
+            ]
+        )
+
+        if not agent_rows and not running_processes and not background_tasks:
+            lines.append("")
+            lines.append(t("gateway.agents.none"))
+
+        return "\n".join(lines)
 
     def _sibling_thread_run_keys(self, source: SessionSource, own_key: str) -> list:
         """Find running-agent keys for OTHER participants in the same thread.

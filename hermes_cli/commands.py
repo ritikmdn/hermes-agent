@@ -112,6 +112,8 @@ COMMAND_REGISTRY: list[CommandDef] = [
     CommandDef("status", "Show session info", "Session"),
     CommandDef("whoami", "Show your slash command access (admin / user)", "Info"),
     CommandDef("profile", "Show active profile name and home directory", "Info"),
+    CommandDef("turns", "Show recent gateway decision ledgers", "Info",
+               gateway_only=True, aliases=("gateway-turns", "ledger"), args_hint="[limit]"),
     CommandDef("sethome", "Set this chat as the home channel", "Session",
                gateway_only=True, aliases=("set-home",)),
     CommandDef("resume", "Resume a previously-named session", "Session",
