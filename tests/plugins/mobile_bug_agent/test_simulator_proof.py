@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import base64
+import os
 
 from pathlib import Path
 from types import SimpleNamespace
@@ -56,6 +57,37 @@ def test_simulator_proof_ios_builds_launches_deep_link_and_screenshots(tmp_path)
         ),
         (("xcrun", "simctl", "io", "SIM-123", "screenshot", str(proof_dir / "ios-screenshot.png")), worktree, 90),
     ]
+
+
+def test_simulator_proof_ios_links_sibling_node_modules(tmp_path):
+    calls = []
+    workspace = tmp_path / "workspace"
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(workspace / "worktrees" / "monica-ENG-123")
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source = source_repo / "node_modules"
+    source.mkdir(parents=True)
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+
+    def run_text(args, cwd, timeout):
+        calls.append((args, cwd, timeout))
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_text("png", encoding="utf-8")
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        ios_simulator_udid="SIM-123",
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert calls[2] == (("npm", "run", "ios"), worktree, 600)
+    assert (worktree / "node_modules").is_symlink()
+    assert (worktree / "node_modules").resolve() == source
 
 
 def test_simulator_proof_android_builds_launches_deep_link_and_screenshots(tmp_path):
@@ -363,14 +395,52 @@ def test_android_screenshot_validation_rejects_blank_image(tmp_path):
 def test_prepare_android_worktree_links_sibling_node_modules(tmp_path):
     workspace = tmp_path / "workspace"
     worktree = workspace / "worktrees" / "monica-ENG-123"
-    source = workspace / "repos" / "elixir-card-app" / "node_modules"
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source = source_repo / "node_modules"
     worktree.mkdir(parents=True)
     source.mkdir(parents=True)
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
 
     simulator_proof._prepare_android_worktree(worktree)
 
     assert (worktree / "node_modules").is_symlink()
     assert (worktree / "node_modules").resolve() == source
+
+
+def test_prepare_react_native_worktree_excludes_local_symlinks_from_git(tmp_path):
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktrees" / "monica-ENG-123"
+    git_info = worktree / ".git" / "info"
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source_app = source_repo / "apps" / "elixir-card"
+    target_app = worktree / "apps" / "elixir-card"
+    git_info.mkdir(parents=True)
+    source_repo.mkdir(parents=True)
+    target_app.mkdir(parents=True)
+    (worktree / "package.json").write_text("{}", encoding="utf-8")
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+    (source_repo / "node_modules").mkdir(parents=True)
+    source_app.mkdir(parents=True)
+    (source_app / ".env").write_text("SECRET=value\n", encoding="utf-8")
+
+    simulator_proof._prepare_react_native_worktree(worktree)
+
+    exclude = (git_info / "exclude").read_text(encoding="utf-8")
+    assert "/node_modules\n" in exclude
+    assert "/apps/elixir-card/.env\n" in exclude
+    assert "/apps/elixir-card/.env.*\n" in exclude
+
+
+def test_git_info_exclude_path_uses_common_dir_for_linked_worktree(tmp_path):
+    worktree = tmp_path / "workspace" / "worktrees" / "monica-ENG-123"
+    common_git_dir = tmp_path / "workspace" / "repos" / "elixir-card-app" / ".git"
+    worktree_git_dir = common_git_dir / "worktrees" / "monica-ENG-123"
+    worktree.mkdir(parents=True)
+    worktree_git_dir.mkdir(parents=True)
+    (worktree / ".git").write_text(f"gitdir: {worktree_git_dir}\n", encoding="utf-8")
+    (worktree_git_dir / "commondir").write_text("../..\n", encoding="utf-8")
+
+    assert simulator_proof._git_info_exclude_path(worktree) == common_git_dir / "info" / "exclude"
 
 
 def test_android_run_env_uses_default_sdk_dir(monkeypatch, tmp_path):
@@ -386,6 +456,35 @@ def test_android_run_env_uses_default_sdk_dir(monkeypatch, tmp_path):
 
     assert env["ANDROID_HOME"] == str(sdk)
     assert env["ANDROID_SDK_ROOT"] == str(sdk)
+
+
+def test_simulator_run_env_includes_user_gem_bin(monkeypatch, tmp_path):
+    fake_home = tmp_path / "home"
+    gem_bin = fake_home / ".gem" / "ruby" / "2.6.0" / "bin"
+    gem_bin.mkdir(parents=True)
+    monkeypatch.setenv("HOME", str(fake_home))
+    monkeypatch.setenv("PATH", "/usr/bin")
+    captured = {}
+
+    def fake_run(args, **kwargs):
+        captured["args"] = tuple(args)
+        captured["kwargs"] = kwargs
+        return SimpleNamespace(returncode=0, stdout="", stderr="")
+
+    monkeypatch.setattr(simulator_proof.subprocess, "run", fake_run)
+
+    simulator_proof._run(("npm", "run", "ios"), tmp_path, 10, capture_bytes=False)
+
+    assert captured["args"] == ("npm", "run", "ios")
+    assert captured["kwargs"]["env"]["PATH"].split(os.pathsep)[0] == str(gem_bin)
+
+
+def test_simulator_run_env_preloads_ruby_logger(monkeypatch):
+    monkeypatch.delenv("RUBYOPT", raising=False)
+
+    env = simulator_proof._simulator_run_env()
+
+    assert env["RUBYOPT"] == "-rlogger"
 
 
 def test_required_env_keys_accept_local_env_file(monkeypatch, tmp_path):
@@ -410,6 +509,43 @@ def test_required_env_keys_accept_expo_app_env_file(monkeypatch, tmp_path):
     )
 
     simulator_proof._validate_required_env_keys(tmp_path, ("MONICA_TEST_REQUIRED_ALPHA",))
+
+
+def test_simulator_proof_links_sibling_app_env_files_before_required_env_validation(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_TEST_REQUIRED_ALPHA", raising=False)
+    monkeypatch.setenv("ENVIRONMENT", "staging")
+    workspace = tmp_path / "workspace"
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(workspace / "worktrees" / "monica-ENG-123")
+    target_app = worktree / "apps" / "elixir-card"
+    target_app.mkdir(parents=True)
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source_app = source_repo / "apps" / "elixir-card"
+    source_app.mkdir(parents=True)
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+    (source_app / ".env.staging").write_text(
+        "MONICA_TEST_REQUIRED_ALPHA=secret-value\n",
+        encoding="utf-8",
+    )
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_text("png", encoding="utf-8")
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        ios_simulator_udid="SIM-123",
+        required_env_keys=("MONICA_TEST_REQUIRED_ALPHA",),
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert (target_app / ".env.staging").is_symlink()
+    assert (target_app / ".env.staging").resolve() == source_app / ".env.staging"
 
 
 def test_required_env_keys_report_missing_names_without_values(monkeypatch, tmp_path):

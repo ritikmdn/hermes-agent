@@ -47,6 +47,7 @@ class SimulatorProofHarness:
         worktree_path = Path(worktree)
         proof_path = Path(proof_dir)
         self._validate_worktree(worktree_path)
+        _prepare_react_native_worktree(worktree_path)
         _validate_required_env_keys(worktree_path, required_env_keys)
         proof_path.mkdir(parents=True, exist_ok=True)
 
@@ -96,6 +97,7 @@ class SimulatorProofHarness:
         deep_link: str,
         timeout_seconds: int,
     ) -> str:
+        _prepare_react_native_worktree(worktree)
         target = simulator_udid.strip() or "booted"
         screenshot = proof_dir / "ios-screenshot.png"
         self._run_text(("xcrun", "--find", "simctl"), worktree, timeout_seconds)
@@ -119,7 +121,7 @@ class SimulatorProofHarness:
         deep_link: str,
         timeout_seconds: int,
     ) -> str:
-        _prepare_android_worktree(worktree)
+        _prepare_react_native_worktree(worktree)
         screenshot = proof_dir / "android-screenshot.png"
         serial = android_serial.strip() or ("emulator-5554" if android_avd.strip() else "")
         adb = ("adb", "-s", serial) if serial else ("adb",)
@@ -210,6 +212,7 @@ def _run(
             capture_output=True,
             timeout=timeout,
             check=False,
+            env=_simulator_run_env(),
         )
     except FileNotFoundError as exc:
         raise RuntimeError(f"executable not found: {args[0]}") from exc
@@ -543,7 +546,7 @@ def _start_log_files() -> tuple[Path, Path]:
 
 
 def _android_run_env() -> dict[str, str]:
-    env = os.environ.copy()
+    env = _simulator_run_env()
     env.setdefault("REACT_NATIVE_PACKAGER_HOSTNAME", "127.0.0.1")
     android_sdk = (
         env.get("ANDROID_HOME", "").strip()
@@ -557,7 +560,38 @@ def _android_run_env() -> dict[str, str]:
     return env
 
 
-def _prepare_android_worktree(worktree: Path) -> None:
+def _simulator_run_env() -> dict[str, str]:
+    env = os.environ.copy()
+    _prepend_path_dirs(env, _user_gem_bin_dirs())
+    _ensure_ruby_logger_preload(env)
+    return env
+
+
+def _prepend_path_dirs(env: dict[str, str], dirs: Sequence[Path]) -> None:
+    prefixes = [str(path) for path in dirs if path.is_dir()]
+    if not prefixes:
+        return
+    current = [part for part in env.get("PATH", "").split(os.pathsep) if part]
+    env["PATH"] = os.pathsep.join([*prefixes, *[part for part in current if part not in prefixes]])
+
+
+def _user_gem_bin_dirs() -> tuple[Path, ...]:
+    root = Path.home() / ".gem" / "ruby"
+    if not root.is_dir():
+        return ()
+    return tuple(path for path in sorted(root.glob("*/bin"), reverse=True) if path.is_dir())
+
+
+def _ensure_ruby_logger_preload(env: dict[str, str]) -> None:
+    current = [part for part in env.get("RUBYOPT", "").split() if part]
+    if "-rlogger" in current:
+        return
+    env["RUBYOPT"] = " ".join(("-rlogger", *current))
+
+
+def _prepare_react_native_worktree(worktree: Path) -> None:
+    _exclude_local_worktree_artifacts(worktree)
+    _link_sibling_app_env_files(worktree)
     node_modules = worktree / "node_modules"
     if node_modules.exists() or node_modules.is_symlink():
         return
@@ -570,7 +604,83 @@ def _prepare_android_worktree(worktree: Path) -> None:
     except FileExistsError:
         return
     except OSError as exc:
-        raise RuntimeError(f"failed to link node_modules for Android proof: {source}") from exc
+        raise RuntimeError(f"failed to link node_modules for simulator proof: {source}") from exc
+
+
+def _prepare_android_worktree(worktree: Path) -> None:
+    _prepare_react_native_worktree(worktree)
+
+
+def _exclude_local_worktree_artifacts(worktree: Path) -> None:
+    exclude_path = _git_info_exclude_path(worktree)
+    if not exclude_path:
+        return
+    exclude_path.parent.mkdir(parents=True, exist_ok=True)
+    existing = exclude_path.read_text(encoding="utf-8") if exclude_path.is_file() else ""
+    entries = (
+        "/node_modules",
+        "/apps/elixir-card/.env",
+        "/apps/elixir-card/.env.*",
+    )
+    missing = [entry for entry in entries if entry not in set(existing.splitlines())]
+    if not missing:
+        return
+    prefix = "" if not existing or existing.endswith("\n") else "\n"
+    exclude_path.write_text(existing + prefix + "\n".join(missing) + "\n", encoding="utf-8")
+
+
+def _git_info_exclude_path(worktree: Path) -> Path | None:
+    git_path = worktree / ".git"
+    if git_path.is_dir():
+        return _git_common_dir(git_path) / "info" / "exclude"
+    if not git_path.is_file():
+        return None
+
+    raw_value = git_path.read_text(encoding="utf-8", errors="replace").strip()
+    if not raw_value.startswith("gitdir:"):
+        return None
+    git_dir = Path(raw_value.removeprefix("gitdir:").strip())
+    if not git_dir.is_absolute():
+        git_dir = (worktree / git_dir).resolve()
+    if not git_dir.exists():
+        return None
+    return _git_common_dir(git_dir) / "info" / "exclude"
+
+
+def _git_common_dir(git_dir: Path) -> Path:
+    common_dir_file = git_dir / "commondir"
+    if not common_dir_file.is_file():
+        return git_dir
+    raw_value = common_dir_file.read_text(encoding="utf-8", errors="replace").strip()
+    if not raw_value:
+        return git_dir
+    common_dir = Path(raw_value)
+    if not common_dir.is_absolute():
+        common_dir = (git_dir / common_dir).resolve()
+    return common_dir if common_dir.exists() else git_dir
+
+
+def _link_sibling_app_env_files(worktree: Path) -> None:
+    source_repo = _source_repo_root(worktree)
+    if not source_repo:
+        return
+    source_app = source_repo / "apps" / "elixir-card"
+    target_app = worktree / "apps" / "elixir-card"
+    if not source_app.is_dir() or not target_app.is_dir():
+        return
+
+    for source in sorted(source_app.glob(".env*")):
+        if source.name == ".env.example" or not source.is_file():
+            continue
+        target = target_app / source.name
+        if target.exists() or target.is_symlink():
+            continue
+        try:
+            target.symlink_to(source)
+        except FileExistsError:
+            continue
+        except OSError as exc:
+            raise RuntimeError(f"failed to link app env file for simulator proof: {source}") from exc
 
 
 def _node_modules_source(worktree: Path) -> Path | None:
@@ -579,6 +689,14 @@ def _node_modules_source(worktree: Path) -> Path | None:
         source = Path(configured).expanduser()
         return source if source.is_dir() else None
 
+    source_repo = _source_repo_root(worktree)
+    if not source_repo:
+        return None
+    source = source_repo / "node_modules"
+    return source if source.is_dir() else None
+
+
+def _source_repo_root(worktree: Path) -> Path | None:
     try:
         workspace = worktree.parent.parent
     except IndexError:
@@ -586,7 +704,7 @@ def _node_modules_source(worktree: Path) -> Path | None:
     repos = workspace / "repos"
     if not repos.is_dir():
         return None
-    candidates = [path for path in sorted(repos.glob("*/node_modules")) if path.is_dir()]
+    candidates = [path for path in sorted(repos.iterdir()) if (path / "package.json").is_file()]
     if len(candidates) == 1:
         return candidates[0]
     return None

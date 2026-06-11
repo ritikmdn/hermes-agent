@@ -111,6 +111,16 @@ class ProofRunner:
                 artifacts=(),
                 platforms=platforms,
             )
+        missing_platforms = _missing_platform_artifacts(artifacts=artifacts, platforms=platforms)
+        if missing_platforms:
+            missing = ", ".join(missing_platforms)
+            return ProofResult(
+                passed=False,
+                summary=f"Proof blocked: missing required platform artifacts: {missing}.",
+                output="\n\n".join(output_parts),
+                artifacts=artifacts,
+                platforms=platforms,
+            )
 
         manifest_path = self._write_manifest(
             run=run,
@@ -119,7 +129,7 @@ class ProofRunner:
             artifacts=artifacts,
             platforms=platforms,
         )
-        artifacts = tuple(sorted((str(manifest_path), *artifacts)))
+        artifacts = (str(manifest_path), *artifacts)
         return ProofResult(
             passed=True,
             summary="Proof captured.",
@@ -211,3 +221,31 @@ class ProofRunner:
         except subprocess.TimeoutExpired:
             return 124, "", f"command timed out after {timeout}s"
         return proc.returncode, proc.stdout, proc.stderr
+
+
+def _missing_platform_artifacts(*, artifacts: tuple[str, ...], platforms: tuple[str, ...]) -> tuple[str, ...]:
+    missing: list[str] = []
+    for platform in platforms:
+        normalized = _normalize_platform_name(platform)
+        if not normalized:
+            continue
+        if not any(_artifact_matches_platform(artifact, normalized) for artifact in artifacts):
+            missing.append(normalized)
+    return tuple(missing)
+
+
+def _artifact_matches_platform(artifact: str, platform: str) -> bool:
+    path = Path(artifact)
+    haystack = " ".join((path.name, path.stem, *path.parts[-3:])).lower()
+    if platform == "ios":
+        return any(token in haystack for token in ("ios", "iphone", "ipad"))
+    return platform in haystack
+
+
+def _normalize_platform_name(platform: str) -> str:
+    value = str(platform or "").strip().lower()
+    if value in {"iphone", "ipad", "ios-simulator"}:
+        return "ios"
+    if value in {"android-emulator"}:
+        return "android"
+    return value
