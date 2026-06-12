@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import json
 import re
+import subprocess
+import uuid
 from dataclasses import asdict, dataclass
+from pathlib import Path
 from typing import Any, Callable
 
-from .config import MonicaConfig
+from .config import MonicaConfig, runtime_root
 
 
 SYSTEM_PROMPT = """You are Monica, an agentic mobile frontend bug triage agent.
@@ -47,6 +50,7 @@ class IntentResult:
 
 
 AgentFactory = Callable[[], Any]
+RunCodexIntentCommand = Callable[[list[str], Path, str, int], str]
 
 
 class IntentClassifier:
@@ -55,9 +59,11 @@ class IntentClassifier:
         *,
         config: MonicaConfig | None = None,
         agent_factory: AgentFactory | None = None,
+        codex_run_command: RunCodexIntentCommand | None = None,
     ) -> None:
         self.config = config or MonicaConfig()
         self.agent_factory = agent_factory or self._default_agent
+        self.codex_run_command = codex_run_command
 
     def classify(self, *, request_text: str, thread_text: str) -> IntentResult:
         prompt = "\n".join(
@@ -79,6 +85,12 @@ class IntentClassifier:
             return _fallback_intent(request_text=request_text, thread_text=thread_text)
 
     def _default_agent(self) -> Any:
+        if self.config.worker.backend == "codex_cli":
+            return CodexCliIntentAgent(
+                config=self.config,
+                run_command=self.codex_run_command,
+            )
+
         from run_agent import AIAgent
 
         return AIAgent(
@@ -87,6 +99,88 @@ class IntentClassifier:
             platform="monica",
             skip_memory=True,
         )
+
+
+class CodexCliIntentAgent:
+    def __init__(
+        self,
+        *,
+        config: MonicaConfig,
+        run_command: RunCodexIntentCommand | None = None,
+    ) -> None:
+        self.config = config
+        self.run_command = run_command
+
+    def run_conversation(
+        self,
+        user_message: str,
+        system_message: str | None = None,
+        conversation_history: list[dict[str, Any]] | None = None,
+        task_id: str | None = None,
+    ) -> dict[str, str]:
+        root = runtime_root(self.config)
+        root.mkdir(parents=True, exist_ok=True)
+        output_dir = root / "intent-output"
+        output_dir.mkdir(parents=True, exist_ok=True)
+        output_file = output_dir / f"{task_id or 'classify'}-{uuid.uuid4().hex}.json"
+        command = self._command(output_file=output_file, cwd=root)
+        prompt = "\n\n".join(
+            part
+            for part in [
+                system_message or SYSTEM_PROMPT,
+                user_message,
+                "Return only the JSON object. Do not include markdown fences.",
+            ]
+            if part
+        )
+        output = (self.run_command or self._default_run)(
+            command,
+            root,
+            prompt,
+            _codex_intent_timeout_seconds(self.config),
+        )
+        content = _read_text(output_file) or output.strip()
+        return {"final_response": content}
+
+    def _command(self, *, output_file: Path, cwd: Path) -> list[str]:
+        command = [
+            self.config.worker.codex_command,
+            "exec",
+            "-c",
+            'approval_policy="never"',
+            "--cd",
+            str(cwd),
+            "--skip-git-repo-check",
+            "--sandbox",
+            "read-only",
+            "--color",
+            "never",
+            "--output-last-message",
+            str(output_file),
+        ]
+        if self.config.worker.codex_model:
+            command.extend(["--model", self.config.worker.codex_model])
+        if self.config.worker.codex_profile:
+            command.extend(["--profile", self.config.worker.codex_profile])
+        command.append("-")
+        return command
+
+    @staticmethod
+    def _default_run(command: list[str], cwd: Path, prompt: str, timeout: int) -> str:
+        proc = subprocess.run(
+            command,
+            cwd=str(cwd),
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=timeout,
+        )
+        if proc.returncode != 0:
+            raise RuntimeError(
+                f"Codex CLI intent classifier failed ({proc.returncode}): {_tail(proc.stderr)}"
+            )
+        return proc.stdout
 
 
 def _extract_json(content: str) -> str:
@@ -252,3 +346,18 @@ def _first_line(text: str) -> str:
         if clean:
             return clean[:180]
     return "Tagged mobile bug report"
+
+
+def _codex_intent_timeout_seconds(config: MonicaConfig) -> int:
+    return max(30, min(config.worker.timeout_minutes * 60, 180))
+
+
+def _read_text(path: Path) -> str:
+    try:
+        return path.read_text(encoding="utf-8").strip()
+    except OSError:
+        return ""
+
+
+def _tail(value: str | None, *, limit: int = 2000) -> str:
+    return str(value or "").strip()[-limit:]

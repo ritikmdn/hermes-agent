@@ -164,9 +164,13 @@ def check_monica_readiness(
 
     side_effect_rollout = config.rollout_mode in {"linear_only", "local_fix_only", "approved_pr"}
     if side_effect_rollout:
+        codex_cli_classifier_available = (
+            config.worker.backend == "codex_cli"
+            and resolve(config.worker.codex_command) is not None
+        )
         warn(
             "intent_classifier_model",
-            _has_any_secret(env, _MODEL_CREDENTIAL_KEYS),
+            _has_any_secret(env, _MODEL_CREDENTIAL_KEYS) or codex_cli_classifier_available,
             (
                 "No common model API credential is configured; Monica's intent classifier "
                 "may fall back to deterministic keyword triage"

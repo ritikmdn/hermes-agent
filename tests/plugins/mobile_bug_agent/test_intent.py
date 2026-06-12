@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+from pathlib import Path
+
+from plugins.mobile_bug_agent.config import MonicaConfig, RuntimeConfig, WorkerConfig
 from plugins.mobile_bug_agent.intent import IntentClassifier, IntentResult
 
 
@@ -98,6 +101,57 @@ def test_classifier_parses_rich_bug_context():
     assert result.platforms == ("Android",)
     assert result.device_context == "Pixel 7 on latest build"
     assert result.build_context == "2.14.0 beta"
+
+
+def test_classifier_uses_codex_cli_backend_when_configured(tmp_path):
+    calls = []
+
+    def fake_run(command, cwd, prompt, timeout):
+        calls.append((command, cwd, prompt, timeout))
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            """{
+              "is_mobile_bug": true,
+              "wants_linear": true,
+              "wants_fix": true,
+              "confidence": 0.9,
+              "summary": "iOS PDP tags are hard coded",
+              "missing_questions": [],
+              "reason": "The request describes native app PDP copy that needs cleanup."
+            }""",
+            encoding="utf-8",
+        )
+        return "stdout fallback"
+
+    config = MonicaConfig(
+        runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime")),
+        worker=WorkerConfig(
+            backend="codex_cli",
+            codex_model="gpt-5-codex",
+            codex_profile="monica",
+        ),
+    )
+
+    result = IntentClassifier(config=config, codex_run_command=fake_run).classify(
+        request_text="@monica iOS PDP tags are hard coded, please fix it",
+        thread_text="U1: screenshot attached from the native app",
+    )
+
+    command, cwd, prompt, timeout = calls[0]
+    assert result.is_mobile_bug is True
+    assert result.wants_fix is True
+    assert command[:2] == ["codex", "exec"]
+    assert command[command.index("-c") + 1] == 'approval_policy="never"'
+    assert command[command.index("--cd") + 1] == str(tmp_path / "runtime")
+    assert "--skip-git-repo-check" in command
+    assert command[command.index("--sandbox") + 1] == "read-only"
+    assert command[command.index("--model") + 1] == "gpt-5-codex"
+    assert command[command.index("--profile") + 1] == "monica"
+    assert command[-1] == "-"
+    assert cwd == tmp_path / "runtime"
+    assert "Tagged request:" in prompt
+    assert "Return strict JSON" in prompt
+    assert timeout == 180
 
 
 def test_classifier_falls_back_safely_on_bad_json():

@@ -9,6 +9,7 @@ from plugins.mobile_bug_agent.config import (
     RepoConfig,
     SlackConfig,
     VerificationConfig,
+    WorkerConfig,
 )
 from plugins.mobile_bug_agent.readiness import check_monica_readiness
 
@@ -70,8 +71,13 @@ def test_readiness_accepts_ios_proof_when_simctl_probe_passes():
 
 
 def test_readiness_warns_when_no_model_credential_is_configured_for_agentic_triage():
+    config = replace(
+        _code_rollout_config(),
+        worker=WorkerConfig(backend="internal_agent"),
+    )
+
     report = check_monica_readiness(
-        config=_code_rollout_config(),
+        config=config,
         environ={
             "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
             "MONICA_SLACK_APP_TOKEN": "xapp-token",
@@ -86,9 +92,32 @@ def test_readiness_warns_when_no_model_credential_is_configured_for_agentic_tria
     assert any(issue.code == "intent_classifier_model" for issue in report.warnings)
 
 
-def test_readiness_accepts_agentic_triage_when_a_model_credential_is_configured():
+def test_readiness_accepts_agentic_triage_with_codex_cli_classifier_path():
     report = check_monica_readiness(
         config=_code_rollout_config(),
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        command_succeeds=lambda _command: True,
+    )
+
+    warning_codes = {issue.code for issue in report.warnings}
+    assert report.ready is True
+    assert "intent_classifier_model" not in warning_codes
+
+
+def test_readiness_accepts_agentic_triage_when_a_model_credential_is_configured():
+    config = replace(
+        _code_rollout_config(),
+        worker=WorkerConfig(backend="internal_agent"),
+    )
+
+    report = check_monica_readiness(
+        config=config,
         environ={
             "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
             "MONICA_SLACK_APP_TOKEN": "xapp-token",
