@@ -1157,6 +1157,36 @@ def test_default_skills_pr_body_includes_slack_permalink_and_evidence(tmp_path):
     assert "- /tmp/monica-proof/android-pdp-fixed.mp4" in body
 
 
+def test_default_skills_linear_description_keeps_context_gaps(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C_MOBILE",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000200",
+        user_id="U_TAGGER",
+        request_text="Hard-coded PDP tags",
+    )
+    skills = DefaultMonicaSkills(config=MonicaConfig(), state=state)
+
+    description = skills._linear_description(
+        run,
+        {"permalink": "https://example.slack.com/thread", "messages": [run.request_text]},
+        {
+            "summary": "Hard-coded PDP tags",
+            "confidence": 0.96,
+            "missing_questions": [
+                "Which app build/environment should be used to verify the issue?",
+                "Are there specific PDP examples where this was observed?",
+            ],
+        },
+    )
+
+    assert "## Open Questions / Context Gaps" in description
+    assert "- Which app build/environment should be used to verify the issue?" in description
+    assert "- Are there specific PDP examples where this was observed?" in description
+
+
 def test_default_skills_pr_body_omits_unsupported_evidence_urls(tmp_path):
     state = MonicaState.open(tmp_path / "monica.sqlite")
     run = state.create_run(

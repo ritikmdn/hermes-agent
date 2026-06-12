@@ -89,6 +89,29 @@ class RichAgent:
         }
 
 
+class OverClarifyingAgent:
+    def run_conversation(self, user_message, system_message=None, conversation_history=None, task_id=None):
+        assert "context gaps instead of blocking" in system_message
+        return {
+            "final_response": """{
+              "is_mobile_bug": true,
+              "wants_linear": true,
+              "wants_fix": false,
+              "confidence": 0.96,
+              "summary": "Gym and voucher PDPs show hard-coded offer tags",
+              "observed_behavior": "Gym and voucher PDPs display tags that may not apply to every offer.",
+              "expected_behavior": "PDP tags should not be hard-coded in the React Native app.",
+              "reproduction_steps": ["Open a gym PDP", "Check product detail tags"],
+              "platforms": ["React Native mobile app"],
+              "missing_questions": [
+                "Which app build/environment should be used to verify the issue?",
+                "Are there specific PDP examples where this was observed?"
+              ],
+              "reason": "This is a mobile frontend PDP content issue."
+            }"""
+        }
+
+
 def test_classifier_parses_rich_bug_context():
     result = IntentClassifier(agent_factory=lambda: RichAgent()).classify(
         request_text="@monica checkout crashes on Android after promo",
@@ -101,6 +124,22 @@ def test_classifier_parses_rich_bug_context():
     assert result.platforms == ("Android",)
     assert result.device_context == "Pixel 7 on latest build"
     assert result.build_context == "2.14.0 beta"
+
+
+def test_classifier_does_not_block_high_confidence_actionable_bug_on_context_gaps():
+    result = IntentClassifier(agent_factory=lambda: OverClarifyingAgent()).classify(
+        request_text=(
+            "@monica Bug: PDP product details for gyms and vouchers show hard-coded tags. "
+            "File Linear and wait for my approval before making code changes."
+        ),
+        thread_text="U1: React Native app PDP tags are app-side hard-coded.",
+    )
+
+    assert result.is_mobile_bug is True
+    assert result.wants_linear is True
+    assert result.wants_fix is True
+    assert result.missing_questions
+    assert result.needs_clarification is False
 
 
 def test_classifier_uses_codex_cli_backend_when_configured(tmp_path):

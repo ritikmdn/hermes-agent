@@ -205,6 +205,7 @@ class DefaultMonicaSkills:
         evidence = self._evidence_lines(files)
         context_errors = thread.get("context_errors") or []
         confidence = intent.get("confidence", "")
+        open_questions = _markdown_list(intent.get("missing_questions"))
         sections = [
             "## Summary",
             str(intent.get("summary") or run.request_text),
@@ -238,6 +239,14 @@ class DefaultMonicaSkills:
             "## Evidence",
             evidence or "- No files captured.",
         ]
+        if open_questions:
+            sections.extend(
+                [
+                    "",
+                    "## Open Questions / Context Gaps",
+                    open_questions,
+                ]
+            )
         if context_errors:
             sections.extend(
                 [

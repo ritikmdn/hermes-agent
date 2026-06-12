@@ -4,7 +4,7 @@ import json
 import re
 import subprocess
 import uuid
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, replace
 from pathlib import Path
 from typing import Any, Callable
 
@@ -17,7 +17,13 @@ Return strict JSON with keys: is_mobile_bug, wants_linear, wants_fix,
 confidence, summary, observed_behavior, expected_behavior, reproduction_steps,
 platforms, device_context, build_context, missing_questions, reason.
 Do not require command syntax. Infer intent from natural language.
-When uncertain, ask for clarification instead of taking action."""
+If a tagged request describes the affected mobile app surface, observed issue,
+and desired outcome, proceed with filing even when build, device, or exact
+example records are missing; put those as context gaps instead of blocking.
+If the request asks to wait for approval before code changes, set wants_fix true;
+the approval gate controls when code is written.
+When the request is too ambiguous to identify a mobile app bug or next action,
+ask for clarification instead of taking action."""
 
 
 @dataclass(frozen=True)
@@ -38,7 +44,18 @@ class IntentResult:
 
     @property
     def needs_clarification(self) -> bool:
+        if self._actionable_enough:
+            return False
         return bool(self.missing_questions) or self.confidence < 0.5
+
+    @property
+    def _actionable_enough(self) -> bool:
+        return (
+            self.is_mobile_bug
+            and (self.wants_linear or self.wants_fix)
+            and self.confidence >= 0.7
+            and bool(self.summary or self.observed_behavior or self.expected_behavior)
+        )
 
     def to_dict(self) -> dict[str, Any]:
         data = asdict(self)
@@ -80,9 +97,17 @@ class IntentClassifier:
             result = agent.run_conversation(user_message=prompt, system_message=SYSTEM_PROMPT)
             content = str((result or {}).get("final_response") or "")
             parsed = json.loads(_extract_json(content))
-            return _result_from_mapping(parsed)
+            return _apply_request_overrides(
+                _result_from_mapping(parsed),
+                request_text=request_text,
+                thread_text=thread_text,
+            )
         except Exception:
-            return _fallback_intent(request_text=request_text, thread_text=thread_text)
+            return _apply_request_overrides(
+                _fallback_intent(request_text=request_text, thread_text=thread_text),
+                request_text=request_text,
+                thread_text=thread_text,
+            )
 
     def _default_agent(self) -> Any:
         if self.config.worker.backend == "codex_cli":
@@ -240,6 +265,35 @@ def _fallback_intent(*, request_text: str, thread_text: str) -> IntentResult:
         platforms=platforms,
         missing_questions=questions,
         reason="Fallback keyword triage used because model classification was unavailable.",
+    )
+
+
+def _apply_request_overrides(
+    result: IntentResult,
+    *,
+    request_text: str,
+    thread_text: str,
+) -> IntentResult:
+    text = "\n".join([request_text, thread_text]).lower()
+    if result.is_mobile_bug and result.wants_linear and _mentions_deferred_fix(text):
+        result = replace(result, wants_fix=True)
+    return result
+
+
+def _mentions_deferred_fix(text: str) -> bool:
+    return bool(
+        "approval" in text
+        and re.search(
+            r"\b("
+            r"code changes?"
+            r"|making code changes?"
+            r"|before fixing"
+            r"|before making"
+            r"|fix after approval"
+            r"|after approval"
+            r")\b",
+            text,
+        )
     )
 
 
