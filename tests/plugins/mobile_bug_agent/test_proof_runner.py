@@ -111,6 +111,62 @@ def test_proof_runner_passes_when_command_creates_artifact(tmp_path):
     ]
 
 
+def test_proof_runner_clears_stale_artifacts_before_each_attempt(tmp_path):
+    proof_dir = tmp_path / "monica-runtime" / "proof" / "run-123"
+    proof_dir.mkdir(parents=True)
+    (proof_dir / "android-screenshot.png").write_text("old launcher screenshot", encoding="utf-8")
+    (proof_dir / "monica-proof-manifest.json").write_text("old manifest", encoding="utf-8")
+
+    def run(_command, _cwd, _timeout, _env):
+        (proof_dir / "ios-screenshot.png").write_text("fresh ios image bytes", encoding="utf-8")
+        return 0, "captured ios only", ""
+
+    runner = ProofRunner(
+        config=_config(tmp_path, platform_order=("ios", "android")),
+        run_command=run,
+    )
+
+    result = runner.run(run=FakeRun(), worktree=_mark_git_worktree(tmp_path / "worktree"))
+
+    assert result.passed is False
+    assert result.summary == "Proof blocked: missing required platform artifacts: android."
+    assert result.artifacts == (str(proof_dir / "ios-screenshot.png"),)
+    assert not (proof_dir / "android-screenshot.png").exists()
+    assert not (proof_dir / "monica-proof-manifest.json").exists()
+
+
+def test_proof_runner_extends_outer_timeout_for_builtin_multi_platform_simulator_command(tmp_path):
+    calls = []
+
+    def run(command, cwd, timeout, env):
+        calls.append((command, timeout, env["MONICA_PROOF_PLATFORM_ORDER"]))
+        proof_dir = tmp_path / "monica-runtime" / "proof" / "run-123"
+        (proof_dir / "ios-screenshot.png").write_text("ios image bytes", encoding="utf-8")
+        (proof_dir / "android-screenshot.png").write_text("android image bytes", encoding="utf-8")
+        return 0, "captured both", ""
+
+    runner = ProofRunner(
+        config=_config(
+            tmp_path,
+            platform_order=("ios", "android"),
+            timeout_minutes=30,
+            commands=("uv run python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 1800",),
+        ),
+        run_command=run,
+    )
+
+    result = runner.run(run=FakeRun(), worktree=_mark_git_worktree(tmp_path / "worktree"))
+
+    assert result.passed is True
+    assert calls == [
+        (
+            "uv run python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 1800",
+            4200,
+            "ios,android",
+        )
+    ]
+
+
 def test_proof_runner_blocks_when_command_produces_no_artifacts(tmp_path):
     runner = ProofRunner(
         config=_config(tmp_path),

@@ -1,5 +1,7 @@
 import json
 import os
+import shlex
+import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -91,10 +93,12 @@ class ProofRunner:
                 platforms=platforms,
             )
 
+        _clear_proof_dir(proof_dir)
         output_parts: list[str] = []
-        timeout = self.config.proof.timeout_minutes * 60
+        base_timeout = self.config.proof.timeout_minutes * 60
         env = self._proof_env(run=run, worktree=worktree_path, proof_dir=proof_dir)
         for command in command_list:
+            timeout = _proof_command_timeout(command, base_timeout, platforms)
             code, stdout, stderr = self._run_command(command, worktree_path, timeout, env)
             output_parts.append(
                 "\n".join(
@@ -257,6 +261,48 @@ def _missing_platform_artifacts(*, artifacts: tuple[str, ...], platforms: tuple[
         if not any(_artifact_matches_platform(artifact, normalized) for artifact in visual_artifacts):
             missing.append(normalized)
     return tuple(missing)
+
+
+def _clear_proof_dir(proof_dir: Path) -> None:
+    for child in proof_dir.iterdir():
+        if child.is_dir() and not child.is_symlink():
+            shutil.rmtree(child)
+            continue
+        child.unlink(missing_ok=True)
+
+
+def _proof_command_timeout(command: str, base_timeout: int, platforms: tuple[str, ...]) -> int:
+    if "plugins.mobile_bug_agent.simulator_proof" not in command:
+        return base_timeout
+
+    platform_count = max(
+        1,
+        len(tuple(platform for platform in (_normalize_platform_name(value) for value in platforms) if platform)),
+    )
+    per_platform_timeout = _simulator_proof_timeout_seconds(command) or base_timeout
+    return max(base_timeout, per_platform_timeout * platform_count + 600)
+
+
+def _simulator_proof_timeout_seconds(command: str) -> int:
+    try:
+        parts = shlex.split(command)
+    except ValueError:
+        return 0
+
+    for index, part in enumerate(parts):
+        if part == "--timeout-seconds" and index + 1 < len(parts):
+            return _positive_int(parts[index + 1])
+        if part.startswith("--timeout-seconds="):
+            return _positive_int(part.split("=", 1)[1])
+    return 0
+
+
+def _positive_int(value: str) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return 0
+    return parsed if parsed > 0 else 0
 
 
 def _artifact_matches_platform(artifact: str, platform: str) -> bool:

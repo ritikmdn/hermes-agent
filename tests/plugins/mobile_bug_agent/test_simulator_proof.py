@@ -433,10 +433,66 @@ def test_simulator_proof_android_captures_while_long_lived_run_is_foreground(mon
             worktree,
             120,
         ),
+        (
+            ("adb", "-s", "emulator-5554", "exec-out", "uiautomator", "dump", "/dev/tty"),
+            worktree,
+            120,
+        ),
     ]
     assert bytes_calls == [
         (("adb", "-s", "emulator-5554", "exec-out", "screencap", "-p"), worktree, 120)
     ]
+
+
+def test_simulator_proof_android_rejects_expo_dev_client_launcher(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return """
+            <hierarchy>
+              <node text="Elixir Card" />
+              <node text="DEVELOPMENT SERVERS" />
+              <node text="New development server" />
+              <node text="Recently opened" />
+            </hierarchy>
+            """
+        return "ok"
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        _log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=lambda _args, _cwd, _timeout: _png_bytes(),
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Expo Dev Client launcher"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            timeout_seconds=120,
+        )
 
 
 def test_open_android_url_shell_quotes_dev_client_url_with_query_separator(tmp_path):

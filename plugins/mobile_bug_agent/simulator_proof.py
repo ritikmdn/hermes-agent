@@ -227,6 +227,8 @@ class SimulatorProofHarness:
                 screenshot.write_bytes(
                     self._run_bytes((*adb, "exec-out", "screencap", "-p"), worktree, timeout_seconds)
                 )
+                if android_package.strip():
+                    _assert_android_not_expo_dev_client_launcher(self._run_text, adb, worktree, timeout_seconds)
 
             package = android_package.strip()
             if package:
@@ -921,6 +923,26 @@ def _resolve_android_launch_activity(adb: tuple[str, ...], cwd: Path, package: s
         if "/" in value and not value.startswith("priority="):
             return value
     return ""
+
+
+def _assert_android_not_expo_dev_client_launcher(
+    run_text: RunText,
+    adb: tuple[str, ...],
+    cwd: Path,
+    timeout: int,
+) -> None:
+    try:
+        ui_tree = run_text((*adb, "exec-out", "uiautomator", "dump", "/dev/tty"), cwd, timeout)
+    except RuntimeError:
+        return
+
+    normalized = " ".join(str(ui_tree or "").lower().split())
+    if "development servers" in normalized and (
+        "new development server" in normalized
+        or "recently opened" in normalized
+        or "expo" in normalized
+    ):
+        raise RuntimeError("Android proof captured Expo Dev Client launcher instead of real app UI.")
 
 
 def _terminate_process(proc: subprocess.Popen[str]) -> None:
