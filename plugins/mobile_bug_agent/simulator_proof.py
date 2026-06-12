@@ -978,6 +978,10 @@ def _ios_metro_env() -> dict[str, str]:
     # Metro must listen on 127.0.0.1: the Expo manifest hardcodes the literal IP
     # in launchAsset URLs, while Node resolves localhost to ::1 first by default.
     env = _simulator_run_env()
+    # The simulator shares the host loopback; the LAN-IP default that
+    # _simulator_run_env applies would make the manifest advertise an
+    # address Metro is not bound to.
+    env["REACT_NATIVE_PACKAGER_HOSTNAME"] = _ios_packager_hostname()
     node_options = env.get("NODE_OPTIONS", "").strip()
     if "--dns-result-order" not in node_options:
         env["NODE_OPTIONS"] = f"{node_options} --dns-result-order=ipv4first".strip()

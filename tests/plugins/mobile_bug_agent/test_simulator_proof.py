@@ -975,6 +975,16 @@ def test_ios_metro_env_prefers_ipv4_loopback(monkeypatch):
     assert simulator_proof._ios_metro_env()["NODE_OPTIONS"] == "--dns-result-order=verbatim"
 
 
+def test_ios_metro_env_pins_packager_hostname_to_loopback(monkeypatch):
+    monkeypatch.delenv("MONICA_IOS_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    assert simulator_proof._ios_metro_env()["REACT_NATIVE_PACKAGER_HOSTNAME"] == "localhost"
+
+    monkeypatch.setenv("MONICA_IOS_PACKAGER_HOSTNAME", "127.0.0.1")
+    assert simulator_proof._ios_metro_env()["REACT_NATIVE_PACKAGER_HOSTNAME"] == "127.0.0.1"
+
+
 def test_required_env_keys_accept_local_env_file(monkeypatch, tmp_path):
     monkeypatch.delenv("MONICA_TEST_REQUIRED_ALPHA", raising=False)
     monkeypatch.setenv("ENVIRONMENT", "staging")
