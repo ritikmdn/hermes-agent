@@ -103,6 +103,27 @@ class LabeledMentionWebClient(FakeWebClient):
         }
 
 
+class ChatGptFooterWebClient(FakeWebClient):
+    def conversations_replies(self, channel, ts, limit):
+        assert channel == "C123"
+        assert ts == "1710000000.000100"
+        assert limit == 40
+        return {
+            "ok": True,
+            "messages": [
+                {
+                    "user": "U1",
+                    "text": (
+                        "<@U999> checkout crashes after promo *Sent using* ChatGPT\n\n"
+                        "[Slack Block Kit payload for this message]\n"
+                        "```json\n[]\n```"
+                    ),
+                    "ts": "1710000000.000100",
+                },
+            ],
+        }
+
+
 class AttachmentImageWebClient(FakeWebClient):
     def conversations_replies(self, channel, ts, limit):
         assert channel == "C123"
@@ -399,6 +420,25 @@ def test_normalizes_labeled_slack_mentions_in_thread_context():
     assert ctx.to_dict()["messages"] == [
         "U1: @monica checkout crashes after promo",
         "U2: @U123 can repro on Android",
+    ]
+
+
+def test_removes_chatgpt_footer_and_block_payload_from_thread_context():
+    fake = ChatGptFooterWebClient()
+    reader = SlackThreadClient(
+        client=fake,
+        token="xoxb-token",
+        monica_user_ids=("U999",),
+        download_attachments=False,
+    )
+
+    ctx = reader.read_thread(channel_id="C123", thread_ts="1710000000.000100", limit=40)
+
+    assert [message.text for message in ctx.messages] == [
+        "@monica checkout crashes after promo",
+    ]
+    assert ctx.to_dict()["messages"] == [
+        "U1: @monica checkout crashes after promo",
     ]
 
 

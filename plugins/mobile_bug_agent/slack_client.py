@@ -10,6 +10,8 @@ import httpx
 
 
 _MENTION_RE = re.compile(r"<@([A-Z0-9_]+)(?:\|[^>]+)?>")
+_SLACK_BLOCK_KIT_PAYLOAD_MARKER = "[Slack Block Kit payload for this message]"
+_CHATGPT_FOOTER_RE = re.compile(r"\s*\*Sent using\*\s+ChatGPT\s*$", re.I)
 
 
 class SlackClientError(RuntimeError):
@@ -360,7 +362,12 @@ class SlackThreadClient:
             user_id = match.group(1)
             return "@monica" if user_id in self.monica_user_ids else f"@{user_id}"
 
-        return _MENTION_RE.sub(replace, text).strip()
+        clean = str(text or "").strip()
+        marker_index = clean.find(_SLACK_BLOCK_KIT_PAYLOAD_MARKER)
+        if marker_index >= 0:
+            clean = clean[:marker_index].rstrip()
+        clean = _CHATGPT_FOOTER_RE.sub("", clean).strip()
+        return _MENTION_RE.sub(replace, clean).strip()
 
     def _message_permalink(self, *, channel_id: str, message_ts: str) -> str:
         if not message_ts:
