@@ -124,6 +124,23 @@ def test_proof_runner_blocks_when_command_produces_no_artifacts(tmp_path):
     assert result.artifacts == ()
 
 
+def test_proof_runner_blocks_when_command_produces_only_logs(tmp_path):
+    def run(_command, _cwd, _timeout, _env):
+        proof_dir = tmp_path / "monica-runtime" / "proof" / "run-123"
+        (proof_dir / "ios-metro.stdout.log").write_text("iOS Bundled 1000ms", encoding="utf-8")
+        return 0, "captured logs", ""
+
+    runner = ProofRunner(config=_config(tmp_path), run_command=run)
+
+    result = runner.run(run=FakeRun(), worktree=_mark_git_worktree(tmp_path / "worktree"))
+
+    assert result.passed is False
+    assert result.summary == "Proof blocked: proof commands produced no screenshot or recording artifacts."
+    assert result.artifacts == (
+        str(tmp_path / "monica-runtime" / "proof" / "run-123" / "ios-metro.stdout.log"),
+    )
+
+
 def test_proof_runner_blocks_when_required_platform_artifact_is_missing(tmp_path):
     def run(_command, _cwd, _timeout, _env):
         proof_path = tmp_path / "monica-runtime" / "proof" / "run-123" / "android-screenshot.png"
@@ -141,6 +158,28 @@ def test_proof_runner_blocks_when_required_platform_artifact_is_missing(tmp_path
     assert result.summary == "Proof blocked: missing required platform artifacts: ios."
     assert result.artifacts == (
         str(tmp_path / "monica-runtime" / "proof" / "run-123" / "android-screenshot.png"),
+    )
+
+
+def test_proof_runner_does_not_count_platform_logs_as_required_visual_proof(tmp_path):
+    def run(_command, _cwd, _timeout, _env):
+        proof_dir = tmp_path / "monica-runtime" / "proof" / "run-123"
+        (proof_dir / "ios-metro.stdout.log").write_text("iOS Bundled 1000ms", encoding="utf-8")
+        (proof_dir / "android-screenshot.png").write_text("android image bytes", encoding="utf-8")
+        return 0, "captured android and ios logs", ""
+
+    runner = ProofRunner(
+        config=_config(tmp_path, platform_order=("ios", "android")),
+        run_command=run,
+    )
+
+    result = runner.run(run=FakeRun(), worktree=_mark_git_worktree(tmp_path / "worktree"))
+
+    assert result.passed is False
+    assert result.summary == "Proof blocked: missing required platform artifacts: ios."
+    assert result.artifacts == (
+        str(tmp_path / "monica-runtime" / "proof" / "run-123" / "android-screenshot.png"),
+        str(tmp_path / "monica-runtime" / "proof" / "run-123" / "ios-metro.stdout.log"),
     )
 
 

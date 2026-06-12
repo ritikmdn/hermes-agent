@@ -8,6 +8,18 @@ from typing import Any, Callable
 from .config import MonicaConfig, runtime_root
 
 _MANIFEST_NAME = "monica-proof-manifest.json"
+_VISUAL_PROOF_SUFFIXES = {
+    ".gif",
+    ".heic",
+    ".jpeg",
+    ".jpg",
+    ".m4v",
+    ".mov",
+    ".mp4",
+    ".png",
+    ".webm",
+    ".webp",
+}
 
 
 @dataclass(frozen=True)
@@ -109,6 +121,15 @@ class ProofRunner:
                 summary="Proof blocked: proof commands produced no artifacts.",
                 output="\n\n".join(output_parts),
                 artifacts=(),
+                platforms=platforms,
+            )
+        visual_artifacts = _visual_proof_artifacts(artifacts)
+        if not visual_artifacts:
+            return ProofResult(
+                passed=False,
+                summary="Proof blocked: proof commands produced no screenshot or recording artifacts.",
+                output="\n\n".join(output_parts),
+                artifacts=artifacts,
                 platforms=platforms,
             )
         missing_platforms = _missing_platform_artifacts(artifacts=artifacts, platforms=platforms)
@@ -228,11 +249,12 @@ class ProofRunner:
 
 def _missing_platform_artifacts(*, artifacts: tuple[str, ...], platforms: tuple[str, ...]) -> tuple[str, ...]:
     missing: list[str] = []
+    visual_artifacts = _visual_proof_artifacts(artifacts)
     for platform in platforms:
         normalized = _normalize_platform_name(platform)
         if not normalized:
             continue
-        if not any(_artifact_matches_platform(artifact, normalized) for artifact in artifacts):
+        if not any(_artifact_matches_platform(artifact, normalized) for artifact in visual_artifacts):
             missing.append(normalized)
     return tuple(missing)
 
@@ -243,6 +265,14 @@ def _artifact_matches_platform(artifact: str, platform: str) -> bool:
     if platform == "ios":
         return any(token in haystack for token in ("ios", "iphone", "ipad"))
     return platform in haystack
+
+
+def _visual_proof_artifacts(artifacts: tuple[str, ...]) -> tuple[str, ...]:
+    return tuple(artifact for artifact in artifacts if _is_visual_proof_artifact(artifact))
+
+
+def _is_visual_proof_artifact(artifact: str) -> bool:
+    return Path(artifact).suffix.lower() in _VISUAL_PROOF_SUFFIXES
 
 
 def _normalize_platform_name(platform: str) -> str:
