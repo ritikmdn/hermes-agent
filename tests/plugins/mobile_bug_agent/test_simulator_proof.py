@@ -240,6 +240,40 @@ def test_simulator_proof_ios_captures_while_expo_runner_is_alive(monkeypatch, tm
     ]
 
 
+def test_simulator_proof_ios_preserves_installed_app_by_default(monkeypatch, tmp_path):
+    uninstall_calls = []
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    monkeypatch.setattr(
+        simulator_proof,
+        "_uninstall_ios_bundle",
+        lambda *args: uninstall_calls.append(args),
+    )
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(args, cwd, timeout, target, bundle_id, dev_client_url, log_dir, while_ready):
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        dev_client_scheme="elixir-card",
+        ios_simulator_udid="SIM-123",
+        ios_bundle_id="com.elixir.card",
+        timeout_seconds=90,
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert uninstall_calls == []
+
+
 def test_simulator_proof_ios_temporarily_overrides_existing_fingerprint_config(tmp_path):
     proof_dir = tmp_path / "proof"
     worktree = _worktree(tmp_path / "app")
@@ -525,6 +559,55 @@ def test_simulator_proof_android_rejects_expo_dev_client_launcher(monkeypatch, t
     )
 
     with pytest.raises(RuntimeError, match="Expo Dev Client launcher"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            timeout_seconds=120,
+        )
+
+
+def test_simulator_proof_android_rejects_expo_dev_client_error_screen(monkeypatch, tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return """
+            <hierarchy>
+              <node text="There was a problem loading the project." />
+              <node text="This development build encountered the following error:" />
+              <node text="java.lang.NoClassDefFoundError: Failed resolution of: Lexpo/modules/webbrowser" />
+              <node text="Reload" />
+              <node text="Go home" />
+            </hierarchy>
+            """
+        return "ok"
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        _log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=lambda _args, _cwd, _timeout: _png_bytes(),
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Expo Dev Client error"):
         harness.run(
             worktree=worktree,
             proof_dir=proof_dir,
@@ -947,6 +1030,88 @@ def test_prepare_react_native_worktree_excludes_local_symlinks_from_git(tmp_path
     assert "/apps/elixir-card/.env\n" in exclude
     assert "/apps/elixir-card/.env.*\n" in exclude
     assert "fingerprint.config.js\n" in exclude
+
+
+def test_prepare_react_native_worktree_initializes_unchecked_out_submodules(monkeypatch, tmp_path):
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktrees" / "monica-ENG-123"
+    worktree.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /tmp/fake-mobile-worktree-git-dir", encoding="utf-8")
+    (worktree / "package.json").write_text("{}", encoding="utf-8")
+    calls = []
+
+    def fake_run(args, **kwargs):
+        calls.append((args, kwargs["cwd"]))
+        if args == ["git", "submodule", "status", "--recursive"]:
+            return SimpleNamespace(
+                returncode=0,
+                stdout="-689e5d722c44e97b19546dd5a434f937bb22ce2c package/health-aggregation\n",
+                stderr="",
+            )
+        if args == ["git", "submodule", "update", "--init", "--recursive"]:
+            return SimpleNamespace(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected command: {args}")
+
+    monkeypatch.setattr(simulator_proof.subprocess, "run", fake_run)
+
+    simulator_proof._prepare_react_native_worktree(worktree)
+
+    assert calls == [
+        (["git", "submodule", "status", "--recursive"], str(worktree)),
+        (["git", "submodule", "update", "--init", "--recursive"], str(worktree)),
+    ]
+
+
+def test_prepare_react_native_worktree_retargets_workspace_package_symlinks(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        simulator_proof.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktrees" / "monica-ENG-123"
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source_package = source_repo / "packages" / "native-glass-tabbar"
+    worktree_package = worktree / "packages" / "native-glass-tabbar"
+    source_scope = source_repo / "node_modules" / "@elixir"
+    worktree.mkdir(parents=True)
+    source_package.mkdir(parents=True)
+    worktree_package.mkdir(parents=True)
+    source_scope.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /tmp/fake-mobile-worktree-git-dir", encoding="utf-8")
+    (worktree / "package.json").write_text("{}", encoding="utf-8")
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+    (source_scope / "native-glass-tabbar").symlink_to(
+        Path("../../packages/native-glass-tabbar"),
+        target_is_directory=True,
+    )
+
+    simulator_proof._prepare_react_native_worktree(worktree)
+
+    assert (worktree / "node_modules" / "@elixir" / "native-glass-tabbar").resolve() == worktree_package
+
+
+def test_prepare_react_native_worktree_links_sibling_app_node_modules(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        simulator_proof.subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(returncode=0, stdout="", stderr=""),
+    )
+    workspace = tmp_path / "workspace"
+    worktree = workspace / "worktrees" / "monica-ENG-123"
+    source_repo = workspace / "repos" / "elixir-card-app"
+    source_app_module = source_repo / "apps" / "elixir-card" / "node_modules" / "expo-web-browser"
+    target_app = worktree / "apps" / "elixir-card"
+    worktree.mkdir(parents=True)
+    source_app_module.mkdir(parents=True)
+    target_app.mkdir(parents=True)
+    (worktree / ".git").write_text("gitdir: /tmp/fake-mobile-worktree-git-dir", encoding="utf-8")
+    (worktree / "package.json").write_text("{}", encoding="utf-8")
+    (source_repo / "package.json").write_text("{}", encoding="utf-8")
+
+    simulator_proof._prepare_react_native_worktree(worktree)
+
+    assert (target_app / "node_modules" / "expo-web-browser").resolve() == source_app_module
 
 
 def test_git_info_exclude_path_uses_common_dir_for_linked_worktree(tmp_path):

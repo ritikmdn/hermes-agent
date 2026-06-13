@@ -133,7 +133,8 @@ class SimulatorProofHarness:
 
             clean_bundle_id = bundle_id.strip()
             if clean_bundle_id:
-                _uninstall_ios_bundle(target, app_dir, clean_bundle_id)
+                if _ios_clean_install_enabled():
+                    _uninstall_ios_bundle(target, app_dir, clean_bundle_id)
                 try:
                     self._run_text(
                         ("npx", "expo", "run:ios", "--no-install", "--no-bundler"),
@@ -954,6 +955,12 @@ def _assert_android_not_expo_dev_client_launcher(
         or "expo" in normalized
     ):
         raise RuntimeError("Android proof captured Expo Dev Client launcher instead of real app UI.")
+    if (
+        "there was a problem loading the project" in normalized
+        or "this development build encountered the following error" in normalized
+        or "java.lang." in normalized and "reload" in normalized and "go home" in normalized
+    ):
+        raise RuntimeError("Android proof captured Expo Dev Client error instead of real app UI.")
 
 
 def _terminate_process(proc: subprocess.Popen[str]) -> None:
@@ -1357,7 +1364,9 @@ def _patch_ios_pbxproj_cxx_standard(
 
 def _prepare_react_native_worktree(worktree: Path) -> None:
     _exclude_local_worktree_artifacts(worktree)
+    _initialize_git_submodules(worktree)
     _link_sibling_app_env_files(worktree)
+    _mirror_sibling_app_node_modules(worktree)
     node_modules = worktree / "node_modules"
     if node_modules.exists() and not node_modules.is_dir() and not node_modules.is_symlink():
         return
@@ -1368,8 +1377,47 @@ def _prepare_react_native_worktree(worktree: Path) -> None:
     _mirror_node_modules(source, node_modules)
 
 
+def _initialize_git_submodules(worktree: Path) -> None:
+    try:
+        status = subprocess.run(
+            ["git", "submodule", "status", "--recursive"],
+            cwd=str(worktree),
+            text=True,
+            capture_output=True,
+            timeout=30,
+            check=False,
+        )
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        return
+    if status.returncode != 0:
+        return
+    if not any(line.startswith("-") for line in str(status.stdout or "").splitlines()):
+        return
+
+    update = subprocess.run(
+        ["git", "submodule", "update", "--init", "--recursive"],
+        cwd=str(worktree),
+        text=True,
+        capture_output=True,
+        timeout=300,
+        check=False,
+    )
+    if update.returncode != 0:
+        raise RuntimeError(
+            "\n".join(
+                [
+                    "failed to initialize git submodules for simulator proof",
+                    f"stdout: {str(update.stdout or '').strip()}",
+                    f"stderr: {str(update.stderr or '').strip()}",
+                ]
+            )
+        )
+
+
 def _mirror_node_modules(source: Path, target: Path) -> None:
     try:
+        source_repo = source.parent
+        worktree = target.parent
         if target.is_symlink():
             target.unlink()
         target.mkdir(parents=True, exist_ok=True)
@@ -1378,17 +1426,58 @@ def _mirror_node_modules(source: Path, target: Path) -> None:
                 scope_target = target / item.name
                 scope_target.mkdir(exist_ok=True)
                 for scoped_item in item.iterdir():
-                    _symlink_node_module(scoped_item, scope_target / scoped_item.name)
+                    _symlink_node_module(
+                        scoped_item,
+                        scope_target / scoped_item.name,
+                        source_repo=source_repo,
+                        worktree=worktree,
+                    )
                 continue
-            _symlink_node_module(item, target / item.name)
+            _symlink_node_module(item, target / item.name, source_repo=source_repo, worktree=worktree)
     except OSError as exc:
         raise RuntimeError(f"failed to mirror node_modules for simulator proof: {source}") from exc
 
 
-def _symlink_node_module(source: Path, target: Path) -> None:
+def _symlink_node_module(
+    source: Path,
+    target: Path,
+    *,
+    source_repo: Path | None = None,
+    worktree: Path | None = None,
+) -> None:
+    link_source = _node_module_link_source(source, source_repo=source_repo, worktree=worktree)
     if target.exists() or target.is_symlink():
-        return
-    target.symlink_to(source, target_is_directory=source.is_dir())
+        if target.is_symlink() and target.resolve(strict=False) != link_source.resolve(strict=False):
+            target.unlink()
+        else:
+            return
+    target.symlink_to(link_source, target_is_directory=link_source.is_dir())
+
+
+def _node_module_link_source(source: Path, *, source_repo: Path | None, worktree: Path | None) -> Path:
+    if not source.is_symlink() or source_repo is None or worktree is None:
+        return source
+    try:
+        resolved = source.resolve(strict=False)
+        resolved_source_repo = source_repo.resolve(strict=False)
+        resolved_node_modules = (source_repo / "node_modules").resolve(strict=False)
+        relative = resolved.relative_to(resolved_source_repo)
+    except ValueError:
+        return source
+    if _is_relative_to(resolved, resolved_node_modules):
+        return source
+    candidate = worktree / relative
+    if candidate.exists() or candidate.is_symlink():
+        return candidate
+    return source
+
+
+def _is_relative_to(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
 
 
 def _prepare_android_worktree(worktree: Path) -> None:
@@ -1403,6 +1492,7 @@ def _exclude_local_worktree_artifacts(worktree: Path) -> None:
     existing = exclude_path.read_text(encoding="utf-8") if exclude_path.is_file() else ""
     entries = (
         "/node_modules",
+        "/apps/elixir-card/node_modules",
         "/apps/elixir-card/.env",
         "/apps/elixir-card/.env.*",
         "fingerprint.config.js",
@@ -1468,6 +1558,19 @@ def _link_sibling_app_env_files(worktree: Path) -> None:
             raise RuntimeError(f"failed to link app env file for simulator proof: {source}") from exc
 
 
+def _mirror_sibling_app_node_modules(worktree: Path) -> None:
+    source_repo = _source_repo_root(worktree)
+    if not source_repo:
+        return
+    source = source_repo / "apps" / "elixir-card" / "node_modules"
+    target = worktree / "apps" / "elixir-card" / "node_modules"
+    if not source.is_dir() or not target.parent.is_dir():
+        return
+    if target.exists() and not target.is_dir() and not target.is_symlink():
+        return
+    _mirror_node_modules(source, target)
+
+
 def _node_modules_source(worktree: Path) -> Path | None:
     configured = os.environ.get("MONICA_NODE_MODULES_SOURCE", "").strip()
     if configured:
@@ -1514,6 +1617,10 @@ def _ios_settle_seconds() -> int:
         return max(int(raw_value), 0)
     except ValueError:
         return 30
+
+
+def _ios_clean_install_enabled() -> bool:
+    return os.environ.get("MONICA_IOS_CLEAN_INSTALL", "").strip().lower() in {"1", "true", "yes", "on"}
 
 
 def _tail_text(path: Path, limit: int = 2000) -> str:

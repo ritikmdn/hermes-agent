@@ -20,6 +20,7 @@ from .repo_manager import (
 from .secrets import MONICA_SLACK_BOT_TOKEN, monica_slack_bot_token
 from .skills import DefaultMonicaSkills
 from .slack_client import SlackClientError, SlackThreadClient
+from .slack_flow import is_approval_text
 from .state import MonicaState
 
 RETRYABLE_STATUSES = {"blocked", "failed", "needs_clarification", "proof_blocked", "proofing"}
@@ -215,6 +216,15 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
     approve_p.add_argument("--user-id", default="local-operator")
     approve_p.add_argument("--json", action="store_true", help="Print approval result as JSON")
 
+    sync_approvals_p = subs.add_parser(
+        "sync-approvals",
+        help="Recover Slack approvals that arrived while the Monica gateway was offline",
+    )
+    sync_approvals_p.set_defaults(mobile_bug_agent_action="sync_approvals")
+    sync_approvals_p.add_argument("--run-id", default="", help="Only sync one awaiting run")
+    sync_approvals_p.add_argument("--limit", type=int, default=20)
+    sync_approvals_p.add_argument("--json", action="store_true", help="Print sync result as JSON")
+
     simulate_p = subs.add_parser("simulate", help="Run a local Monica message simulation")
     simulate_p.add_argument("text", nargs="+")
     simulate_p.add_argument("--channel-id", default="LOCAL_MONICA_SIM")
@@ -317,6 +327,14 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             run_id=str(args.run_id),
             user_id=str(getattr(args, "user_id", "") or "local-operator"),
             config=config,
+            json_output=bool(getattr(args, "json", False)),
+        )
+    if action == "sync_approvals":
+        return run_sync_approvals_command(
+            config=config,
+            state=state,
+            run_id=str(getattr(args, "run_id", "") or ""),
+            limit=int(getattr(args, "limit", 20)),
             json_output=bool(getattr(args, "json", False)),
         )
     if action == "simulate":
@@ -1715,6 +1733,197 @@ def run_approve_command(
         return 0
     print(f"Approved Monica run {run.id}.")
     return 0
+
+
+def run_sync_approvals_command(
+    *,
+    config: MonicaConfig,
+    state: MonicaState,
+    run_id: str = "",
+    limit: int = 20,
+    json_output: bool = False,
+    client_factory: Any = SlackThreadClient.from_token,
+    readiness_checker: Any | None = None,
+) -> int:
+    runs = _approval_sync_runs(state=state, run_id=run_id, limit=limit)
+    if run_id and not runs:
+        message = f"Monica run not found: {run_id}"
+        if json_output:
+            _print_sync_approvals_json(ok=False, results=[], error={"code": "not_found", "message": message})
+            return 1
+        print(message)
+        return 1
+
+    token = monica_slack_bot_token()
+    if not token:
+        message = f"{MONICA_SLACK_BOT_TOKEN} is missing; cannot read Slack approval threads."
+        if json_output:
+            _print_sync_approvals_json(ok=False, results=[], error={"code": "slack_bot_token_missing", "message": message})
+            return 1
+        print(message)
+        return 1
+    if not config.slack.approver_user_ids:
+        message = "mobile_bug_agent.slack.approver_user_ids is empty; cannot sync approvals."
+        if json_output:
+            _print_sync_approvals_json(ok=False, results=[], error={"code": "approvers_empty", "message": message})
+            return 1
+        print(message)
+        return 1
+
+    try:
+        client = client_factory(
+            token=token,
+            monica_user_ids=config.slack.bot_user_ids,
+            download_attachments=False,
+        )
+    except Exception as exc:
+        message = f"Could not create Slack client: {exc}"
+        if json_output:
+            _print_sync_approvals_json(ok=False, results=[], error={"code": "slack_client_failed", "message": message})
+            return 1
+        print(message)
+        return 1
+
+    results: list[dict[str, Any]] = []
+    exit_code = 0
+    for run in runs:
+        result = _sync_one_approval(
+            config=config,
+            state=state,
+            run=run,
+            client=client,
+            readiness_checker=readiness_checker,
+        )
+        results.append(result)
+        if result.get("error"):
+            exit_code = 1
+
+    if json_output:
+        _print_sync_approvals_json(ok=exit_code == 0, results=results)
+        return exit_code
+
+    synced = [item for item in results if item.get("action") == "approved"]
+    if synced:
+        for item in synced:
+            print(
+                f"Synced Slack approval for Monica run {item['run_id']} "
+                f"from {item.get('approved_by_user_id', 'unknown')}."
+            )
+    else:
+        print("No pending Monica Slack approvals were found.")
+    for item in results:
+        if item.get("action") != "approved":
+            print(f"- {item['run_id']}: {item.get('reason', 'no approval')}")
+    return exit_code
+
+
+def _approval_sync_runs(*, state: MonicaState, run_id: str, limit: int) -> list[Any]:
+    clean_run_id = str(run_id or "").strip()
+    if clean_run_id:
+        run = state.get_run(clean_run_id)
+        return [run] if run is not None else []
+    return [
+        run
+        for run in state.list_runs(limit=max(1, int(limit or 20)))
+        if run.status == "awaiting_fix_approval"
+    ]
+
+
+def _sync_one_approval(
+    *,
+    config: MonicaConfig,
+    state: MonicaState,
+    run: Any,
+    client: Any,
+    readiness_checker: Any | None,
+) -> dict[str, Any]:
+    payload: dict[str, Any] = {
+        "run_id": run.id,
+        "status": run.status,
+        "thread_ts": run.thread_ts,
+        "channel_id": run.channel_id,
+    }
+    if run.status != "awaiting_fix_approval":
+        payload.update(action="skipped", reason=f"not awaiting approval: {run.status}")
+        return payload
+    try:
+        thread = client.read_thread(
+            channel_id=run.channel_id,
+            thread_ts=run.thread_ts,
+            limit=max(2, config.loop.max_thread_messages),
+        )
+    except SlackClientError as exc:
+        payload.update(action="error", error={"code": "slack_read_failed", "message": str(exc)})
+        return payload
+
+    approval = _find_thread_approval(config=config, run=run, thread=thread)
+    if approval is None:
+        payload.update(action="skipped", reason="no configured approver approval found in Slack thread")
+        return payload
+
+    ready, reason = _approval_readiness(config=config, readiness_checker=readiness_checker)
+    if not ready:
+        payload.update(action="error", error={"code": "readiness_failed", "message": reason})
+        return payload
+
+    approved, changed = state.approve_fix_once(run.id, approved_by_user_id=approval["user_id"])
+    if not changed:
+        payload.update(action="skipped", reason="already approved or status changed")
+        return payload
+    _run_loop(approved.id, state=state)
+    updated = state.get_run(approved.id) or approved
+    payload.update(
+        action="approved",
+        approved_by_user_id=approval["user_id"],
+        approval_message_ts=approval["ts"],
+        final_status=updated.status,
+        pr_url=updated.pr_url,
+    )
+    return payload
+
+
+def _find_thread_approval(*, config: MonicaConfig, run: Any, thread: Any) -> dict[str, str] | None:
+    approvers = set(config.slack.approver_user_ids)
+    bot_ids = set(config.slack.bot_user_ids)
+    for message in getattr(thread, "messages", []) or []:
+        message_ts = str(getattr(message, "ts", "") or "")
+        if message_ts and message_ts == str(getattr(run, "message_ts", "") or ""):
+            continue
+        user_id = str(getattr(message, "user_id", "") or "")
+        if user_id in bot_ids or user_id not in approvers:
+            continue
+        if is_approval_text(str(getattr(message, "text", "") or "")):
+            return {"user_id": user_id, "ts": message_ts}
+    return None
+
+
+def _approval_readiness(
+    *,
+    config: MonicaConfig,
+    readiness_checker: Any | None,
+) -> tuple[bool, str]:
+    if config.rollout_mode not in {"local_fix_only", "approved_pr"}:
+        return True, ""
+    checker = readiness_checker or (lambda: run_doctor_command(config=config))
+    try:
+        exit_code = int(checker())
+    except Exception as exc:
+        return False, f"Monica readiness check failed: {exc}"
+    if exit_code != 0:
+        return False, "Monica readiness check failed."
+    return True, ""
+
+
+def _print_sync_approvals_json(
+    *,
+    ok: bool,
+    results: list[dict[str, Any]],
+    error: dict[str, str] | None = None,
+) -> None:
+    payload: dict[str, Any] = {"ok": ok, "results": results}
+    if error is not None:
+        payload["error"] = error
+    print(json.dumps(payload, sort_keys=True))
 
 
 def run_simulate_command(

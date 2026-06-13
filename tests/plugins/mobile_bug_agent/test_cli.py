@@ -5,6 +5,7 @@ import json
 import re
 from argparse import ArgumentParser
 from types import SimpleNamespace
+from typing import Any
 
 from plugins.mobile_bug_agent import cli
 from plugins.mobile_bug_agent.cli import (
@@ -22,6 +23,7 @@ from plugins.mobile_bug_agent.cli import (
     run_slack_manifest_command,
     run_slack_metadata_command,
     run_status_command,
+    run_sync_approvals_command,
 )
 from plugins.mobile_bug_agent.config import (
     LinearConfig,
@@ -751,6 +753,134 @@ def test_approve_does_not_launch_when_atomic_approval_already_changed(tmp_path, 
     assert updated.approved_by_user_id == "U_OTHER"
     assert launched == []
     assert "already approved or no longer awaiting fix approval" in capsys.readouterr().out
+
+
+def test_sync_approvals_reads_slack_thread_and_invokes_loop(tmp_path, capsys, monkeypatch):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U_REPORTER",
+        request_text="@monica checkout crash",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    launched: list[str] = []
+    clients: list[Any] = []
+    monkeypatch.setattr(cli, "monica_slack_bot_token", lambda: "xoxb-token")
+
+    class FakeClient:
+        def __init__(self, *, token, monica_user_ids, download_attachments):
+            self.token = token
+            self.monica_user_ids = monica_user_ids
+            self.download_attachments = download_attachments
+            clients.append(self)
+
+        def read_thread(self, *, channel_id, thread_ts, limit):
+            assert channel_id == "C123"
+            assert thread_ts == "1710000000.000100"
+            assert limit >= 2
+            return SimpleNamespace(
+                messages=[
+                    SimpleNamespace(ts="1710000000.000100", user_id="U_REPORTER", text="@monica checkout crash"),
+                    SimpleNamespace(ts="1710000001.000100", user_id="U_APPROVER", text="approved, fix it"),
+                ]
+            )
+
+    def fake_loop(run_id: str, *, state: MonicaState) -> None:
+        launched.append(run_id)
+        state.update_run(run_id, status="done", pr_url="https://github.com/acme/mobile/pull/123")
+
+    monkeypatch.setattr(cli, "_run_loop", fake_loop)
+
+    exit_code = run_sync_approvals_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(approver_user_ids=("U_APPROVER",), bot_user_ids=("BMONICA",)),
+        ),
+        state=state,
+        run_id=run.id,
+        json_output=True,
+        client_factory=FakeClient,
+        readiness_checker=lambda: 0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    updated = state.get_run(run.id)
+    assert updated is not None
+    assert exit_code == 0
+    assert launched == [run.id]
+    assert clients[0].token == "xoxb-token"
+    assert clients[0].monica_user_ids == ("BMONICA",)
+    assert clients[0].download_attachments is False
+    assert updated.status == "done"
+    assert updated.approved_by_user_id == "U_APPROVER"
+    assert payload == {
+        "ok": True,
+        "results": [
+            {
+                "action": "approved",
+                "approval_message_ts": "1710000001.000100",
+                "approved_by_user_id": "U_APPROVER",
+                "channel_id": "C123",
+                "final_status": "done",
+                "pr_url": "https://github.com/acme/mobile/pull/123",
+                "run_id": run.id,
+                "status": "awaiting_fix_approval",
+                "thread_ts": "1710000000.000100",
+            }
+        ],
+    }
+
+
+def test_sync_approvals_ignores_non_approver_and_question_text(tmp_path, capsys, monkeypatch):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U_REPORTER",
+        request_text="@monica checkout crash",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "monica_slack_bot_token", lambda: "xoxb-token")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    class FakeClient:
+        def __init__(self, **_: Any):
+            pass
+
+        def read_thread(self, **_: Any):
+            return SimpleNamespace(
+                messages=[
+                    SimpleNamespace(ts="1710000001.000100", user_id="U_RANDOM", text="approved, fix it"),
+                    SimpleNamespace(ts="1710000002.000100", user_id="U_APPROVER", text="should I approve?"),
+                    SimpleNamespace(ts="1710000003.000100", user_id="U_APPROVER", text="not approved"),
+                ]
+            )
+
+    exit_code = run_sync_approvals_command(
+        config=MonicaConfig(slack=SlackConfig(approver_user_ids=("U_APPROVER",))),
+        state=state,
+        run_id=run.id,
+        json_output=True,
+        client_factory=FakeClient,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    updated = state.get_run(run.id)
+    assert updated is not None
+    assert exit_code == 0
+    assert launched == []
+    assert updated.status == "awaiting_fix_approval"
+    assert updated.approved_by_user_id == ""
+    assert payload["ok"] is True
+    assert payload["results"][0]["action"] == "skipped"
+    assert payload["results"][0]["reason"] == "no configured approver approval found in Slack thread"
 
 
 def test_simulate_requires_enabled_config(tmp_path, capsys):

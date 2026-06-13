@@ -118,6 +118,19 @@ _NOOP_RE = re.compile(
     r")\b",
     re.I,
 )
+
+
+def is_approval_text(text: str) -> bool:
+    value = str(text or "")
+    if _NEGATED_APPROVAL_RE.search(value):
+        return False
+    if (
+        _QUESTION_APPROVAL_RE.search(value)
+        or _APPROVAL_PHRASE_QUESTION_RE.search(value)
+        or (value.strip().endswith("?") and _APPROVAL_RE.search(value))
+    ):
+        return False
+    return bool(_APPROVAL_RE.search(value))
 _TERMINAL_NOOP_RE = re.compile(
     r"\b("
     r"fixed now"
@@ -593,15 +606,7 @@ class MonicaSlackFlow:
 
     @staticmethod
     def _is_approval(text: str) -> bool:
-        if _NEGATED_APPROVAL_RE.search(text):
-            return False
-        if (
-            _QUESTION_APPROVAL_RE.search(text)
-            or _APPROVAL_PHRASE_QUESTION_RE.search(text)
-            or (text.strip().endswith("?") and _APPROVAL_RE.search(text))
-        ):
-            return False
-        return bool(_APPROVAL_RE.search(text))
+        return is_approval_text(text)
 
     @staticmethod
     def _is_cancel(text: str) -> bool:
