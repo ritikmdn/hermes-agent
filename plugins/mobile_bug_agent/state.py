@@ -1,12 +1,16 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import uuid
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 @dataclass(frozen=True)
@@ -25,6 +29,11 @@ class MonicaRun:
     linear_issue_id: str = ""
     linear_url: str = ""
     branch_name: str = ""
+    base_branch: str = ""
+    base_commit: str = ""
+    proof_deep_link: str = ""
+    proof_expected_text: str = ""
+    proof_screen: str = ""
     pr_url: str = ""
     failure_reason: str = ""
     approved_by_user_id: str = ""
@@ -64,6 +73,11 @@ class MonicaState:
                     linear_issue_id TEXT NOT NULL DEFAULT '',
                     linear_url TEXT NOT NULL DEFAULT '',
                     branch_name TEXT NOT NULL DEFAULT '',
+                    base_branch TEXT NOT NULL DEFAULT '',
+                    base_commit TEXT NOT NULL DEFAULT '',
+                    proof_deep_link TEXT NOT NULL DEFAULT '',
+                    proof_expected_text TEXT NOT NULL DEFAULT '',
+                    proof_screen TEXT NOT NULL DEFAULT '',
                     pr_url TEXT NOT NULL DEFAULT '',
                     failure_reason TEXT NOT NULL DEFAULT '',
                     approved_by_user_id TEXT NOT NULL DEFAULT '',
@@ -83,6 +97,11 @@ class MonicaState:
                 "linear_issue_id": "TEXT NOT NULL DEFAULT ''",
                 "linear_url": "TEXT NOT NULL DEFAULT ''",
                 "branch_name": "TEXT NOT NULL DEFAULT ''",
+                "base_branch": "TEXT NOT NULL DEFAULT ''",
+                "base_commit": "TEXT NOT NULL DEFAULT ''",
+                "proof_deep_link": "TEXT NOT NULL DEFAULT ''",
+                "proof_expected_text": "TEXT NOT NULL DEFAULT ''",
+                "proof_screen": "TEXT NOT NULL DEFAULT ''",
                 "pr_url": "TEXT NOT NULL DEFAULT ''",
                 "failure_reason": "TEXT NOT NULL DEFAULT ''",
                 "approved_by_user_id": "TEXT NOT NULL DEFAULT ''",
@@ -97,6 +116,14 @@ class MonicaState:
                 """
                 CREATE UNIQUE INDEX IF NOT EXISTS idx_monica_runs_thread_unique
                 ON runs(platform, channel_id, thread_ts)
+                """
+            )
+            self._db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS runtime_sync_metadata (
+                    key TEXT PRIMARY KEY,
+                    value TEXT NOT NULL
+                )
                 """
             )
             self._db.commit()
@@ -244,6 +271,48 @@ class MonicaState:
             rows = self._db.execute(query, params).fetchall()
             return [self._row_to_run(row) for row in rows]
 
+    def list_runtime_sync_blocking_runs(self) -> list[MonicaRun]:
+        with self._lock:
+            placeholders = ",".join("?" for _ in RUNTIME_SYNC_TERMINAL_STATUSES)
+            rows = self._db.execute(
+                f"SELECT * FROM runs WHERE status NOT IN ({placeholders})",
+                RUNTIME_SYNC_TERMINAL_STATUSES,
+            ).fetchall()
+            runs = [self._row_to_run(row) for row in rows]
+        return sorted(runs, key=lambda run: _STATUS_PRIORITY.get(run.status, 0), reverse=True)
+
+    def is_idle_for_runtime_sync(self) -> bool:
+        return not self.list_runtime_sync_blocking_runs()
+
+    def record_runtime_sync(self, *, commit: str, synced_at: str | None = None) -> dict[str, str]:
+        clean_commit = str(commit or "").strip()
+        if not _GIT_COMMIT_RE.fullmatch(clean_commit):
+            raise ValueError("runtime sync commit must be a git SHA")
+        metadata = {
+            "last_synced_commit": clean_commit,
+            "last_synced_at": str(synced_at or _utc_now_iso()).strip(),
+        }
+        with self._lock:
+            self._db.executemany(
+                """
+                INSERT INTO runtime_sync_metadata(key, value)
+                VALUES (?, ?)
+                ON CONFLICT(key) DO UPDATE SET value=excluded.value
+                """,
+                tuple(metadata.items()),
+            )
+            self._db.commit()
+        return metadata
+
+    def runtime_sync_metadata(self) -> dict[str, str]:
+        with self._lock:
+            rows = self._db.execute("SELECT key, value FROM runtime_sync_metadata").fetchall()
+        values = {str(row["key"]): str(row["value"]) for row in rows}
+        return {
+            "last_synced_commit": values.get("last_synced_commit", ""),
+            "last_synced_at": values.get("last_synced_at", ""),
+        }
+
     def update_run(self, run_id: str, **fields: Any) -> MonicaRun:
         allowed = {
             "intent",
@@ -257,6 +326,11 @@ class MonicaState:
             "linear_issue_id",
             "linear_url",
             "branch_name",
+            "base_branch",
+            "base_commit",
+            "proof_deep_link",
+            "proof_expected_text",
+            "proof_screen",
             "pr_url",
             "failure_reason",
             "approved_by_user_id",
@@ -308,6 +382,11 @@ class MonicaState:
             linear_issue_id=row["linear_issue_id"],
             linear_url=row["linear_url"],
             branch_name=row["branch_name"],
+            base_branch=row["base_branch"],
+            base_commit=row["base_commit"],
+            proof_deep_link=row["proof_deep_link"],
+            proof_expected_text=row["proof_expected_text"],
+            proof_screen=row["proof_screen"],
             pr_url=row["pr_url"],
             failure_reason=row["failure_reason"],
             approved_by_user_id=row["approved_by_user_id"],
@@ -321,6 +400,13 @@ class MonicaState:
             status="approved",
             approved_by_user_id=approved_by_user_id,
             failure_reason="",
+            branch_name="",
+            base_branch="",
+            base_commit="",
+            proof_deep_link="",
+            proof_expected_text="",
+            proof_screen="",
+            pr_url="",
         )
 
     def approve_fix_once(self, run_id: str, *, approved_by_user_id: str) -> tuple[MonicaRun, bool]:
@@ -328,7 +414,17 @@ class MonicaState:
             cursor = self._db.execute(
                 """
                 UPDATE runs
-                SET status = ?, approved_by_user_id = ?, failure_reason = '', updated_at = CURRENT_TIMESTAMP
+                SET status = ?,
+                    approved_by_user_id = ?,
+                    failure_reason = '',
+                    branch_name = '',
+                    base_branch = '',
+                    base_commit = '',
+                    proof_deep_link = '',
+                    proof_expected_text = '',
+                    proof_screen = '',
+                    pr_url = '',
+                    updated_at = CURRENT_TIMESTAMP
                 WHERE id = ? AND status = ?
                 """,
                 ("approved", approved_by_user_id, run_id, "awaiting_fix_approval"),
@@ -373,6 +469,25 @@ _STATUS_PRIORITY = {
     "blocked": 10,
     "queued": 0,
 }
+
+RUNTIME_SYNC_TERMINAL_STATUSES = ("done", "blocked", "failed", "needs_clarification")
+RUNTIME_SYNC_BLOCKING_STATUSES = (
+    "queued",
+    "triaging",
+    "creating_linear",
+    "linear_created",
+    "awaiting_fix_approval",
+    "approved",
+    "fixing",
+    "verifying",
+    "proofing",
+    "proof_blocked",
+    "opening_pr",
+)
+
+
+def _utc_now_iso() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z")
 
 
 def _run_dedup_score(row: sqlite3.Row) -> tuple[int, int, int, int, int, str, str, int]:

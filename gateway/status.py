@@ -17,6 +17,7 @@ import os
 import signal
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 from hermes_constants import get_hermes_home
@@ -209,8 +210,23 @@ def _build_pid_record() -> dict:
     }
 
 
+def _runtime_status_wall_time() -> float:
+    return time.time()
+
+
+def _runtime_status_start_time(process_start_time: Any, existing: Optional[dict[str, Any]] = None) -> Any:
+    if process_start_time is not None:
+        return process_start_time
+    if existing and existing.get("pid") == os.getpid():
+        existing_start = existing.get("start_time")
+        if isinstance(existing_start, (int, float)):
+            return existing_start
+    return _runtime_status_wall_time()
+
+
 def _build_runtime_status_record() -> dict[str, Any]:
     payload = _build_pid_record()
+    payload["start_time"] = _runtime_status_start_time(payload.get("start_time"))
     payload.update({
         "gateway_state": "starting",
         "exit_reason": None,
@@ -520,11 +536,12 @@ def write_runtime_status(
     path = _get_runtime_status_path()
     payload = _read_json_file(path) or _build_runtime_status_record()
     current_record = _build_pid_record()
+    runtime_start_time = _runtime_status_start_time(current_record["start_time"], payload)
     payload.setdefault("platforms", {})
     payload["kind"] = current_record["kind"]
     payload["pid"] = current_record["pid"]
     payload["argv"] = current_record["argv"]
-    payload["start_time"] = current_record["start_time"]
+    payload["start_time"] = runtime_start_time
     payload["updated_at"] = _utc_now_iso()
 
     if gateway_state is not _UNSET:

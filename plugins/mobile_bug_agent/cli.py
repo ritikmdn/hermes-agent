@@ -3,14 +3,31 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import shlex
+import subprocess
 import time
 from dataclasses import replace
+from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any
 
 from .config import MonicaConfig, load_monica_config, runtime_root
 from .linear_client import LinearClient, LinearClientError
 from .loop import MonicaLoop
-from .readiness import check_monica_readiness, _is_slack_channel_id, _is_slack_user_id
+from .readiness import (
+    check_monica_readiness,
+    _invalid_required_env_keys,
+    _inline_secret_env_assignments,
+    _is_slack_channel_id,
+    _is_slack_user_id,
+    _noop_only_proof_commands,
+    _noop_only_proof_setup_commands,
+    _placeholder_proof_commands,
+    _placeholder_proof_setup_commands,
+    _proof_setting_configured,
+    _uses_builtin_simulator_proof,
+)
 from .repo_manager import (
     RepoManagerError,
     safe_branch_prefix,
@@ -21,10 +38,13 @@ from .secrets import MONICA_SLACK_BOT_TOKEN, monica_slack_bot_token
 from .skills import DefaultMonicaSkills
 from .slack_client import SlackClientError, SlackThreadClient
 from .slack_flow import is_approval_text
-from .state import MonicaState
+from .state import MonicaState, RUNTIME_SYNC_BLOCKING_STATUSES
 
 RETRYABLE_STATUSES = {"blocked", "failed", "needs_clarification", "proof_blocked", "proofing"}
 _SIMULATION_THREAD_SEQUENCE = 0
+_MONICA_PLUGIN_NAME = "mobile-bug-agent"
+_GATEWAY_STATUS_STALE_AFTER_SECONDS = 300
+_SLACK_MENTION_RE = re.compile(r"<@([A-Z0-9_]+)(?:\|[^>]+)?>")
 
 
 def register_cli(subparser: argparse.ArgumentParser) -> None:
@@ -171,9 +191,91 @@ def register_cli(subparser: argparse.ArgumentParser) -> None:
         required=True,
         help="Command Monica must run before opening a draft PR; repeat for multiple commands",
     )
+    configure_pr_p.add_argument(
+        "--proof-setup-command",
+        dest="proof_setup_commands",
+        action="append",
+        default=[],
+        help="Command Monica runs before simulator proof to seed auth/session state; repeat for multiple commands",
+    )
+    configure_pr_p.add_argument(
+        "--proof-command",
+        dest="proof_commands",
+        action="append",
+        default=[],
+        help="Command Monica runs to capture iOS and Android simulator proof; repeat for multiple commands",
+    )
+    configure_pr_p.add_argument(
+        "--proof-required-env-key",
+        dest="proof_required_env_keys",
+        action="append",
+        default=[],
+        help="Non-secret environment key name required by simulator proof; repeat for multiple keys",
+    )
+    configure_pr_p.add_argument(
+        "--proof-dev-client-scheme",
+        default="",
+        help="Expo dev-client URL scheme used by Monica's built-in simulator proof harness",
+    )
+    configure_pr_p.add_argument(
+        "--proof-ios-bundle-id",
+        default="",
+        help="iOS bundle identifier for simulator launch/proof setup",
+    )
+    configure_pr_p.add_argument(
+        "--proof-ios-simulator-udid",
+        default="",
+        help="Optional iOS simulator UDID for proof setup/capture",
+    )
+    configure_pr_p.add_argument(
+        "--proof-android-serial",
+        default="",
+        help="Optional adb serial for Android proof setup/capture",
+    )
+    configure_pr_p.add_argument(
+        "--proof-android-avd",
+        default="",
+        help="Optional Android AVD name for proof setup/capture",
+    )
+    configure_pr_p.add_argument(
+        "--proof-android-package",
+        default="",
+        help="Android package name for emulator launch/proof setup",
+    )
+    configure_pr_p.add_argument(
+        "--proof-timeout-minutes",
+        type=int,
+        default=0,
+        help="Optional proof command timeout in minutes",
+    )
+    configure_pr_p.add_argument(
+        "--proof-artifact-dir",
+        default="",
+        help="Optional proof artifact directory relative to Monica runtime root",
+    )
     configure_pr_p.add_argument("--repo-local-name", default="mobile-app")
     configure_pr_p.add_argument("--default-branch", default="main")
     configure_pr_p.add_argument("--branch-prefix", default="monica")
+
+    configure_proof_setup_p = subs.add_parser(
+        "configure-proof-setup",
+        help="Persist Monica proof setup/auth commands without changing rollout settings",
+    )
+    configure_proof_setup_p.set_defaults(mobile_bug_agent_action="configure_proof_setup")
+    configure_proof_setup_p.add_argument(
+        "--proof-setup-command",
+        dest="proof_setup_commands",
+        action="append",
+        required=True,
+        help="Command Monica runs before simulator proof to seed auth/session state; repeat for multiple commands",
+    )
+    configure_proof_setup_p.add_argument(
+        "--proof-required-env-key",
+        dest="proof_required_env_keys",
+        action="append",
+        default=[],
+        help="Non-secret environment key name required by simulator proof; repeat for multiple keys",
+    )
 
     configure_local_fix_p = subs.add_parser(
         "configure-local-fix-only",
@@ -248,12 +350,14 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             config=config,
             target_rollout_mode=str(getattr(args, "rollout_mode", "") or ""),
             json_output=bool(getattr(args, "json", False)),
+            plugin_config=_load_hermes_config_mapping(),
         )
     if action == "setup_plan":
         return run_setup_plan_command(
             config=config,
             target_rollout_mode=str(getattr(args, "rollout_mode", "") or ""),
             json_output=bool(getattr(args, "json", False)),
+            plugin_config=_load_hermes_config_mapping(),
         )
     if action == "slack_manifest":
         return run_slack_manifest_command(
@@ -283,9 +387,25 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             approver_user_ids=tuple(getattr(args, "approver_user_ids", ()) or ()),
             repo_url=str(getattr(args, "repo_url", "") or ""),
             verification_commands=tuple(getattr(args, "verification_commands", ()) or ()),
+            proof_setup_commands=tuple(getattr(args, "proof_setup_commands", ()) or ()),
+            proof_commands=tuple(getattr(args, "proof_commands", ()) or ()),
+            proof_required_env_keys=tuple(getattr(args, "proof_required_env_keys", ()) or ()),
+            proof_dev_client_scheme=str(getattr(args, "proof_dev_client_scheme", "") or ""),
+            proof_ios_bundle_id=str(getattr(args, "proof_ios_bundle_id", "") or ""),
+            proof_ios_simulator_udid=str(getattr(args, "proof_ios_simulator_udid", "") or ""),
+            proof_android_serial=str(getattr(args, "proof_android_serial", "") or ""),
+            proof_android_avd=str(getattr(args, "proof_android_avd", "") or ""),
+            proof_android_package=str(getattr(args, "proof_android_package", "") or ""),
+            proof_timeout_minutes=int(getattr(args, "proof_timeout_minutes", 0) or 0),
+            proof_artifact_dir=str(getattr(args, "proof_artifact_dir", "") or ""),
             repo_local_name=str(getattr(args, "repo_local_name", "") or ""),
             default_branch=str(getattr(args, "default_branch", "") or ""),
             branch_prefix=str(getattr(args, "branch_prefix", "") or ""),
+        )
+    if action == "configure_proof_setup":
+        return run_configure_proof_setup_command(
+            proof_setup_commands=tuple(getattr(args, "proof_setup_commands", ()) or ()),
+            proof_required_env_keys=tuple(getattr(args, "proof_required_env_keys", ()) or ()),
         )
     if action == "configure_local_fix_only":
         return run_configure_local_fix_only_command(
@@ -319,6 +439,7 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             state=state,
             run_id=str(args.run_id),
             config=config,
+            readiness_checker=_cli_readiness_checker(config),
             json_output=bool(getattr(args, "json", False)),
         )
     if action == "approve":
@@ -327,6 +448,7 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             run_id=str(args.run_id),
             user_id=str(getattr(args, "user_id", "") or "local-operator"),
             config=config,
+            readiness_checker=_cli_readiness_checker(config),
             json_output=bool(getattr(args, "json", False)),
         )
     if action == "sync_approvals":
@@ -335,6 +457,7 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             state=state,
             run_id=str(getattr(args, "run_id", "") or ""),
             limit=int(getattr(args, "limit", 20)),
+            readiness_checker=_cli_readiness_checker(config),
             json_output=bool(getattr(args, "json", False)),
         )
     if action == "simulate":
@@ -347,12 +470,13 @@ def mobile_bug_agent_command(args: argparse.Namespace) -> int:
             thread_ts=str(getattr(args, "thread_ts", "") or ""),
             allow_side_effects=bool(getattr(args, "allow_side_effects", False)),
             json_output=bool(getattr(args, "json", False)),
+            readiness_checker=_cli_readiness_checker(config),
         )
     print(
         "Usage: hermes mobile-bug-agent "
         "{status|doctor|setup-plan|configure-dry-run|configure-linear-only|configure-local-fix-only|"
-        "configure-approved-pr|"
-        "show|retry|approve|simulate}"
+        "configure-approved-pr|configure-proof-setup|"
+        "show|retry|approve|sync-approvals|simulate}"
     )
     return 2
 
@@ -731,6 +855,7 @@ def _slack_app_manifest(
     ]
     if config.slack.download_attachments:
         scopes.append("files:read")
+    scopes.append("files:write")
     return {
         "display_information": {
             "name": str(app_name or "").strip() or "Monica",
@@ -770,6 +895,17 @@ def run_configure_approved_pr_command(
     approver_user_ids: tuple[str, ...],
     repo_url: str,
     verification_commands: tuple[str, ...],
+    proof_setup_commands: tuple[str, ...] = (),
+    proof_commands: tuple[str, ...] = (),
+    proof_required_env_keys: tuple[str, ...] = (),
+    proof_dev_client_scheme: str = "",
+    proof_ios_bundle_id: str = "",
+    proof_ios_simulator_udid: str = "",
+    proof_android_serial: str = "",
+    proof_android_avd: str = "",
+    proof_android_package: str = "",
+    proof_timeout_minutes: int = 0,
+    proof_artifact_dir: str = "",
     repo_local_name: str = "mobile-app",
     default_branch: str = "main",
     branch_prefix: str = "monica",
@@ -778,6 +914,18 @@ def run_configure_approved_pr_command(
 ) -> int:
     approvers = _clean_sequence(approver_user_ids)
     commands = _clean_sequence(verification_commands)
+    setup_commands = _clean_sequence(proof_setup_commands)
+    proof_command_list = _clean_sequence(proof_commands)
+    required_env_keys = _clean_required_env_key_sequence(proof_required_env_keys)
+    proof_environment = {
+        "dev_client_scheme": str(proof_dev_client_scheme or "").strip(),
+        "ios_bundle_id": str(proof_ios_bundle_id or "").strip(),
+        "ios_simulator_udid": str(proof_ios_simulator_udid or "").strip(),
+        "android_serial": str(proof_android_serial or "").strip(),
+        "android_avd": str(proof_android_avd or "").strip(),
+        "android_package": str(proof_android_package or "").strip(),
+        "artifact_dir": str(proof_artifact_dir or "").strip(),
+    }
     repo_url_value = str(repo_url or "").strip()
     local_name = str(repo_local_name or "mobile-app").strip() or "mobile-app"
     branch = str(default_branch or "main").strip() or "main"
@@ -787,6 +935,14 @@ def run_configure_approved_pr_command(
         approver_user_ids=approvers,
         repo_url=repo_url_value,
         verification_commands=commands,
+        proof_setup_commands=setup_commands,
+        proof_commands=proof_command_list,
+        proof_required_env_keys=required_env_keys,
+        proof_dev_client_scheme=proof_environment["dev_client_scheme"],
+        proof_ios_bundle_id=proof_environment["ios_bundle_id"],
+        proof_android_package=proof_environment["android_package"],
+        require_proof_setup_command=True,
+        require_proof_command=True,
         repo_local_name=local_name,
         default_branch=branch,
         branch_prefix=prefix,
@@ -831,6 +987,29 @@ def run_configure_approved_pr_command(
     verification_cfg = _ensure_dict(monica_cfg, "verification")
     verification_cfg["commands"] = list(commands)
 
+    if (
+        setup_commands
+        or proof_command_list
+        or required_env_keys
+        or any(proof_environment.values())
+        or proof_timeout_minutes > 0
+    ):
+        proof_cfg = _ensure_dict(monica_cfg, "proof")
+        proof_cfg["enabled"] = True
+        proof_cfg["required_for_done"] = True
+        proof_cfg["platform_order"] = ["ios", "android"]
+        if setup_commands:
+            proof_cfg["setup_commands"] = list(setup_commands)
+        if proof_command_list:
+            proof_cfg["commands"] = list(proof_command_list)
+        if required_env_keys:
+            proof_cfg["required_env_keys"] = list(required_env_keys)
+        for key, value in proof_environment.items():
+            if value:
+                proof_cfg[key] = value
+        if proof_timeout_minutes > 0:
+            proof_cfg["timeout_minutes"] = int(proof_timeout_minutes)
+
     runtime_cfg = _ensure_dict(monica_cfg, "runtime")
     runtime_cfg["home_subdir"] = "agents/monica"
     runtime_cfg["worker_session_prefix"] = "monica"
@@ -851,6 +1030,67 @@ def run_configure_approved_pr_command(
     )
     print("Run `hermes mobile-bug-agent doctor --rollout-mode approved_pr` before approving fixes.")
     return 0
+
+
+def run_configure_proof_setup_command(
+    *,
+    proof_setup_commands: tuple[str, ...],
+    proof_required_env_keys: tuple[str, ...] = (),
+    load_config_fn: Any | None = None,
+    save_config_fn: Any | None = None,
+) -> int:
+    setup_commands = _clean_sequence(proof_setup_commands)
+    provided_required_env_keys = _clean_required_env_key_sequence(proof_required_env_keys)
+
+    if load_config_fn is None or save_config_fn is None:
+        from hermes_cli.config import load_config, save_config
+
+        load = load_config if load_config_fn is None else load_config_fn
+        save = save_config if save_config_fn is None else save_config_fn
+    else:
+        load = load_config_fn
+        save = save_config_fn
+
+    config = load()
+    if not isinstance(config, dict):
+        config = {}
+    required_env_keys = provided_required_env_keys or _existing_proof_required_env_keys(config)
+    errors = _proof_setup_command_config_errors(
+        setup_commands,
+        proof_required_env_keys=required_env_keys,
+    )
+    if errors:
+        for error in errors:
+            print(f"ERROR: {error}")
+        print("Monica proof setup configuration was not saved.")
+        return 1
+
+    _enable_plugin(config)
+    monica_cfg = _ensure_dict(config, "mobile_bug_agent")
+    proof_cfg = _ensure_dict(monica_cfg, "proof")
+    proof_cfg["enabled"] = True
+    proof_cfg["required_for_done"] = True
+    if not _clean_sequence(proof_cfg.get("platform_order", ())):
+        proof_cfg["platform_order"] = ["ios", "android"]
+    proof_cfg["setup_commands"] = list(setup_commands)
+    if required_env_keys:
+        proof_cfg["required_env_keys"] = list(required_env_keys)
+
+    save(config)
+    print("Configured Monica proof setup commands.")
+    print("Secrets were not written; keep credentials in the Monica profile .env.")
+    print("Run `hermes mobile-bug-agent doctor --rollout-mode approved_pr` before approving fixes.")
+    return 0
+
+
+def _existing_proof_required_env_keys(config: dict[str, Any]) -> tuple[str, ...]:
+    monica_cfg = config.get("mobile_bug_agent")
+    if not isinstance(monica_cfg, dict):
+        return ()
+    proof_cfg = monica_cfg.get("proof")
+    if not isinstance(proof_cfg, dict):
+        return ()
+    return _clean_required_env_key_sequence(proof_cfg.get("required_env_keys", ()))
 
 
 def run_configure_local_fix_only_command(
@@ -1026,6 +1266,14 @@ def _approved_pr_config_errors(
     repo_local_name: str,
     default_branch: str,
     branch_prefix: str,
+    proof_setup_commands: tuple[str, ...] = (),
+    proof_commands: tuple[str, ...] = (),
+    proof_required_env_keys: tuple[str, ...] = (),
+    proof_dev_client_scheme: str = "",
+    proof_ios_bundle_id: str = "",
+    proof_android_package: str = "",
+    require_proof_setup_command: bool = False,
+    require_proof_command: bool = False,
 ) -> list[str]:
     errors: list[str] = []
     if not approver_user_ids:
@@ -1034,6 +1282,82 @@ def _approved_pr_config_errors(
         errors.append("--repo-url is required")
     if not verification_commands:
         errors.append("at least one --verification-command is required")
+    if require_proof_setup_command and not proof_setup_commands:
+        errors.append("at least one --proof-setup-command is required")
+    if require_proof_setup_command and proof_setup_commands and not proof_required_env_keys:
+        errors.append("at least one --proof-required-env-key is required")
+    placeholder_setup_commands = _placeholder_proof_setup_commands(proof_setup_commands)
+    if placeholder_setup_commands:
+        errors.append(
+            "--proof-setup-command must be the real auth/session seed command, "
+            f"not placeholder {placeholder_setup_commands[0]}"
+        )
+    secret_setup_assignments = _inline_secret_env_assignments(proof_setup_commands)
+    if secret_setup_assignments:
+        errors.append(
+            "--proof-setup-command must not inline secret env assignment(s); "
+            "put credentials in the Monica profile .env instead: "
+            f"{', '.join(secret_setup_assignments)}"
+        )
+    noop_setup_commands = _noop_only_proof_setup_commands(proof_setup_commands)
+    if noop_setup_commands:
+        errors.append(
+            "--proof-setup-command must seed test auth/session state, "
+            f"not only no-op command(s): {', '.join(noop_setup_commands)}"
+        )
+    errors.extend(_proof_required_env_key_config_errors(proof_required_env_keys))
+    if require_proof_command and not proof_commands:
+        errors.append("at least one --proof-command is required")
+    placeholder_proof_commands = _placeholder_proof_commands(proof_commands)
+    if placeholder_proof_commands:
+        errors.append(
+            "--proof-command must be the real simulator proof command, "
+            f"not placeholder {placeholder_proof_commands[0]}"
+        )
+    secret_proof_assignments = _inline_secret_env_assignments(proof_commands)
+    if secret_proof_assignments:
+        errors.append(
+            "--proof-command must not inline secret env assignment(s); "
+            "put credentials in the Monica profile .env instead: "
+            f"{', '.join(secret_proof_assignments)}"
+        )
+    noop_proof_commands = _noop_only_proof_commands(proof_commands)
+    if noop_proof_commands:
+        errors.append(
+            "--proof-command must capture simulator proof artifacts, "
+            f"not only no-op command(s): {', '.join(noop_proof_commands)}"
+        )
+    if proof_commands and _uses_builtin_simulator_proof(proof_commands):
+        if not _proof_setting_configured(
+            proof_dev_client_scheme,
+            proof_commands,
+            cli_flag="--dev-client-scheme",
+            env_var="MONICA_DEV_CLIENT_SCHEME",
+        ):
+            errors.append(
+                "proof.dev_client_scheme is required for built-in simulator proof "
+                "(pass --proof-dev-client-scheme or set --dev-client-scheme/MONICA_DEV_CLIENT_SCHEME in --proof-command)"
+            )
+        if not _proof_setting_configured(
+            proof_ios_bundle_id,
+            proof_commands,
+            cli_flag="--ios-bundle-id",
+            env_var="MONICA_IOS_BUNDLE_ID",
+        ):
+            errors.append(
+                "proof.ios_bundle_id is required for built-in simulator proof "
+                "(pass --proof-ios-bundle-id or set --ios-bundle-id/MONICA_IOS_BUNDLE_ID in --proof-command)"
+            )
+        if not _proof_setting_configured(
+            proof_android_package,
+            proof_commands,
+            cli_flag="--android-package",
+            env_var="MONICA_ANDROID_PACKAGE",
+        ):
+            errors.append(
+                "proof.android_package is required for built-in simulator proof "
+                "(pass --proof-android-package or set --android-package/MONICA_ANDROID_PACKAGE in --proof-command)"
+            )
     for user_id in approver_user_ids:
         if str(user_id).startswith("@"):
             errors.append(
@@ -1055,6 +1379,49 @@ def _approved_pr_config_errors(
     return errors
 
 
+def _proof_setup_command_config_errors(
+    proof_setup_commands: tuple[str, ...],
+    *,
+    proof_required_env_keys: tuple[str, ...] = (),
+) -> list[str]:
+    errors: list[str] = []
+    if not proof_setup_commands:
+        errors.append("at least one --proof-setup-command is required")
+    if proof_setup_commands and not proof_required_env_keys:
+        errors.append("at least one --proof-required-env-key is required")
+    placeholder_setup_commands = _placeholder_proof_setup_commands(proof_setup_commands)
+    if placeholder_setup_commands:
+        errors.append(
+            "--proof-setup-command must be the real auth/session seed command, "
+            f"not placeholder {placeholder_setup_commands[0]}"
+        )
+    secret_setup_assignments = _inline_secret_env_assignments(proof_setup_commands)
+    if secret_setup_assignments:
+        errors.append(
+            "--proof-setup-command must not inline secret env assignment(s); "
+            "put credentials in the Monica profile .env instead: "
+            f"{', '.join(secret_setup_assignments)}"
+        )
+    noop_setup_commands = _noop_only_proof_setup_commands(proof_setup_commands)
+    if noop_setup_commands:
+        errors.append(
+            "--proof-setup-command must seed test auth/session state, "
+            f"not only no-op command(s): {', '.join(noop_setup_commands)}"
+        )
+    errors.extend(_proof_required_env_key_config_errors(proof_required_env_keys))
+    return errors
+
+
+def _proof_required_env_key_config_errors(proof_required_env_keys: tuple[str, ...]) -> list[str]:
+    invalid_keys = _invalid_required_env_keys(proof_required_env_keys)
+    if not invalid_keys:
+        return []
+    return [
+        "--proof-required-env-key must name an environment key like MONICA_TEST_LOGIN_TOKEN, "
+        f"not KEY=value or another invalid value: {', '.join(invalid_keys)}"
+    ]
+
+
 def _clean_sequence(value: Any) -> tuple[str, ...]:
     if value is None:
         return ()
@@ -1068,12 +1435,23 @@ def _clean_sequence(value: Any) -> tuple[str, ...]:
     return tuple(str(item).strip() for item in raw_values if str(item).strip())
 
 
+def _clean_required_env_key_sequence(value: Any) -> tuple[str, ...]:
+    keys: list[str] = []
+    seen: set[str] = set()
+    for item in _clean_sequence(value):
+        if item in seen:
+            continue
+        seen.add(item)
+        keys.append(item)
+    return tuple(keys)
+
+
 def _enable_plugin(config: dict[str, Any]) -> None:
     plugins_cfg = _ensure_dict(config, "plugins")
     enabled = set(_clean_sequence(plugins_cfg.get("enabled", ())))
     disabled = set(_clean_sequence(plugins_cfg.get("disabled", ())))
-    enabled.add("mobile-bug-agent")
-    disabled.discard("mobile-bug-agent")
+    enabled.add(_MONICA_PLUGIN_NAME)
+    disabled.discard(_MONICA_PLUGIN_NAME)
     plugins_cfg["enabled"] = sorted(enabled)
     if disabled:
         plugins_cfg["disabled"] = sorted(disabled)
@@ -1089,19 +1467,103 @@ def _ensure_dict(parent: dict[str, Any], key: str) -> dict[str, Any]:
     return value
 
 
-def run_status_command(*, state: MonicaState, limit: int = 20, json_output: bool = False) -> int:
+def _load_hermes_config_mapping() -> dict[str, Any] | None:
+    try:
+        from hermes_cli.config import load_config
+
+        config = load_config()
+    except Exception:
+        return None
+    return config if isinstance(config, dict) else None
+
+
+def _cli_readiness_checker(config: MonicaConfig) -> Any:
+    return lambda: run_doctor_command(
+        config=config,
+        plugin_config=_load_hermes_config_mapping(),
+    )
+
+
+def _monica_plugin_health_payload(
+    plugin_config: dict[str, Any] | None,
+) -> dict[str, Any] | None:
+    if plugin_config is None:
+        return None
+    plugins_cfg = plugin_config.get("plugins")
+    if not isinstance(plugins_cfg, dict):
+        plugins_cfg = {}
+    enabled = set(_clean_sequence(plugins_cfg.get("enabled", ())))
+    disabled = set(_clean_sequence(plugins_cfg.get("disabled", ())))
+    explicitly_enabled = _MONICA_PLUGIN_NAME in enabled
+    explicitly_disabled = _MONICA_PLUGIN_NAME in disabled
+    return {
+        "configured": "enabled" in plugins_cfg,
+        "enabled": explicitly_enabled and not explicitly_disabled,
+        "disabled": explicitly_disabled,
+        "name": _MONICA_PLUGIN_NAME,
+    }
+
+
+def run_status_command(
+    *,
+    state: MonicaState,
+    limit: int = 20,
+    json_output: bool = False,
+    gateway_status: dict[str, Any] | None = None,
+    current_commit: str | None = None,
+    now: float | None = None,
+) -> int:
     runs = state.list_runs(limit=limit)
+    runtime_sync_blocking_runs = state.list_runtime_sync_blocking_runs()
+    runtime_sync_metadata = state.runtime_sync_metadata()
+    gateway_health = _gateway_health_payload(
+        gateway_status if gateway_status is not None else _read_gateway_status(),
+        now=time.time() if now is None else now,
+    )
+    commit = current_commit if current_commit is not None else _current_hermes_commit()
+    runtime_sync_stale = _runtime_sync_stale(
+        current_commit=commit,
+        last_synced_commit=runtime_sync_metadata["last_synced_commit"],
+    )
     if json_output:
         print(
             json.dumps(
                 {
                     "count": len(runs),
+                    "health": {
+                        "hermes_commit": commit,
+                        "gateway": gateway_health,
+                    },
                     "runs": [_run_payload(run, include_raw_event=False) for run in runs],
+                    "runtime_sync": {
+                        "idle": not runtime_sync_blocking_runs,
+                        "current_commit": commit,
+                        "stale": runtime_sync_stale,
+                        "last_synced_commit": runtime_sync_metadata["last_synced_commit"],
+                        "last_synced_at": runtime_sync_metadata["last_synced_at"],
+                        "blocking_statuses": list(RUNTIME_SYNC_BLOCKING_STATUSES),
+                        "active_run_count": len(runtime_sync_blocking_runs),
+                        "active_runs": [
+                            _run_payload(run, include_raw_event=False)
+                            for run in runtime_sync_blocking_runs
+                        ],
+                    },
                 },
                 sort_keys=True,
             )
         )
         return 0
+    print(f"Hermes commit: {commit or 'unavailable'}")
+    print(_format_gateway_health(gateway_health))
+    print(
+        _format_runtime_sync_status(
+            active_run_count=len(runtime_sync_blocking_runs),
+            last_synced_commit=runtime_sync_metadata["last_synced_commit"],
+            last_synced_at=runtime_sync_metadata["last_synced_at"],
+            active_runs=runtime_sync_blocking_runs,
+            stale=runtime_sync_stale,
+        )
+    )
     if not runs:
         print("No Monica runs found.")
         return 0
@@ -1117,6 +1579,284 @@ def run_status_command(*, state: MonicaState, limit: int = 20, json_output: bool
         ]
         print(" | ".join(parts))
     return 0
+
+
+def _format_gateway_health(gateway_health: dict[str, Any]) -> str:
+    state = str(gateway_health.get("state") or "unknown")
+    pid = _status_text_value(gateway_health.get("pid"))
+    active_agents = _status_text_value(gateway_health.get("active_agents"))
+    uptime = gateway_health.get("uptime_seconds")
+    uptime_text = f"{int(uptime)}s" if isinstance(uptime, int) else "-"
+    line = f"Gateway: {state} pid:{pid} uptime:{uptime_text} active_agents:{active_agents}"
+    if gateway_health.get("stale"):
+        age = gateway_health.get("updated_age_seconds")
+        age_text = f"{int(age)}s" if isinstance(age, int) else "-"
+        line += f" stale:true heartbeat_age:{age_text}"
+    return line
+
+
+def _format_gateway_service_health(gateway_service_health: dict[str, Any]) -> str:
+    if not gateway_service_health.get("available"):
+        return "Gateway service: unavailable"
+    manager = _status_text_value(gateway_service_health.get("manager"))
+    installed = "true" if gateway_service_health.get("service_installed") else "false"
+    running = "true" if gateway_service_health.get("service_running") else "false"
+    supervised = "true" if gateway_service_health.get("supervised") else "false"
+    pids = gateway_service_health.get("gateway_pids") or []
+    pid_text = ",".join(str(pid) for pid in pids) if pids else "-"
+    return (
+        f"Gateway service: {manager} installed:{installed} "
+        f"running:{running} supervised:{supervised} pids:{pid_text}"
+    )
+
+
+def _format_runtime_sync_status(
+    *,
+    active_run_count: int,
+    last_synced_commit: Any,
+    last_synced_at: Any,
+    active_runs: list[Any] | tuple[Any, ...] = (),
+    stale: bool = False,
+) -> str:
+    state = "idle" if active_run_count == 0 else "blocked"
+    commit = _status_text_value(last_synced_commit)
+    synced_at = _status_text_value(last_synced_at)
+    line = (
+        f"Runtime sync: {state} active_runs:{active_run_count} "
+        f"last_commit:{commit} last_synced:{synced_at}"
+    )
+    if stale:
+        line += " stale:true"
+    if active_run_count > 0:
+        labels = [_runtime_sync_run_label(run) for run in active_runs[:5]]
+        labels = [label for label in labels if label]
+        if labels:
+            suffix = "" if len(active_runs) <= 5 else f", +{len(active_runs) - 5} more"
+            line += f" blocked_by:{', '.join(labels)}{suffix}"
+    return line
+
+
+def _format_runtime_sync_health(payload: dict[str, Any]) -> str:
+    if not payload.get("available"):
+        commit = _status_text_value(payload.get("current_commit"))
+        return f"Runtime sync: unavailable current_commit:{commit}"
+    return _format_runtime_sync_status(
+        active_run_count=int(payload.get("active_run_count") or 0),
+        last_synced_commit=payload.get("last_synced_commit"),
+        last_synced_at=payload.get("last_synced_at"),
+        active_runs=payload.get("active_runs") or (),
+        stale=bool(payload.get("stale")),
+    )
+
+
+def _format_plugin_health(payload: dict[str, Any]) -> str:
+    state = "enabled" if payload.get("enabled") else "disabled"
+    configured = "true" if payload.get("configured") else "false"
+    disabled = "true" if payload.get("disabled") else "false"
+    name = str(payload.get("name") or _MONICA_PLUGIN_NAME)
+    return f"Plugin: {name} {state} configured:{configured} disabled:{disabled}"
+
+
+def _runtime_sync_run_label(run: Any) -> str:
+    if isinstance(run, dict):
+        linear = run.get("linear")
+        linear_identifier = ""
+        if isinstance(linear, dict):
+            linear_identifier = str(linear.get("identifier") or "").strip()
+        identifier = str(linear_identifier or run.get("id") or "").strip()
+        status = str(run.get("status") or "").strip()
+    else:
+        identifier = str(getattr(run, "linear_identifier", "") or getattr(run, "id", "") or "").strip()
+        status = str(getattr(run, "status", "") or "").strip()
+    if identifier and status:
+        return f"{identifier}/{status}"
+    return identifier or status
+
+
+def _runtime_sync_stale(*, current_commit: Any, last_synced_commit: Any) -> bool:
+    current = str(current_commit or "").strip()
+    synced = str(last_synced_commit or "").strip()
+    if not current or not synced:
+        return False
+    if current == synced:
+        return False
+    if len(current) >= 7 and len(synced) >= 7:
+        return not (current.startswith(synced) or synced.startswith(current))
+    return True
+
+
+def _runtime_sync_health_payload(
+    *,
+    state: MonicaState | None,
+    config: MonicaConfig,
+    current_commit: Any,
+) -> dict[str, Any]:
+    resolved_state = state or _try_open_state(config)
+    commit = str(current_commit or "").strip()
+    if resolved_state is None:
+        return {
+            "available": False,
+            "idle": None,
+            "current_commit": commit,
+            "stale": False,
+            "last_synced_commit": "",
+            "last_synced_at": "",
+            "blocking_statuses": list(RUNTIME_SYNC_BLOCKING_STATUSES),
+            "active_run_count": None,
+            "active_runs": [],
+        }
+    active_runs = resolved_state.list_runtime_sync_blocking_runs()
+    metadata = resolved_state.runtime_sync_metadata()
+    return {
+        "available": True,
+        "idle": not active_runs,
+        "current_commit": commit,
+        "stale": _runtime_sync_stale(
+            current_commit=commit,
+            last_synced_commit=metadata["last_synced_commit"],
+        ),
+        "last_synced_commit": metadata["last_synced_commit"],
+        "last_synced_at": metadata["last_synced_at"],
+        "blocking_statuses": list(RUNTIME_SYNC_BLOCKING_STATUSES),
+        "active_run_count": len(active_runs),
+        "active_runs": [
+            _run_payload(run, include_raw_event=False)
+            for run in active_runs
+        ],
+    }
+
+
+def _try_open_state(config: MonicaConfig) -> MonicaState | None:
+    try:
+        return _open_state(config)
+    except Exception:
+        return None
+
+
+def _status_text_value(value: Any) -> str:
+    return str(value) if value not in (None, "") else "-"
+
+
+def _read_gateway_status() -> dict[str, Any]:
+    try:
+        from gateway.status import read_runtime_status
+
+        payload = read_runtime_status()
+    except Exception:
+        return {}
+    return payload if isinstance(payload, dict) else {}
+
+
+def _read_gateway_service_status() -> dict[str, Any]:
+    try:
+        from hermes_cli.gateway import get_gateway_runtime_snapshot
+
+        snapshot = get_gateway_runtime_snapshot()
+    except Exception:
+        return {"available": False}
+    gateway_pids = tuple(int(pid) for pid in (getattr(snapshot, "gateway_pids", ()) or ()))
+    manager = str(getattr(snapshot, "manager", "") or "")
+    service_running = bool(getattr(snapshot, "service_running", False))
+    return {
+        "available": True,
+        "manager": manager,
+        "service_installed": bool(getattr(snapshot, "service_installed", False)),
+        "service_running": service_running,
+        "gateway_pids": list(gateway_pids),
+        "service_scope": getattr(snapshot, "service_scope", None),
+        "supervised": _gateway_service_snapshot_is_supervised(
+            manager=manager,
+            service_running=service_running,
+            gateway_pids=gateway_pids,
+        ),
+    }
+
+
+def _gateway_service_snapshot_is_supervised(
+    *,
+    manager: str,
+    service_running: bool,
+    gateway_pids: tuple[int, ...],
+) -> bool:
+    if service_running:
+        return True
+    manager_text = manager.strip().lower()
+    return bool(gateway_pids) and "s6" in manager_text and "supervisor" in manager_text
+
+
+def _gateway_health_payload(gateway_status: dict[str, Any], *, now: float) -> dict[str, Any]:
+    start_time = _float_or_none(gateway_status.get("start_time"))
+    uptime_seconds = int(max(0, now - start_time)) if start_time is not None else None
+    updated_age_seconds = _gateway_status_age_seconds(gateway_status.get("updated_at"), now=now)
+    return {
+        "state": str(gateway_status.get("gateway_state") or ""),
+        "pid": gateway_status.get("pid"),
+        "active_agents": _int_or_zero(gateway_status.get("active_agents")),
+        "start_time": start_time,
+        "uptime_seconds": uptime_seconds,
+        "updated_at": str(gateway_status.get("updated_at") or ""),
+        "updated_age_seconds": updated_age_seconds,
+        "stale": (
+            updated_age_seconds is not None
+            and updated_age_seconds > _GATEWAY_STATUS_STALE_AFTER_SECONDS
+        ),
+    }
+
+
+def _float_or_none(value: Any) -> float | None:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _int_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _gateway_status_age_seconds(value: Any, *, now: float) -> int | None:
+    if value in (None, ""):
+        return None
+    text = str(value).strip()
+    if not text:
+        return None
+    timestamp = _float_or_none(text)
+    if timestamp is None:
+        normalized = text[:-1] + "+00:00" if text.endswith("Z") else text
+        try:
+            updated_at = datetime.fromisoformat(normalized)
+        except ValueError:
+            return None
+        if updated_at.tzinfo is None:
+            updated_at = updated_at.replace(tzinfo=timezone.utc)
+        timestamp = updated_at.timestamp()
+    return int(max(0, now - timestamp))
+
+
+def _current_hermes_commit() -> str:
+    try:
+        from hermes_cli.build_info import get_build_sha
+
+        build_sha = get_build_sha()
+    except Exception:
+        build_sha = None
+    if build_sha:
+        return str(build_sha)
+    try:
+        proc = subprocess.run(
+            ["git", "rev-parse", "--short=8", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            text=True,
+            capture_output=True,
+            check=False,
+            timeout=2,
+        )
+    except Exception:
+        return ""
+    return proc.stdout.strip() if proc.returncode == 0 else ""
 
 
 def run_show_command(*, state: MonicaState, run_id: str, json_output: bool = False) -> int:
@@ -1151,6 +1891,14 @@ def _run_payload(run: Any, *, include_raw_event: bool) -> dict[str, Any]:
             "url": run.linear_url,
         },
         "branch_name": run.branch_name,
+        "base": {
+            "ref": run.base_branch,
+            "commit": run.base_commit,
+        },
+        "proof_target": {
+            "deep_link": run.proof_deep_link,
+            "expected_text": run.proof_expected_text,
+        },
         "pr_url": run.pr_url,
         "failure_reason": run.failure_reason,
         "approved_by_user_id": run.approved_by_user_id,
@@ -1165,11 +1913,17 @@ def _run_payload(run: Any, *, include_raw_event: bool) -> dict[str, Any]:
 def run_doctor_command(
     *,
     config: MonicaConfig,
+    state: MonicaState | None = None,
     target_rollout_mode: str = "",
     json_output: bool = False,
+    plugin_config: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
     which: Any | None = None,
     module_available: Any | None = None,
+    gateway_status: dict[str, Any] | None = None,
+    gateway_service_status: dict[str, Any] | None = None,
+    current_commit: str | None = None,
+    now: float | None = None,
 ) -> int:
     effective_config = _config_for_doctor_target(
         config=config,
@@ -1181,33 +1935,283 @@ def run_doctor_command(
         which=which,
         module_available=module_available,
     )
+    gateway_status_provided = gateway_status is not None
+    gateway_health = _gateway_health_payload(
+        gateway_status if gateway_status_provided else _read_gateway_status(),
+        now=time.time() if now is None else now,
+    )
+    gateway_service_health = (
+        gateway_service_status
+        if gateway_service_status is not None
+        else ({"available": False} if gateway_status_provided else _read_gateway_service_status())
+    )
+    commit = current_commit if current_commit is not None else _current_hermes_commit()
+    runtime_sync_health = _runtime_sync_health_payload(
+        state=state,
+        config=effective_config,
+        current_commit=commit,
+    )
+    runtime_sync_warnings = _doctor_runtime_sync_warnings(
+        runtime_sync_health,
+        rollout_mode=report.rollout_mode,
+    )
+    gateway_failures = _doctor_gateway_failures(
+        gateway_health,
+        gateway_service_health,
+        rollout_mode=report.rollout_mode,
+    )
+    gateway_warnings = _doctor_gateway_warnings(
+        gateway_health,
+        rollout_mode=report.rollout_mode,
+    )
+    plugin_health = _monica_plugin_health_payload(plugin_config)
+    plugin_failures = _doctor_plugin_failures(plugin_health)
 
     if json_output:
-        print(json.dumps(_readiness_report_payload(report), sort_keys=True))
-        return 0 if report.ready else 1
+        payload = _readiness_report_payload(report)
+        payload["warnings"].extend(gateway_warnings)
+        payload["warnings"].extend(runtime_sync_warnings)
+        payload["failures"].extend(gateway_failures)
+        payload["failures"].extend(plugin_failures)
+        if gateway_failures or plugin_failures:
+            payload["ready"] = False
+        health = {
+            "hermes_commit": commit,
+            "gateway": gateway_health,
+            "gateway_service": gateway_service_health,
+            "runtime_sync": runtime_sync_health,
+        }
+        if plugin_health is not None:
+            health["plugin"] = plugin_health
+        payload["health"] = health
+        print(json.dumps(payload, sort_keys=True))
+        return 0 if report.ready and not gateway_failures and not plugin_failures else 1
 
+    print(f"Hermes commit: {commit or 'unavailable'}")
+    print(_format_gateway_health(gateway_health))
+    print(_format_gateway_service_health(gateway_service_health))
+    print(_format_runtime_sync_health(runtime_sync_health))
+    if plugin_health is not None:
+        print(_format_plugin_health(plugin_health))
     print(f"Monica rollout mode: {report.rollout_mode}")
     if report.runtime_root_value:
         print(f"Monica runtime root: {report.runtime_root_value}")
     for warning in report.warnings:
         print(f"WARN: {warning.message}")
+    for warning in gateway_warnings:
+        print(f"WARN: {warning['message']}")
+    for warning in runtime_sync_warnings:
+        print(f"WARN: {warning['message']}")
+    for failure in gateway_failures:
+        print(f"FAIL: {failure['message']}")
+    for failure in plugin_failures:
+        print(f"FAIL: {failure['message']}")
     for failure in report.failures:
         print(f"FAIL: {failure.message}")
-    if report.failures:
+    if report.failures or gateway_failures or plugin_failures:
         print("Monica doctor: not ready")
         return 1
     print("Monica doctor: ready")
     return 0
 
 
+def _doctor_gateway_failures(
+    gateway_health: dict[str, Any],
+    gateway_service_health: dict[str, Any],
+    *,
+    rollout_mode: str,
+) -> list[dict[str, str]]:
+    if rollout_mode != "approved_pr":
+        return []
+    issue = _gateway_not_running_issue(gateway_health, require_status=True)
+    if issue:
+        return [issue]
+    heartbeat_issue = _gateway_heartbeat_missing_issue(gateway_health)
+    if heartbeat_issue:
+        return [heartbeat_issue]
+    stale_issue = _gateway_status_stale_issue(gateway_health)
+    if stale_issue:
+        return [stale_issue]
+    metadata_issue = _gateway_runtime_metadata_missing_issue(gateway_health)
+    if metadata_issue:
+        return [metadata_issue]
+    supervision_issue = _gateway_not_supervised_issue(gateway_health, gateway_service_health)
+    return [supervision_issue] if supervision_issue else []
+
+
+def _doctor_runtime_sync_warnings(
+    runtime_sync_health: dict[str, Any],
+    *,
+    rollout_mode: str = "",
+) -> list[dict[str, str]]:
+    if not runtime_sync_health.get("available"):
+        return []
+    current_commit = _status_text_value(runtime_sync_health.get("current_commit"))
+    last_commit = _status_text_value(runtime_sync_health.get("last_synced_commit"))
+    active_count = runtime_sync_health.get("active_run_count")
+    if (
+        rollout_mode in {"local_fix_only", "approved_pr"}
+        and runtime_sync_health.get("current_commit")
+        and not runtime_sync_health.get("last_synced_commit")
+    ):
+        if isinstance(active_count, int) and active_count > 0:
+            message = (
+                "Monica runtime sync has not recorded a synced Hermes commit yet "
+                f"(current {current_commit}) while Monica has {active_count} active run(s); "
+                "wait until Monica is idle before running `hermes update`."
+            )
+        else:
+            message = (
+                "Monica runtime sync has not recorded a synced Hermes commit yet "
+                f"(current {current_commit}); run `hermes update` while Monica is idle "
+                "to record the current runtime."
+            )
+        return [{"code": "runtime_sync_unrecorded", "message": message}]
+    if not runtime_sync_health.get("stale"):
+        return []
+    if isinstance(active_count, int) and active_count > 0:
+        message = (
+            "Monica runtime sync is stale "
+            f"(current {current_commit}, last synced {last_commit}) while Monica has "
+            f"{active_count} active run(s); wait until Monica is idle before running `hermes update`."
+        )
+    else:
+        message = (
+            "Monica runtime sync is stale "
+            f"(current {current_commit}, last synced {last_commit}); run `hermes update` "
+            "while Monica is idle to record the current runtime."
+        )
+    return [{"code": "runtime_sync_stale", "message": message}]
+
+
+def _doctor_gateway_warnings(
+    gateway_health: dict[str, Any],
+    *,
+    rollout_mode: str = "",
+) -> list[dict[str, str]]:
+    if rollout_mode == "approved_pr":
+        return []
+    issue = _gateway_not_running_issue(gateway_health)
+    return [issue] if issue else []
+
+
+def _gateway_not_running_issue(
+    gateway_health: dict[str, Any],
+    *,
+    require_status: bool = False,
+) -> dict[str, str] | None:
+    state = str(gateway_health.get("state") or "").strip().lower()
+    if state == "running":
+        return None
+    if not state:
+        if not require_status:
+            return None
+        return {
+            "code": "gateway_not_running",
+            "message": (
+                "Monica gateway status is unavailable; live Slack tag/DM intake "
+                "and approvals will not be received until the gateway is running."
+            ),
+        }
+    return {
+        "code": "gateway_not_running",
+        "message": (
+            "Monica gateway is stopped; live Slack tag/DM intake and approvals "
+            "will not be received until the gateway is running."
+        ),
+    }
+
+
+def _gateway_status_stale_issue(gateway_health: dict[str, Any]) -> dict[str, str] | None:
+    if not gateway_health.get("stale"):
+        return None
+    return {
+        "code": "gateway_status_stale",
+        "message": (
+            "Monica gateway status is stale; live Slack tag/DM intake and approvals "
+            "may not be received until the gateway heartbeat is fresh."
+        ),
+    }
+
+
+def _gateway_heartbeat_missing_issue(gateway_health: dict[str, Any]) -> dict[str, str] | None:
+    state = str(gateway_health.get("state") or "").strip().lower()
+    updated_at = str(gateway_health.get("updated_at") or "").strip()
+    if state != "running" or updated_at:
+        return None
+    return {
+        "code": "gateway_heartbeat_missing",
+        "message": (
+            "Monica gateway heartbeat is missing; restart the gateway so live Slack "
+            "tag/DM intake and approvals run on the current Monica runtime."
+        ),
+    }
+
+
+def _gateway_runtime_metadata_missing_issue(gateway_health: dict[str, Any]) -> dict[str, str] | None:
+    state = str(gateway_health.get("state") or "").strip().lower()
+    if state != "running" or gateway_health.get("start_time") is not None:
+        return None
+    return {
+        "code": "gateway_runtime_metadata_missing",
+        "message": (
+            "Monica gateway runtime metadata is incomplete; restart the gateway "
+            "so doctor can verify uptime before approved_pr work runs."
+        ),
+    }
+
+
+def _gateway_not_supervised_issue(
+    gateway_health: dict[str, Any],
+    gateway_service_health: dict[str, Any],
+) -> dict[str, str] | None:
+    state = str(gateway_health.get("state") or "").strip().lower()
+    if state != "running":
+        return None
+    if not gateway_service_health.get("available"):
+        return None
+    if gateway_service_health.get("supervised"):
+        return None
+    return {
+        "code": "gateway_not_supervised",
+        "message": (
+            "Monica gateway is running manually; approved_pr work needs the "
+            "profile-aware gateway service so Slack approvals survive restarts "
+            "and terminal exits."
+        ),
+    }
+
+
+def _doctor_plugin_failures(
+    plugin_health: dict[str, Any] | None,
+) -> list[dict[str, str]]:
+    if plugin_health is None or bool(plugin_health.get("enabled")):
+        return []
+    return [
+        {
+            "code": "plugin_not_enabled",
+            "message": (
+                "plugins.enabled must include mobile-bug-agent and plugins.disabled must not; "
+                "otherwise Monica's Slack gateway hooks will not load."
+            ),
+        }
+    ]
+
+
 def run_setup_plan_command(
     *,
     config: MonicaConfig,
+    state: MonicaState | None = None,
     target_rollout_mode: str = "",
     json_output: bool = False,
+    plugin_config: dict[str, Any] | None = None,
     environ: dict[str, str] | None = None,
     which: Any | None = None,
     module_available: Any | None = None,
+    gateway_status: dict[str, Any] | None = None,
+    gateway_service_status: dict[str, Any] | None = None,
+    current_commit: str | None = None,
+    now: float | None = None,
 ) -> int:
     effective_config = _config_for_doctor_target(
         config=config,
@@ -1219,15 +2223,67 @@ def run_setup_plan_command(
         which=which,
         module_available=module_available,
     )
-    steps = _setup_plan_steps(report)
+    gateway_status_provided = gateway_status is not None
+    gateway_health = _gateway_health_payload(
+        gateway_status if gateway_status_provided else _read_gateway_status(),
+        now=time.time() if now is None else now,
+    )
+    gateway_service_health = (
+        gateway_service_status
+        if gateway_service_status is not None
+        else ({"available": False} if gateway_status_provided else _read_gateway_service_status())
+    )
+    commit = current_commit if current_commit is not None else _current_hermes_commit()
+    runtime_sync_health = _runtime_sync_health_payload(
+        state=state,
+        config=effective_config,
+        current_commit=commit,
+    )
+    runtime_sync_warnings = _doctor_runtime_sync_warnings(
+        runtime_sync_health,
+        rollout_mode=report.rollout_mode,
+    )
+    gateway_failures = _doctor_gateway_failures(
+        gateway_health,
+        gateway_service_health,
+        rollout_mode=report.rollout_mode,
+    )
+    gateway_warnings = _doctor_gateway_warnings(
+        gateway_health,
+        rollout_mode=report.rollout_mode,
+    )
+    plugin_health = _monica_plugin_health_payload(plugin_config)
+    plugin_failures = _doctor_plugin_failures(plugin_health)
+    steps = _setup_plan_steps(
+        report,
+        config=effective_config,
+        extra_warnings=[*gateway_warnings, *runtime_sync_warnings],
+        extra_failures=[*gateway_failures, *plugin_failures],
+        runtime_sync_health=runtime_sync_health,
+    )
     if json_output:
         payload = _readiness_report_payload(report)
+        payload["warnings"].extend(gateway_warnings)
+        payload["warnings"].extend(runtime_sync_warnings)
+        payload["failures"].extend(gateway_failures)
+        payload["failures"].extend(plugin_failures)
+        if gateway_failures or plugin_failures:
+            payload["ready"] = False
+        health = {
+            "hermes_commit": commit,
+            "gateway": gateway_health,
+            "gateway_service": gateway_service_health,
+            "runtime_sync": runtime_sync_health,
+        }
+        if plugin_health is not None:
+            health["plugin"] = plugin_health
+        payload["health"] = health
         payload["steps"] = steps
         print(json.dumps(payload, sort_keys=True))
-        return 0 if report.ready else 1
+        return 0 if report.ready and not gateway_failures and not plugin_failures else 1
 
     print(f"Monica setup plan: {report.rollout_mode}")
-    if report.ready:
+    if report.ready and not gateway_failures and not plugin_failures:
         print("Monica is ready for this rollout mode.")
         if steps:
             print("")
@@ -1241,6 +2297,10 @@ def run_setup_plan_command(
     print("Blocking readiness failures:")
     for failure in report.failures:
         print(f"- {failure.message}")
+    for failure in gateway_failures:
+        print(f"- {failure['message']}")
+    for failure in plugin_failures:
+        print(f"- {failure['message']}")
     print("")
     print("Next steps:")
     for index, step in enumerate(steps, start=1):
@@ -1250,24 +2310,144 @@ def run_setup_plan_command(
     return 1
 
 
-def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
+def _setup_plan_steps(
+    report: Any,
+    *,
+    config: MonicaConfig | None = None,
+    extra_warnings: list[dict[str, str]] | None = None,
+    extra_failures: list[dict[str, str]] | None = None,
+    runtime_sync_health: dict[str, Any] | None = None,
+) -> list[dict[str, str]]:
     failure_codes = {str(issue.code) for issue in getattr(report, "failures", ())}
+    failure_codes.update(str(item.get("code") or "") for item in extra_failures or [])
     warning_codes = {str(issue.code) for issue in getattr(report, "warnings", ())}
+    warning_codes.update(str(item.get("code") or "") for item in extra_warnings or [])
     rollout_mode = str(getattr(report, "rollout_mode", "") or "")
     steps: list[dict[str, str]] = []
-    proof_warning_codes = {
+    setup_warning_codes = {
+        "gateway_not_running",
+        "gateway_not_supervised",
+        "gateway_status_stale",
+        "gateway_heartbeat_missing",
+        "gateway_runtime_metadata_missing",
+        "runtime_sync_stale",
+        "runtime_sync_unrecorded",
         "proof_commands_empty",
+        "proof_setup_commands_empty",
+        "proof_setup_commands_noop",
         "ios_proof_tooling",
         "android_proof_tooling",
     }
-    if not failure_codes and not (warning_codes & proof_warning_codes):
+    if not failure_codes and not (warning_codes & setup_warning_codes):
         return []
+    if "plugin_not_enabled" in failure_codes:
+        _append_setup_step(
+            steps,
+            step_id="enable_mobile_bug_agent_plugin",
+            title="Enable the Monica plugin",
+            command=_profiled_hermes_command("plugins", "enable", _MONICA_PLUGIN_NAME),
+            why=(
+                "The gateway only loads Monica's Slack intake, approval, and runtime-sync hooks "
+                "when the bundled plugin is enabled."
+            ),
+        )
+    if not failure_codes and warning_codes & {"runtime_sync_stale", "runtime_sync_unrecorded"}:
+        runtime_sync_health = runtime_sync_health or {}
+        active_count = int(runtime_sync_health.get("active_run_count") or 0)
+        active_runs = runtime_sync_health.get("active_runs") or []
+        if active_count:
+            labels = ", ".join(_runtime_sync_run_label(run) for run in active_runs[:5])
+            if active_count > 5:
+                labels += f", +{active_count - 5} more"
+            detail = f" Active run(s): {labels}." if labels else ""
+            _append_setup_step(
+                steps,
+                step_id="wait_for_monica_idle_runtime_sync",
+                title="Wait for Monica to be idle before Hermes sync",
+                command=_profiled_hermes_command(
+                    "mobile-bug-agent",
+                    "status",
+                    "--json",
+                ),
+                why=(
+                    "Hermes update is blocked while Monica has active approved-PR work. "
+                    "Re-run status until runtime_sync.idle is true, then run `hermes update`."
+                    f"{detail}"
+                ),
+            )
+        else:
+            _append_setup_step(
+                steps,
+                step_id="sync_hermes_runtime",
+                title="Sync Hermes runtime while Monica is idle",
+                command=_profiled_hermes_command("update"),
+                why=(
+                    "Monica is idle, so `hermes update` can run the idle-only sync hook "
+                    "and record the current Hermes commit/time."
+                ),
+            )
+    if (
+        "gateway_not_running" in warning_codes
+        or "gateway_not_running" in failure_codes
+        or "gateway_not_supervised" in warning_codes
+        or "gateway_not_supervised" in failure_codes
+    ):
+        if rollout_mode == "approved_pr":
+            _append_setup_step(
+                steps,
+                step_id="install_gateway_service",
+                title="Install Monica's supervised Slack gateway",
+                command=_profiled_hermes_command("gateway", "install"),
+                why=(
+                    "Approved PR work depends on live Slack tag/DM intake and approvals. "
+                    "Install the profile-aware gateway service so Monica stays running "
+                    "under the platform supervisor."
+                ),
+            )
+        else:
+            _append_setup_step(
+                steps,
+                step_id="start_gateway",
+                title="Start Monica's Slack gateway",
+                command=_profiled_hermes_command("gateway", "start"),
+                why=(
+                    "The gateway must be running for live Slack tag/DM intake and approvals; "
+                    "doctor will keep warning until it is running."
+                ),
+            )
+    if (
+        "gateway_heartbeat_missing" in warning_codes
+        or "gateway_heartbeat_missing" in failure_codes
+        or "gateway_runtime_metadata_missing" in warning_codes
+        or "gateway_runtime_metadata_missing" in failure_codes
+    ):
+        _append_setup_step(
+            steps,
+            step_id="restart_gateway",
+            title="Restart Monica's Slack gateway",
+            command=_profiled_hermes_command("gateway", "restart"),
+            why=(
+                "The gateway heartbeat or runtime metadata is incomplete, so restart it "
+                "before relying on live Slack tag/DM intake or approvals."
+            ),
+        )
+    if "gateway_status_stale" in warning_codes or "gateway_status_stale" in failure_codes:
+        _append_setup_step(
+            steps,
+            step_id="restart_gateway",
+            title="Restart Monica's Slack gateway",
+            command=_profiled_hermes_command("gateway", "restart"),
+            why=(
+                "The gateway heartbeat is stale, so restart it before relying on "
+                "live Slack tag/DM intake or approvals."
+            ),
+        )
     if rollout_mode == "dry_run" and "config_enabled" in failure_codes:
         _append_setup_step(
             steps,
             step_id="configure_dry_run",
             title="Persist Monica's dry-run rollout settings",
-            command="hermes mobile-bug-agent configure-dry-run",
+            command=_profiled_hermes_command("mobile-bug-agent", "configure-dry-run"),
             why="This enables the Monica plugin and keeps her in no-side-effect dry-run mode.",
         )
     if failure_codes & {
@@ -1277,12 +2457,13 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
         "slack_scope_chat_write",
         "slack_scope_history",
         "slack_scope_files_read",
+        "slack_scope_files_write",
     }:
         _append_setup_step(
             steps,
             step_id="create_slack_app",
             title="Create or update the Monica Slack app",
-            command="hermes mobile-bug-agent slack-manifest",
+            command=_profiled_hermes_command("mobile-bug-agent", "slack-manifest"),
             why="Import the manifest in Slack, install the app, and invite Monica to the target channels.",
         )
     if "slack_bot_token" in failure_codes:
@@ -1305,7 +2486,7 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             steps,
             step_id="discover_slack_ids",
             title="Discover Monica's Slack user ID and channel IDs",
-            command="hermes mobile-bug-agent slack-metadata --json",
+            command=_profiled_hermes_command("mobile-bug-agent", "slack-metadata", "--json"),
             why="Use auth.bot_user_id for --bot-user-id and selected C.../G... channel IDs for --channel-id.",
         )
     if "linear_api_key" in failure_codes:
@@ -1321,7 +2502,7 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             steps,
             step_id="discover_linear_ids",
             title="Discover Linear team, project, and label IDs",
-            command="hermes mobile-bug-agent linear-metadata --json",
+            command=_profiled_hermes_command("mobile-bug-agent", "linear-metadata", "--json"),
             why="Use the selected team ID, and optionally project/label IDs, in Monica's rollout config.",
         )
     if rollout_mode in {"linear_only", "local_fix_only", "approved_pr"} and failure_codes & {
@@ -1339,9 +2520,15 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             steps,
             step_id="configure_linear_only",
             title="Persist Monica's Linear-only rollout settings",
-            command=(
-                "hermes mobile-bug-agent configure-linear-only "
-                "--bot-user-id <U...> --channel-id <C...> --linear-team-id <team-id>"
+            command=_profiled_hermes_command(
+                "mobile-bug-agent",
+                "configure-linear-only",
+                "--bot-user-id",
+                "<U...>",
+                "--channel-id",
+                "<C...>",
+                "--linear-team-id",
+                "<team-id>",
             ),
             why="This enables Monica only in explicitly allowed Slack channels and lets her file Linear issues.",
         )
@@ -1361,10 +2548,15 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             steps,
             step_id="configure_local_fix_only",
             title="Persist local code-fix rollout settings",
-            command=(
-                "hermes mobile-bug-agent configure-local-fix-only "
-                "--approver-user-id <U...> --repo-url <repo-url> "
-                "--verification-command '<command>'"
+            command=_profiled_hermes_command(
+                "mobile-bug-agent",
+                "configure-local-fix-only",
+                "--approver-user-id",
+                "<U...>",
+                "--repo-url",
+                "<repo-url>",
+                "--verification-command",
+                "<command>",
             ),
             why="This configures the React Native repo, approver allowlist, and verification gate without enabling push or PR creation.",
         )
@@ -1384,12 +2576,39 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             steps,
             step_id="configure_approved_pr",
             title="Persist approved draft-PR rollout settings",
-            command=(
-                "hermes mobile-bug-agent configure-approved-pr "
-                "--approver-user-id <U...> --repo-url <repo-url> "
-                "--verification-command '<command>'"
+            command=_profiled_hermes_command(
+                "mobile-bug-agent",
+                "configure-approved-pr",
+                "--approver-user-id",
+                "<U...>",
+                "--repo-url",
+                "<repo-url>",
+                "--verification-command",
+                "<command>",
+                "--proof-setup-command",
+                "<auth/session seed command>",
+                "--proof-required-env-key",
+                "<test-auth env key>",
+                "--proof-command",
+                "<simulator proof command>",
             ),
-            why="This configures the React Native repo, approver allowlist, and verification gate.",
+            why=(
+                "This configures the React Native repo, approver allowlist, verification gate, "
+                "and non-secret proof setup/proof commands."
+            ),
+        )
+    if failure_codes & {"repo_cached_path", "repo_cached_status", "repo_cached_dirty"}:
+        _append_setup_step(
+            steps,
+            step_id="clean_cached_mobile_repo",
+            title="Inspect and clean Monica's cached mobile repo",
+            command=_cached_mobile_repo_status_command(config),
+            why=(
+                "Monica creates fresh run worktrees from the cached mobile repo, so cached "
+                "uncommitted changes can poison future approved-PR fixes. Review the status, "
+                "then intentionally clean, stash, or archive the cached repo before approving "
+                "new code work."
+            ),
         )
     if rollout_mode in {"local_fix_only", "approved_pr"} and failure_codes & {
         "git_executable",
@@ -1416,10 +2635,20 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
             command="gh auth status || gh auth login -h github.com",
             why="Approved-PR mode needs GitHub CLI auth for pushing branches and opening draft PRs.",
         )
-    if warning_codes & {"proof_commands_empty"} or failure_codes & {
+    proof_command_failure_codes = {
+        "proof_commands_empty",
+        "proof_commands_noop",
+        "proof_commands_placeholder",
+        "proof_commands_inline_secret",
+        "proof_commands_literal_secret",
         "proof_ios_dev_client_scheme",
         "proof_ios_bundle_id",
-    }:
+        "proof_android_package",
+    }
+    if (
+        warning_codes & {"proof_commands_empty"}
+        or failure_codes & proof_command_failure_codes
+    ):
         _append_setup_step(
             steps,
             step_id="configure_simulator_proof",
@@ -1428,9 +2657,65 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
                 "Set mobile_bug_agent.proof.commands to "
                 "`uv run --project \"$MONICA_HERMES_AGENT_ROOT\" python -m "
                 "plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600`, "
-                "and set proof.dev_client_scheme plus proof.ios_bundle_id for iOS dev-client proof."
+                "then set proof.dev_client_scheme, proof.ios_bundle_id, and "
+                "proof.android_package for real-app simulator proof."
             ),
             why="Stage D/E/F cannot complete until proof commands write screenshots or recordings to MONICA_PROOF_DIR.",
+        )
+    if rollout_mode == "approved_pr" and "proof_platform_order" in failure_codes:
+        _append_setup_step(
+            steps,
+            step_id="configure_proof_platform_order",
+            title="Require iOS and Android simulator proof",
+            command="Set mobile_bug_agent.proof.platform_order to `['ios', 'android']`.",
+            why=(
+                "approved_pr cannot open a PR unless Monica captures proof artifacts "
+                "for both iOS and Android."
+            ),
+        )
+    setup_command_failure_codes = {
+        "proof_setup_commands_empty",
+        "proof_setup_commands_noop",
+        "proof_setup_commands_placeholder",
+        "proof_setup_commands_inline_secret",
+        "proof_setup_commands_literal_secret",
+    }
+    if (
+        warning_codes & {"proof_setup_commands_empty"}
+        or failure_codes & setup_command_failure_codes
+    ):
+        _append_setup_step(
+            steps,
+            step_id="configure_proof_setup_commands",
+            title="Configure Monica proof setup/auth command",
+            command=_approved_pr_setup_command_configure_step(config),
+            why=(
+                "Monica runs setup commands before proof with MONICA_WORKTREE, MONICA_PROOF_DIR, "
+                "MONICA_LINEAR_URL, MONICA_BRANCH_NAME, MONICA_BASE_REF, MONICA_BASE_COMMIT, "
+                "MONICA_DEEP_LINK, MONICA_PROOF_EXPECTED_TEXT, MONICA_PROOF_SCREEN, simulator "
+                "IDs/packages, and credentials loaded from the Monica profile .env. The proof "
+                "capture must also emit target route evidence, such as a screen.load marker for "
+                "the fixed screen."
+            ),
+        )
+    if (
+        rollout_mode == "approved_pr"
+        and not (failure_codes & setup_command_failure_codes)
+        and failure_codes & {
+            "proof_required_env_keys_empty",
+            "proof_required_env_keys",
+            "proof_required_env_keys_invalid",
+        }
+    ):
+        _append_setup_step(
+            steps,
+            step_id="configure_proof_required_env_keys",
+            title="Configure Monica proof environment secrets",
+            command=_proof_required_env_keys_setup_step(config, failure_codes),
+            why=(
+                "Proof setup and simulator capture receive credentials from the Monica "
+                "profile .env; proof.required_env_keys records only the non-secret key names."
+            ),
         )
     if warning_codes & {"ios_proof_tooling"}:
         _append_setup_step(
@@ -1458,7 +2743,13 @@ def _setup_plan_steps(report: Any) -> list[dict[str, str]]:
         steps,
         step_id="rerun_doctor",
         title="Re-run the rollout readiness check",
-        command=f"hermes mobile-bug-agent doctor --rollout-mode {rollout_mode or 'linear_only'} --json",
+        command=_profiled_hermes_command(
+            "mobile-bug-agent",
+            "doctor",
+            "--rollout-mode",
+            rollout_mode or "linear_only",
+            "--json",
+        ),
         why="Only continue to a live Slack test once Monica reports ready.",
     )
     return steps
@@ -1482,6 +2773,112 @@ def _append_setup_step(
             "why": why,
         }
     )
+
+
+def _approved_pr_setup_command_configure_step(config: MonicaConfig | None) -> str:
+    if config is None:
+        return (
+            "Ask the mobile team for the simulator test-auth/session seed command, "
+            "then run `hermes mobile-bug-agent configure-proof-setup "
+            "--proof-setup-command '<auth/session seed command>' "
+            "--proof-required-env-key '<test-auth env key>'`."
+        )
+
+    parts = _profiled_hermes_command_parts("mobile-bug-agent", "configure-proof-setup")
+    parts.extend(["--proof-setup-command", "<auth/session seed command>"])
+    configured_required_env_keys = _clean_required_env_key_sequence(config.proof.required_env_keys)
+    if not configured_required_env_keys or _invalid_required_env_keys(configured_required_env_keys):
+        parts.extend(["--proof-required-env-key", "<test-auth env key>"])
+    return " ".join(shlex.quote(str(part)) for part in parts)
+
+
+def _cached_mobile_repo_status_command(config: MonicaConfig | None) -> str:
+    if config is None:
+        return "Inspect Monica's cached mobile repo under mobile_bug_agent.runtime.home_subdir/workspace/repos."
+    try:
+        local_name = safe_repo_local_name(config.repo.local_name)
+        repo_path = runtime_root(config) / "workspace" / "repos" / local_name
+    except (RepoManagerError, ValueError):
+        return "Inspect Monica's cached mobile repo under mobile_bug_agent.runtime.home_subdir/workspace/repos."
+    return f"git -C {shlex.quote(str(repo_path))} status --short --branch"
+
+
+def _proof_required_env_keys_setup_step(
+    config: MonicaConfig | None,
+    failure_codes: set[str],
+) -> str:
+    if config is None:
+        return "Add the configured proof.required_env_keys values to the Monica profile .env."
+
+    if "proof_required_env_keys_invalid" in failure_codes:
+        keys = _suggested_required_env_keys_for_invalid_config(
+            config.proof.required_env_keys
+        )
+        parts = _profiled_hermes_command_parts("mobile-bug-agent", "configure-proof-setup")
+        _append_configured_proof_setup_command_args(parts, config)
+        for key in keys:
+            parts.extend(["--proof-required-env-key", key])
+        return " ".join(shlex.quote(str(part)) for part in parts)
+    if "proof_required_env_keys_empty" in failure_codes:
+        parts = _profiled_hermes_command_parts("mobile-bug-agent", "configure-proof-setup")
+        _append_configured_proof_setup_command_args(parts, config)
+        parts.extend(["--proof-required-env-key", "MONICA_TEST_LOGIN_TOKEN"])
+        return " ".join(shlex.quote(str(part)) for part in parts)
+
+    keys = _clean_sequence(config.proof.required_env_keys)
+    key_text = ", ".join(keys) if keys else "the configured proof.required_env_keys"
+    return f"Add {key_text} to the Monica profile .env, then rerun doctor."
+
+
+def _append_configured_proof_setup_command_args(
+    parts: list[str],
+    config: MonicaConfig,
+) -> None:
+    setup_commands = _clean_sequence(config.proof.setup_commands)
+    if not setup_commands:
+        parts.extend(["--proof-setup-command", "<auth/session seed command>"])
+        return
+    for command in setup_commands:
+        parts.extend(["--proof-setup-command", command])
+
+
+def _suggested_required_env_keys_for_invalid_config(keys: tuple[str, ...]) -> tuple[str, ...]:
+    suggested: list[str] = []
+    seen: set[str] = set()
+    for key in _invalid_required_env_keys(keys):
+        candidate = str(key or "").strip()
+        if (
+            not candidate
+            or candidate in seen
+            or _invalid_required_env_keys((candidate,))
+        ):
+            continue
+        seen.add(candidate)
+        suggested.append(candidate)
+    return tuple(suggested) or ("MONICA_TEST_LOGIN_TOKEN",)
+
+
+def _profiled_hermes_command(*args: Any) -> str:
+    return " ".join(shlex.quote(str(part)) for part in _profiled_hermes_command_parts(*args))
+
+
+def _profiled_hermes_command_parts(*args: Any) -> list[str]:
+    parts = ["hermes"]
+    profile = _active_named_profile()
+    if profile:
+        parts.extend(["-p", profile])
+    parts.extend(str(arg) for arg in args)
+    return parts
+
+
+def _active_named_profile() -> str:
+    try:
+        from hermes_cli.profiles import get_active_profile_name
+
+        profile = str(get_active_profile_name() or "").strip()
+    except Exception:
+        return ""
+    return "" if profile in {"", "default"} else profile
 
 
 def _readiness_report_payload(report: Any) -> dict[str, Any]:
@@ -1577,7 +2974,7 @@ def run_retry_command(
     )
     next_status = "proof_blocked" if is_proof_resume else ("approved" if run.approved_by_user_id else "queued")
     if (
-        next_status == "approved"
+        (next_status == "approved" or (is_proof_resume and config is not None and config.rollout_mode == "approved_pr"))
         and config is not None
         and not _is_allowed_local_approver(config=config, user_id=run.approved_by_user_id)
     ):
@@ -1595,7 +2992,12 @@ def run_retry_command(
             return 1
         print(message)
         return 1
-    if next_status == "approved" and config is not None and config.rollout_mode in {"local_fix_only", "approved_pr"}:
+    should_check_readiness = (
+        config is not None
+        and config.rollout_mode in {"local_fix_only", "approved_pr"}
+        and (next_status == "approved" or is_proof_resume)
+    )
+    if should_check_readiness:
         checker = readiness_checker or (lambda: run_doctor_command(config=config))
         try:
             readiness_exit_code = int(checker())
@@ -1628,6 +3030,10 @@ def run_retry_command(
         status=next_status,
         failure_reason="",
         branch_name=run.branch_name if is_proof_resume else "",
+        base_branch=run.base_branch if is_proof_resume else "",
+        base_commit=run.base_commit if is_proof_resume else "",
+        proof_deep_link=run.proof_deep_link if is_proof_resume else "",
+        proof_expected_text=run.proof_expected_text if is_proof_resume else "",
         pr_url="",
     )
     _run_loop(run.id, state=state)
@@ -1885,16 +3291,84 @@ def _sync_one_approval(
 def _find_thread_approval(*, config: MonicaConfig, run: Any, thread: Any) -> dict[str, str] | None:
     approvers = set(config.slack.approver_user_ids)
     bot_ids = set(config.slack.bot_user_ids)
+    waiting_since = _run_updated_at_epoch(run)
     for message in getattr(thread, "messages", []) or []:
         message_ts = str(getattr(message, "ts", "") or "")
         if message_ts and message_ts == str(getattr(run, "message_ts", "") or ""):
             continue
+        if not _message_is_after_waiting_since(message_ts, waiting_since):
+            continue
         user_id = str(getattr(message, "user_id", "") or "")
         if user_id in bot_ids or user_id not in approvers:
             continue
-        if is_approval_text(str(getattr(message, "text", "") or "")):
+        text = str(getattr(message, "text", "") or "")
+        if is_approval_text(text) and _recovered_approval_targets_monica(
+            config=config,
+            run=run,
+            text=text,
+        ):
             return {"user_id": user_id, "ts": message_ts}
     return None
+
+
+def _recovered_approval_targets_monica(
+    *,
+    config: MonicaConfig,
+    run: Any,
+    text: str,
+) -> bool:
+    if _run_is_slack_direct_message(run):
+        return True
+    configured_ids = {
+        str(user_id).strip()
+        for user_id in config.slack.bot_user_ids
+        if str(user_id).strip()
+    }
+    if not configured_ids:
+        return False
+    mentioned_ids = set(_SLACK_MENTION_RE.findall(str(text or "")))
+    return bool(configured_ids & mentioned_ids)
+
+
+def _run_is_slack_direct_message(run: Any) -> bool:
+    raw_event = getattr(run, "raw_event", None)
+    if isinstance(raw_event, dict):
+        channel_type = str(raw_event.get("channel_type") or "").strip()
+        if channel_type == "im":
+            return True
+        if channel_type == "mpim":
+            return False
+    channel_id = str(getattr(run, "channel_id", "") or "").strip()
+    return channel_id.startswith("D")
+
+
+def _message_is_after_waiting_since(message_ts: str, waiting_since: float | None) -> bool:
+    if waiting_since is None:
+        return True
+    message_epoch = _slack_ts_epoch(message_ts)
+    if message_epoch is None:
+        return True
+    return message_epoch >= waiting_since
+
+
+def _slack_ts_epoch(value: str) -> float | None:
+    try:
+        return float(str(value or "").strip())
+    except (TypeError, ValueError):
+        return None
+
+
+def _run_updated_at_epoch(run: Any) -> float | None:
+    value = str(getattr(run, "updated_at", "") or "").strip()
+    if not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.timestamp()
 
 
 def _approval_readiness(

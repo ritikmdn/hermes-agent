@@ -124,6 +124,11 @@ class ChatGptFooterWebClient(FakeWebClient):
         }
 
 
+class UploadWithoutPermalinkWebClient(FakeWebClient):
+    def files_upload_v2(self, **_kwargs):
+        return {"ok": True, "file": {"id": "F_PROOF", "name": "ios-proof.png"}}
+
+
 class AttachmentImageWebClient(FakeWebClient):
     def conversations_replies(self, channel, ts, limit):
         assert channel == "C123"
@@ -362,6 +367,20 @@ def test_reads_thread_messages_files_and_permalink():
         ("C123", "1710000000.000100"),
         ("C123", "1710000001.000200"),
     ]
+
+
+def test_upload_thread_file_requires_permalink(tmp_path):
+    proof = tmp_path / "ios-proof.png"
+    proof.write_bytes(b"ios proof")
+    client = SlackThreadClient(client=UploadWithoutPermalinkWebClient())
+
+    with pytest.raises(SlackClientError, match="permalink"):
+        client.upload_thread_file(
+            channel_id="C123",
+            thread_ts="1710000000.000100",
+            file_path=str(proof),
+            title="Monica iOS proof",
+        )
 
 
 def test_lists_slack_workspace_metadata_with_channels():

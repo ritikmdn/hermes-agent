@@ -3077,6 +3077,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             pass
 
+    async def _runtime_status_heartbeat_watcher(self, interval: float = 60.0) -> None:
+        """Refresh gateway_state.json while the gateway is healthy but idle."""
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+
+            if not self._running or self._shutdown_event.is_set():
+                break
+            self._update_runtime_status("running")
+
     def _update_platform_runtime_status(
         self,
         platform: str,
@@ -4998,6 +5012,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+
+        # Keep runtime status fresh even when a gateway is healthy but idle.
+        asyncio.create_task(self._runtime_status_heartbeat_watcher())
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers

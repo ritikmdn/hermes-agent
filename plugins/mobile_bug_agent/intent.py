@@ -16,6 +16,11 @@ Classify only the tagged Slack request and its thread context.
 Return strict JSON with keys: is_mobile_bug, wants_linear, wants_fix,
 confidence, summary, observed_behavior, expected_behavior, reproduction_steps,
 platforms, device_context, build_context, missing_questions, reason.
+Monica is narrow: mark is_mobile_bug true only for React Native mobile app
+marketplace/PDP copy, content, or basic design bugs. Generic crashes,
+checkout/payment bugs, backend bugs, native infrastructure bugs, and broad
+navigation issues are out of scope unless the request is specifically about a
+marketplace/PDP copy/content/design surface.
 Do not require command syntax. Infer intent from natural language.
 If a tagged request describes the affected mobile app surface, observed issue,
 and desired outcome, proceed with filing even when build, device, or exact
@@ -239,7 +244,19 @@ def _result_from_mapping(data: dict[str, Any]) -> IntentResult:
 
 def _fallback_intent(*, request_text: str, thread_text: str) -> IntentResult:
     text = "\n".join([request_text, thread_text]).lower()
-    bug_words = ("bug", "crash", "broken", "issue", "error", "regression", "not working", "fails")
+    bug_words = (
+        "bug",
+        "crash",
+        "broken",
+        "issue",
+        "error",
+        "regression",
+        "not working",
+        "fails",
+        "misspelled",
+        "typo",
+        "wrong",
+    )
     fix_words = ("fix", "patch", "pr", "clean it up", "clean up", "ship", "resolve")
     ticket_words = ("linear", "ticket", "file", "triage")
     platforms = _fallback_platforms(text)
@@ -247,14 +264,14 @@ def _fallback_intent(*, request_text: str, thread_text: str) -> IntentResult:
     is_mobile = _has_explicit_mobile_context(text)
     wants_fix = any(word in text for word in fix_words)
     asked_ticket = any(word in text for word in ticket_words)
-    is_mobile_bug = is_bug and is_mobile
+    is_mobile_bug = is_bug and is_mobile and _is_monica_marketplace_copy_design_scope(text)
     question_only = _is_actionless_question(request_text.lower())
     wants_linear = asked_ticket or (is_mobile_bug and not question_only)
     summary = _first_line(request_text or thread_text)
     questions: tuple[str, ...] = ()
     confidence = 0.78 if is_mobile_bug else 0.25
     if not is_mobile_bug:
-        questions = ("What mobile app bug or platform should I file or investigate?",)
+        questions = (_scope_question(text),)
     return IntentResult(
         is_mobile_bug=is_mobile_bug,
         wants_linear=wants_linear,
@@ -275,9 +292,95 @@ def _apply_request_overrides(
     thread_text: str,
 ) -> IntentResult:
     text = "\n".join([request_text, thread_text]).lower()
+    if result.is_mobile_bug and not _is_monica_marketplace_copy_design_scope(text):
+        return replace(
+            result,
+            is_mobile_bug=False,
+            wants_linear=False,
+            confidence=min(result.confidence, 0.35),
+            observed_behavior="",
+            missing_questions=(_scope_question(text),),
+            reason="The request is outside Monica's marketplace copy/design scope.",
+        )
     if result.is_mobile_bug and result.wants_linear and _mentions_deferred_fix(text):
         result = replace(result, wants_fix=True)
     return result
+
+
+_MONICA_SCOPE_SURFACE_TERMS = (
+    "marketplace",
+    "pdp",
+    "product detail",
+    "offer detail",
+    "offer card",
+)
+_MONICA_SCOPE_KIND_TERMS = (
+    "badge",
+    "color",
+    "content",
+    "copy",
+    "design",
+    "font",
+    "label",
+    "layout",
+    "spacing",
+    "style",
+    "tag",
+    "text",
+    "title",
+    "visual",
+    "wording",
+)
+_MONICA_SCOPE_EXCLUDED_TERMS = (
+    "api",
+    "backend",
+    "build failure",
+    "checkout",
+    "crash",
+    "hang",
+    "latency",
+    "native module",
+    "navigation",
+    "payment",
+    "performance",
+    "slow",
+    "slowness",
+    "timeout",
+)
+
+
+def _is_monica_marketplace_copy_design_scope(text: str) -> bool:
+    normalized = _normalized_scope_text(text)
+    if _has_monica_scope_excluded_term(normalized):
+        return False
+    has_surface = any(term in normalized for term in _MONICA_SCOPE_SURFACE_TERMS)
+    has_kind = any(term in normalized for term in _MONICA_SCOPE_KIND_TERMS)
+    return has_surface and has_kind
+
+
+def _has_monica_scope_excluded_term(text: str) -> bool:
+    normalized = _normalized_scope_text(text)
+    for term in _MONICA_SCOPE_EXCLUDED_TERMS:
+        if term == "crash":
+            if re.search(r"\bcrash(?:es|ed|ing)?\b", normalized):
+                return True
+            continue
+        if re.search(rf"\b{re.escape(term)}\b", normalized):
+            return True
+    return False
+
+
+def _normalized_scope_text(value: str) -> str:
+    return " ".join(str(value or "").lower().replace("_", " ").split())
+
+
+def _scope_question(text: str) -> str:
+    if _has_explicit_mobile_context(text):
+        return (
+            "Is this a marketplace copy/design bug Monica should handle? "
+            "Monica is limited to marketplace copy/design issues."
+        )
+    return "What mobile app marketplace copy/design bug should I file or investigate?"
 
 
 def _mentions_deferred_fix(text: str) -> bool:

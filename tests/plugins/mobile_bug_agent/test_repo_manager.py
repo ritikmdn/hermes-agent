@@ -16,6 +16,8 @@ def test_repo_manager_clones_missing_repo_and_creates_named_worktree(tmp_path):
         commands.append(cmd if cwd is None else ["cwd=" + str(cwd), *cmd])
         if cmd[:2] == ["git", "clone"]:
             Path(cmd[-1]).mkdir(parents=True)
+        if cmd[:4] == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse"]:
+            return "abc1234\n"
         return ""
 
     manager = RepoManager(
@@ -36,6 +38,8 @@ def test_repo_manager_clones_missing_repo_and_creates_named_worktree(tmp_path):
 
     assert worktree.branch_name == "monica/MOB-123-android-checkout-crash-after-promo-code"
     assert worktree.path == tmp_path / "worktrees" / "monica-MOB-123-android-checkout-crash-after-promo-code"
+    assert worktree.base_ref == "origin/main"
+    assert worktree.base_commit == "abc1234"
     assert commands == [
         [
             "git",
@@ -47,12 +51,51 @@ def test_repo_manager_clones_missing_repo_and_creates_named_worktree(tmp_path):
             "git",
             "-C",
             str(tmp_path / "repos" / "mobile-app"),
+            "fetch",
+            "--prune",
+            "origin",
+        ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
+            "status",
+            "--porcelain",
+        ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
+            "rev-parse",
+            "origin/main",
+        ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
+            "branch",
+            "--list",
+            "monica/MOB-123-android-checkout-crash-after-promo-code",
+        ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
+            "branch",
+            "-r",
+            "--list",
+            "origin/monica/MOB-123-android-checkout-crash-after-promo-code",
+        ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
             "worktree",
             "add",
             "-B",
             "monica/MOB-123-android-checkout-crash-after-promo-code",
             str(tmp_path / "worktrees" / "monica-MOB-123-android-checkout-crash-after-promo-code"),
-            "origin/main",
+            "abc1234",
         ],
     ]
 
@@ -63,6 +106,8 @@ def test_repo_manager_fetches_existing_repo_before_worktree(tmp_path):
 
     def run(cmd: list[str], cwd: Path | None = None) -> str:
         commands.append(cmd)
+        if cmd[:4] == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse"]:
+            return "abc1234\n"
         return ""
 
     manager = RepoManager(
@@ -73,14 +118,237 @@ def test_repo_manager_fetches_existing_repo_before_worktree(tmp_path):
 
     manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
 
-    assert commands[0] == [
+    assert commands[:2] == [
+        ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "remote", "get-url", "origin"],
+        [
         "git",
         "-C",
         str(tmp_path / "repos" / "mobile-app"),
         "fetch",
+        "--prune",
         "origin",
-        "main",
+        ],
     ]
+
+
+def test_repo_manager_rejects_existing_repo_with_wrong_origin_before_fetch(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "remote", "get-url", "origin"]:
+            return "git@github.com:acme/chandler-app.git\n"
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="cached repo origin"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert commands == [
+        ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
+    ]
+
+
+def test_repo_manager_uses_configured_remote_default_branch_and_records_base_commit(tmp_path):
+    commands: list[list[str]] = []
+    (tmp_path / "repos" / "mobile-app").mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd[:4] == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse"]:
+            return "def4567\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(
+            url="git@github.com:acme/mobile-app.git",
+            local_name="mobile-app",
+            default_branch="dev",
+        ),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    worktree = manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert worktree.base_ref == "origin/dev"
+    assert worktree.base_commit == "def4567"
+    assert [
+        "git",
+        "-C",
+        str(tmp_path / "repos" / "mobile-app"),
+        "worktree",
+        "add",
+        "-B",
+        "monica/MOB-123-checkout-crash",
+        str(tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"),
+        "def4567",
+    ] in commands
+
+
+def test_repo_manager_creates_worktree_from_resolved_base_commit_not_moving_ref(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/dev"]:
+            return "def4567\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(
+            url="git@github.com:acme/mobile-app.git",
+            local_name="mobile-app",
+            default_branch="dev",
+        ),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    worktree = manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert worktree.base_ref == "origin/dev"
+    assert worktree.base_commit == "def4567"
+    assert [
+        "git",
+        "-C",
+        str(repo_path),
+        "worktree",
+        "add",
+        "-B",
+        "monica/MOB-123-checkout-crash",
+        str(tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"),
+        "def4567",
+    ] in commands
+
+
+def test_repo_manager_accepts_origin_prefixed_default_branch(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/dev"]:
+            return "def4567\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(
+            url="git@github.com:acme/mobile-app.git",
+            local_name="mobile-app",
+            default_branch="origin/dev",
+        ),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    worktree = manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert worktree.base_ref == "origin/dev"
+    assert worktree.base_commit == "def4567"
+    assert [
+        "git",
+        "-C",
+        str(repo_path),
+        "worktree",
+        "add",
+        "-B",
+        "monica/MOB-123-checkout-crash",
+        str(tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"),
+        "def4567",
+    ] in commands
+    assert not any("origin/origin/dev" in cmd for cmd in commands)
+
+
+def test_repo_manager_rejects_empty_remote_base_commit_before_worktree(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/dev"]:
+            return "\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(
+            url="git@github.com:acme/mobile-app.git",
+            local_name="mobile-app",
+            default_branch="dev",
+        ),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="could not resolve valid latest base commit"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert not any("worktree" in cmd for cmd in commands)
+
+
+def test_repo_manager_rejects_non_sha_remote_base_commit_before_worktree(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/dev"]:
+            return "abc123base\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(
+            url="git@github.com:acme/mobile-app.git",
+            local_name="mobile-app",
+            default_branch="dev",
+        ),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="could not resolve valid latest base commit"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert not any("worktree" in cmd for cmd in commands)
+
+
+def test_repo_manager_rejects_dirty_cached_repo_before_creating_worktree(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "status", "--porcelain"]:
+            return " M package.json\n"
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="cached repo has uncommitted changes"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert not any("worktree" in cmd for cmd in commands)
 
 
 def test_repo_manager_rejects_existing_repo_file(tmp_path):
@@ -216,7 +484,7 @@ def test_repo_manager_rejects_unsafe_default_branch_before_commands(tmp_path):
         assert commands == []
 
 
-def test_repo_manager_reuses_existing_worktree_for_retry(tmp_path):
+def test_repo_manager_reuses_existing_worktree_only_when_it_is_at_latest_base(tmp_path):
     commands: list[list[str]] = []
     (tmp_path / "repos" / "mobile-app").mkdir(parents=True)
     existing = tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"
@@ -225,8 +493,12 @@ def test_repo_manager_reuses_existing_worktree_for_retry(tmp_path):
 
     def run(cmd: list[str], cwd: Path | None = None) -> str:
         commands.append(cmd)
+        if cmd == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse", "origin/main"]:
+            return "abc1234\n"
         if cmd == ["git", "-C", str(existing), "branch", "--show-current"]:
             return "monica/MOB-123-checkout-crash\n"
+        if cmd == ["git", "-C", str(existing), "rev-parse", "HEAD"]:
+            return "abc1234\n"
         return ""
 
     manager = RepoManager(
@@ -241,9 +513,117 @@ def test_repo_manager_reuses_existing_worktree_for_retry(tmp_path):
     assert worktree.path == existing
     assert not any(cmd[:4] == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "worktree"] for cmd in commands)
     assert commands[-2:] == [
+        ["git", "-C", str(existing), "status", "--porcelain"],
+        ["git", "-C", str(existing), "rev-parse", "HEAD"],
+    ]
+
+
+def test_repo_manager_rejects_stale_clean_existing_worktree_for_new_run(tmp_path):
+    commands: list[list[str]] = []
+    (tmp_path / "repos" / "mobile-app").mkdir(parents=True)
+    existing = tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"
+    existing.mkdir(parents=True)
+    (existing / ".git").write_text("gitdir: /tmp/fake-worktree-git-dir")
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse", "origin/main"]:
+            return "eee4567\n"
+        if cmd == ["git", "-C", str(existing), "branch", "--show-current"]:
+            return "monica/MOB-123-checkout-crash\n"
+        if cmd == ["git", "-C", str(existing), "rev-parse", "HEAD"]:
+            return "ddd4567\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="existing Monica worktree is not at latest base"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert not any(cmd[:6] == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "worktree", "add"] for cmd in commands)
+    assert commands[-3:] == [
         ["git", "-C", str(existing), "branch", "--show-current"],
         ["git", "-C", str(existing), "status", "--porcelain"],
+        ["git", "-C", str(existing), "rev-parse", "HEAD"],
     ]
+
+
+def test_repo_manager_rejects_existing_local_branch_without_worktree(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        if cmd == [
+            "git",
+            "-C",
+            str(repo_path),
+            "branch",
+            "--list",
+            "monica/MOB-123-checkout-crash",
+        ]:
+            return "  monica/MOB-123-checkout-crash\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="local Monica branch already exists"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert not any(cmd[:6] == ["git", "-C", str(repo_path), "worktree", "add"] for cmd in commands)
+
+
+def test_repo_manager_rejects_existing_remote_branch_before_worktree(tmp_path):
+    commands: list[list[str]] = []
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
+
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        if cmd == [
+            "git",
+            "-C",
+            str(repo_path),
+            "branch",
+            "-r",
+            "--list",
+            "origin/monica/MOB-123-checkout-crash",
+        ]:
+            return "  origin/monica/MOB-123-checkout-crash\n"
+        return ""
+
+    manager = RepoManager(
+        config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
+        workspace_root=tmp_path,
+        run_command=run,
+    )
+
+    with pytest.raises(RepoManagerError, match="remote Monica branch already exists"):
+        manager.prepare_worktree(linear_identifier="MOB-123", summary="Checkout crash")
+
+    assert [
+        "git",
+        "-C",
+        str(repo_path),
+        "branch",
+        "-r",
+        "--list",
+        "origin/monica/MOB-123-checkout-crash",
+    ] in commands
+    assert not any(cmd[:6] == ["git", "-C", str(repo_path), "worktree", "add"] for cmd in commands)
 
 
 def test_repo_manager_rejects_dirty_existing_worktree_for_retry(tmp_path):
@@ -255,6 +635,8 @@ def test_repo_manager_rejects_dirty_existing_worktree_for_retry(tmp_path):
 
     def run(cmd: list[str], cwd: Path | None = None) -> str:
         commands.append(cmd)
+        if cmd == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse", "origin/main"]:
+            return "abc1234\n"
         if cmd == ["git", "-C", str(existing), "branch", "--show-current"]:
             return "monica/MOB-123-checkout-crash\n"
         if cmd == ["git", "-C", str(existing), "status", "--porcelain"]:
@@ -285,6 +667,8 @@ def test_repo_manager_rejects_existing_worktree_on_unexpected_branch(tmp_path):
 
     def run(cmd: list[str], cwd: Path | None = None) -> str:
         commands.append(cmd)
+        if cmd == ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse", "origin/main"]:
+            return "abc1234\n"
         if cmd == ["git", "-C", str(existing), "branch", "--show-current"]:
             return "main\n"
         return ""
@@ -303,10 +687,20 @@ def test_repo_manager_rejects_existing_worktree_on_unexpected_branch(tmp_path):
             "git",
             "-C",
             str(tmp_path / "repos" / "mobile-app"),
-            "fetch",
+            "remote",
+            "get-url",
             "origin",
-            "main",
         ],
+        [
+            "git",
+            "-C",
+            str(tmp_path / "repos" / "mobile-app"),
+            "fetch",
+            "--prune",
+            "origin",
+        ],
+        ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "status", "--porcelain"],
+        ["git", "-C", str(tmp_path / "repos" / "mobile-app"), "rev-parse", "origin/main"],
         ["git", "-C", str(existing), "branch", "--show-current"],
     ]
 
@@ -318,10 +712,16 @@ def test_repo_manager_rejects_existing_worktree_directory_that_is_not_git_worktr
     stale_path = tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"
     stale_path.mkdir(parents=True)
 
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        commands.append(cmd)
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        return ""
+
     manager = RepoManager(
         config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
         workspace_root=tmp_path,
-        run_command=lambda cmd, cwd=None: commands.append(cmd) or "",
+        run_command=run,
     )
 
     with pytest.raises(RepoManagerError, match="worktree path exists but is not a git worktree"):
@@ -332,23 +732,39 @@ def test_repo_manager_rejects_existing_worktree_directory_that_is_not_git_worktr
             "git",
             "-C",
             str(repo_path),
-            "fetch",
+            "remote",
+            "get-url",
             "origin",
-            "main",
-        ]
+        ],
+        [
+            "git",
+            "-C",
+            str(repo_path),
+            "fetch",
+            "--prune",
+            "origin",
+        ],
+        ["git", "-C", str(repo_path), "status", "--porcelain"],
+        ["git", "-C", str(repo_path), "rev-parse", "origin/main"],
     ]
 
 
 def test_repo_manager_rejects_existing_worktree_file(tmp_path):
-    (tmp_path / "repos" / "mobile-app").mkdir(parents=True)
+    repo_path = tmp_path / "repos" / "mobile-app"
+    repo_path.mkdir(parents=True)
     stale_path = tmp_path / "worktrees" / "monica-MOB-123-checkout-crash"
     stale_path.parent.mkdir(parents=True)
     stale_path.write_text("not a worktree")
 
+    def run(cmd: list[str], cwd: Path | None = None) -> str:
+        if cmd == ["git", "-C", str(repo_path), "rev-parse", "origin/main"]:
+            return "abc1234\n"
+        return ""
+
     manager = RepoManager(
         config=RepoConfig(url="git@github.com:acme/mobile-app.git", local_name="mobile-app"),
         workspace_root=tmp_path,
-        run_command=lambda cmd, cwd=None: "",
+        run_command=run,
     )
 
     with pytest.raises(RepoManagerError, match="worktree path exists but is not a directory"):

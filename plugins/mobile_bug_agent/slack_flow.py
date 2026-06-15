@@ -242,7 +242,8 @@ class MonicaSlackFlow:
                     ),
                 }
 
-        if allowed and channel_id not in allowed:
+        is_direct_message = self._is_direct_message(event)
+        if allowed and channel_id not in allowed and not is_direct_message:
             return {
                 "action": "skip_reply",
                 "reason": "monica_channel_not_allowed",
@@ -402,6 +403,11 @@ class MonicaSlackFlow:
                         approved_by_user_id=user_id,
                         failure_reason="",
                         branch_name="",
+                        base_branch="",
+                        base_commit="",
+                        proof_deep_link="",
+                        proof_expected_text="",
+                        proof_screen="",
                         pr_url="",
                     )
                     _log_slack_flow("approved", approved, approved_by=user_id)
@@ -597,6 +603,11 @@ class MonicaSlackFlow:
             request_text=request_text,
             raw_event=raw if isinstance(raw, dict) else {},
             branch_name="",
+            base_branch="",
+            base_commit="",
+            proof_deep_link="",
+            proof_expected_text="",
+            proof_screen="",
             pr_url="",
             failure_reason="",
             approved_by_user_id="",

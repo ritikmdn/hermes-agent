@@ -45,6 +45,8 @@ def _mark_git_worktree(path: Path) -> Path:
 class FakeWorktree:
     path: Path
     branch_name: str = "monica/MOB-42-checkout-crash"
+    base_ref: str = ""
+    base_commit: str = ""
 
 
 def test_codex_worker_runs_in_worktree(tmp_path):
@@ -61,6 +63,42 @@ def test_codex_worker_runs_in_worktree(tmp_path):
     assert result["worktree"] == str(worktree)
     assert result["changed"] is True
     assert result["worker"] == "internal_agent"
+
+
+def test_codex_workers_return_worktree_base_metadata(tmp_path):
+    worktree_path = _mark_git_worktree(tmp_path / "worktree")
+    worktree = FakeWorktree(
+        path=worktree_path,
+        base_ref="origin/dev",
+        base_commit="abc1234",
+    )
+
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text("Changed marketplace PDP copy.", encoding="utf-8")
+        return ""
+
+    cli_result = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    ).run(
+        run=FakeRun(),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: Marketplace PDP copy is wrong",
+    )
+    internal_result = InternalCodexWorker(
+        config=MonicaConfig(),
+        agent_factory=FakeAgent,
+    ).run(
+        run=FakeRun(),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: Marketplace PDP copy is wrong",
+    )
+
+    assert cli_result["base_ref"] == "origin/dev"
+    assert cli_result["base_commit"] == "abc1234"
+    assert internal_result["base_ref"] == "origin/dev"
+    assert internal_result["base_commit"] == "abc1234"
 
 
 def test_codex_worker_uses_isolated_monica_session(tmp_path):
@@ -173,12 +211,41 @@ def test_codex_cli_worker_invokes_codex_exec_in_worktree(tmp_path):
     assert command[-1] == "-"
     assert cwd == worktree
     assert "You are Monica's code worker" in prompt
+    assert "marketplace copy/design fixes" in prompt
     assert "Do not push" in prompt
     assert "Android checkout crash" in prompt
     assert timeout == 420
     assert result["worker"] == "codex_cli"
     assert result["summary"] == "Changed via Codex CLI."
     assert result["output_file"].endswith("abc123.md")
+
+
+def test_codex_cli_worker_prompt_requires_both_proof_target_lines(tmp_path):
+    calls = []
+
+    def fake_run(command, cwd, prompt, timeout):
+        calls.append((command, cwd, prompt, timeout))
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text("Changed the marketplace PDP copy.", encoding="utf-8")
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: Marketplace PDP copy is wrong",
+    )
+
+    prompt = calls[0][2]
+    assert "must include both proof target final lines" in prompt
+    assert "Monica proof deep link: <url>" in prompt
+    assert "Monica proof expected text: <text visible on the fixed screen>" in prompt
+    assert "Monica proof screen: <route or screen name>" in prompt
 
 
 def test_codex_cli_worker_extracts_proof_deep_link_from_summary(tmp_path):
@@ -189,6 +256,7 @@ def test_codex_cli_worker_extracts_proof_deep_link_from_summary(tmp_path):
                 [
                     "Changed the offer PDP tags.",
                     "Monica proof deep link: elixir-card://marketplace/offer/fitness-first",
+                    "Monica proof expected text: Fitness First",
                 ]
             ),
             encoding="utf-8",
@@ -208,6 +276,256 @@ def test_codex_cli_worker_extracts_proof_deep_link_from_summary(tmp_path):
     )
 
     assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
+
+
+def test_codex_cli_worker_extracts_optional_proof_screen_from_summary(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: elixir-card://marketplace/offer/fitness-first",
+                    "Monica proof expected text: Fitness First",
+                    "Monica proof screen: /MarketplacePdp",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_screen"] == "/MarketplacePdp"
+
+
+def test_codex_cli_worker_ignores_placeholder_proof_expected_text(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: elixir-card://marketplace/offer/fitness-first",
+                    "Monica proof expected text: <text visible on the fixed screen>",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert "proof_expected_text" not in result
+
+
+def test_codex_cli_worker_extracts_bulleted_proof_target_lines(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "- Monica proof deep link: elixir-card://marketplace/offer/fitness-first",
+                    "- Monica proof expected text: Fitness First",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
+
+
+def test_codex_cli_worker_extracts_markdown_bold_proof_target_labels(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "- **Monica proof deep link:** elixir-card://marketplace/offer/fitness-first",
+                    "- **Monica proof expected text:** **Fitness First**.",
+                    "- **Monica proof screen:** `/MarketplacePdp`.",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
+    assert result["proof_screen"] == "/MarketplacePdp"
+
+
+def test_codex_cli_worker_normalizes_wrapped_proof_target_lines(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: <`elixir-card://marketplace/offer/fitness-first`>.",
+                    "Monica proof expected text: \"Fitness First\"",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
+
+
+def test_codex_cli_worker_trims_sentence_punctuation_after_wrapped_expected_text(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: elixir-card://marketplace/offer/fitness-first",
+                    "Monica proof expected text: `Fitness First`.",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_expected_text"] == "Fitness First"
+
+
+def test_codex_cli_worker_extracts_markdown_proof_deep_link(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: [PDP](elixir-card://marketplace/offer/fitness-first).",
+                    "Monica proof expected text: Fitness First",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
+
+
+def test_codex_cli_worker_extracts_markdown_proof_deep_link_with_spaced_label(tmp_path):
+    def fake_run(command, _cwd, _prompt, _timeout):
+        output_file = Path(command[command.index("--output-last-message") + 1])
+        output_file.write_text(
+            "\n".join(
+                [
+                    "Changed the offer PDP tags.",
+                    "Monica proof deep link: [Fitness First PDP](elixir-card://marketplace/offer/fitness-first)",
+                    "Monica proof expected text: Fitness First",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        return ""
+
+    worker = CodexCliWorker(
+        config=MonicaConfig(runtime=RuntimeConfig(home_subdir=str(tmp_path / "runtime"))),
+        run_command=fake_run,
+    )
+    worktree = _mark_git_worktree(tmp_path)
+
+    result = worker.run(
+        run=FakeRun(id="abc123"),
+        worktree=worktree,
+        brief="Slack thread: https://slack/thread\nBug: hard-coded PDP tags",
+    )
+
+    assert result["proof_deep_link"] == "elixir-card://marketplace/offer/fitness-first"
+    assert result["proof_expected_text"] == "Fitness First"
 
 
 def test_codex_cli_worker_requires_existing_worktree_before_invoking_codex(tmp_path):

@@ -16,9 +16,9 @@ class FakeAgent:
               "wants_linear": true,
               "wants_fix": true,
               "confidence": 0.92,
-              "summary": "Android checkout crashes after applying promo code",
+              "summary": "Android marketplace PDP title copy is wrong",
               "missing_questions": [],
-              "reason": "The tagged thread describes a reproducible Android app crash."
+              "reason": "The tagged thread describes a marketplace PDP copy bug in the React Native app."
             }"""
         }
 
@@ -45,14 +45,14 @@ class StringBooleanAgent:
 
 def test_classifier_parses_agent_json():
     result = IntentClassifier(agent_factory=lambda: FakeAgent()).classify(
-        request_text="@monica checkout crashes on Android after promo",
-        thread_text="U1: checkout crashes on Android after promo\nU2: Pixel 7, latest build",
+        request_text="@monica marketplace PDP title copy is wrong on Android, please fix it",
+        thread_text="U1: PDP title says Fitnes First\nU2: Pixel 7, latest build",
     )
 
     assert result.is_mobile_bug is True
     assert result.wants_linear is True
     assert result.wants_fix is True
-    assert result.summary.startswith("Android checkout")
+    assert result.summary.startswith("Android marketplace")
 
 
 def test_classifier_treats_string_false_booleans_as_false():
@@ -76,15 +76,15 @@ class RichAgent:
               "wants_linear": true,
               "wants_fix": false,
               "confidence": 0.87,
-              "summary": "Android checkout crashes after applying promo code",
-              "observed_behavior": "Checkout crashes after applying a promo code.",
-              "expected_behavior": "Checkout should keep the cart open and apply the discount.",
-              "reproduction_steps": ["Open checkout", "Apply a promo code", "Tap pay"],
+              "summary": "Android marketplace PDP title copy is misspelled",
+              "observed_behavior": "The marketplace PDP title shows misspelled copy.",
+              "expected_behavior": "The PDP title should show the approved marketplace copy.",
+              "reproduction_steps": ["Open the marketplace", "Open the affected PDP", "Check the title copy"],
               "platforms": ["Android"],
               "device_context": "Pixel 7 on latest build",
               "build_context": "2.14.0 beta",
               "missing_questions": [],
-              "reason": "Thread includes crash, platform, device, and reproduction context."
+              "reason": "Thread includes PDP copy, platform, device, and reproduction context."
             }"""
         }
 
@@ -114,13 +114,17 @@ class OverClarifyingAgent:
 
 def test_classifier_parses_rich_bug_context():
     result = IntentClassifier(agent_factory=lambda: RichAgent()).classify(
-        request_text="@monica checkout crashes on Android after promo",
-        thread_text="U1: checkout crashes after promo\nU2: Pixel 7, latest build 2.14.0 beta",
+        request_text="@monica marketplace PDP title copy is misspelled on Android",
+        thread_text="U1: PDP title says Fitnes First\nU2: Pixel 7, latest build 2.14.0 beta",
     )
 
-    assert result.observed_behavior == "Checkout crashes after applying a promo code."
-    assert result.expected_behavior == "Checkout should keep the cart open and apply the discount."
-    assert result.reproduction_steps == ("Open checkout", "Apply a promo code", "Tap pay")
+    assert result.observed_behavior == "The marketplace PDP title shows misspelled copy."
+    assert result.expected_behavior == "The PDP title should show the approved marketplace copy."
+    assert result.reproduction_steps == (
+        "Open the marketplace",
+        "Open the affected PDP",
+        "Check the title copy",
+    )
     assert result.platforms == ("Android",)
     assert result.device_context == "Pixel 7 on latest build"
     assert result.build_context == "2.14.0 beta"
@@ -241,10 +245,58 @@ def test_fallback_does_not_classify_android_web_bug_as_native_mobile_bug():
     assert "mobile" in result.missing_questions[0].lower()
 
 
+def test_fallback_does_not_classify_generic_checkout_crash_as_monica_scope():
+    result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
+        request_text="@monica Android checkout error after promo, please fix it",
+        thread_text="U1: Pixel 7 on 2.14.0 beta",
+    )
+
+    assert result.is_mobile_bug is False
+    assert result.wants_fix is True
+    assert result.needs_clarification is True
+    assert "marketplace copy/design" in result.missing_questions[0].lower()
+
+
+def test_fallback_does_not_classify_offer_card_crash_as_copy_design_scope():
+    result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
+        request_text="@monica Android offer card crashes when tapped, please fix it",
+        thread_text="U1: Pixel 7 on 2.14.0 beta",
+    )
+
+    assert result.is_mobile_bug is False
+    assert result.wants_fix is True
+    assert result.needs_clarification is True
+    assert "marketplace copy/design" in result.missing_questions[0].lower()
+
+
+def test_fallback_does_not_classify_marketplace_crash_as_copy_design_scope_even_with_copy_terms():
+    result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
+        request_text="@monica Android marketplace PDP crashes after loading promo copy, please fix it",
+        thread_text="U1: Pixel 7 on 2.14.0 beta",
+    )
+
+    assert result.is_mobile_bug is False
+    assert result.wants_fix is True
+    assert result.needs_clarification is True
+    assert "marketplace copy/design" in result.missing_questions[0].lower()
+
+
+def test_fallback_does_not_classify_marketplace_performance_as_copy_design_scope():
+    result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
+        request_text="@monica Android marketplace PDP layout performance bug is slow to load, please fix it",
+        thread_text="U1: Pixel 7 on 2.14.0 beta shows high latency on the PDP",
+    )
+
+    assert result.is_mobile_bug is False
+    assert result.wants_fix is True
+    assert result.needs_clarification is True
+    assert "marketplace copy/design" in result.missing_questions[0].lower()
+
+
 def test_fallback_keeps_question_only_mobile_bug_tag_actionless():
     result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
-        request_text="@monica any thoughts on this Android checkout crash?",
-        thread_text="U1: Pixel 7 on 2.14.0 beta",
+        request_text="@monica any thoughts on this Android marketplace PDP copy bug?",
+        thread_text="U1: Pixel 7 on 2.14.0 beta shows the PDP title typo",
     )
 
     assert result.is_mobile_bug is True
@@ -252,10 +304,10 @@ def test_fallback_keeps_question_only_mobile_bug_tag_actionless():
     assert result.wants_fix is False
 
 
-def test_fallback_classifies_clear_android_fix_request_as_mobile_bug():
+def test_fallback_classifies_clear_android_marketplace_copy_fix_request_as_mobile_bug():
     result = IntentClassifier(agent_factory=lambda: BadAgent()).classify(
-        request_text="@monica Android checkout error after promo, please fix it",
-        thread_text="U1: Pixel 7 on 2.14.0 beta",
+        request_text="@monica Android marketplace PDP title copy is wrong, please fix it",
+        thread_text="U1: Pixel 7 on 2.14.0 beta shows the PDP title typo",
     )
 
     assert result.is_mobile_bug is True

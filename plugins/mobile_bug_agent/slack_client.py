@@ -39,6 +39,13 @@ class SlackFile:
 
 
 @dataclass(frozen=True)
+class SlackUploadedFile:
+    id: str
+    name: str
+    permalink: str
+
+
+@dataclass(frozen=True)
 class SlackThreadContext:
     channel_id: str
     thread_ts: str
@@ -195,6 +202,53 @@ class SlackThreadClient:
         if _response_get(response, "ok") is False:
             error = str(_response_get(response, "error") or "unknown_error")
             raise SlackClientError(f"Slack chat_postMessage failed: {error}")
+
+    def upload_thread_file(
+        self,
+        *,
+        channel_id: str,
+        thread_ts: str,
+        file_path: str,
+        title: str,
+        initial_comment: str = "",
+    ) -> SlackUploadedFile:
+        path = Path(file_path)
+        if not path.is_file():
+            raise SlackClientError(f"Slack upload file does not exist: {path}")
+        clean_title = str(title or path.name).strip() or path.name
+        kwargs: dict[str, Any] = {
+            "channel": channel_id,
+            "thread_ts": thread_ts,
+            "file": str(path),
+            "title": clean_title,
+        }
+        comment = str(initial_comment or "").strip()
+        if comment:
+            kwargs["initial_comment"] = comment
+        uploader = getattr(self.client, "files_upload_v2", None)
+        if callable(uploader):
+            response = uploader(**kwargs)
+        else:
+            legacy_uploader = getattr(self.client, "files_upload", None)
+            if not callable(legacy_uploader):
+                raise SlackClientError("Slack client does not support file uploads.")
+            legacy_kwargs = dict(kwargs)
+            legacy_kwargs["channels"] = legacy_kwargs.pop("channel")
+            response = legacy_uploader(**legacy_kwargs)
+        if _response_get(response, "ok") is False:
+            error = str(_response_get(response, "error") or "unknown_error")
+            raise SlackClientError(f"Slack file upload failed: {error}")
+        payload = _uploaded_file_payload(response)
+        if not payload:
+            raise SlackClientError("Slack file upload did not return file metadata.")
+        permalink = str(payload.get("permalink_public") or payload.get("permalink") or "")
+        if not permalink:
+            raise SlackClientError("Slack file upload did not return a permalink.")
+        return SlackUploadedFile(
+            id=str(payload.get("id") or ""),
+            name=str(payload.get("name") or payload.get("title") or path.name),
+            permalink=permalink,
+        )
 
     def list_workspace_metadata(self, *, limit: int = 200) -> SlackWorkspaceMetadata:
         auth_response = self.client.auth_test()
@@ -397,6 +451,18 @@ def _response_next_cursor(response: Any) -> str:
     if cursor:
         return str(cursor).strip()
     return str(_response_get(response, "next_cursor", "") or "").strip()
+
+
+def _uploaded_file_payload(response: Any) -> dict[str, Any]:
+    file_payload = _response_get(response, "file")
+    if isinstance(file_payload, dict):
+        return file_payload
+    files_payload = _response_get(response, "files") or []
+    if isinstance(files_payload, list):
+        for item in files_payload:
+            if isinstance(item, dict):
+                return item
+    return {}
 
 
 def _unique_path(directory: Path, filename: str) -> Path:

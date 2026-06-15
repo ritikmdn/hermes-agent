@@ -69,6 +69,18 @@ class LinearAttachment:
     url: str
 
 
+@dataclass(frozen=True)
+class LinearCommentPayload:
+    issue_id: str
+    body: str
+
+
+@dataclass(frozen=True)
+class LinearComment:
+    id: str
+    url: str
+
+
 class LinearClient:
     API_URL = "https://api.linear.app/graphql"
 
@@ -126,6 +138,26 @@ class LinearClient:
         if attachment is None:
             raise LinearClientError(f"Linear attachment write failed: {data}")
         return attachment
+
+    def create_comment(self, payload: LinearCommentPayload) -> LinearComment:
+        if not self.api_key:
+            raise LinearClientError("LINEAR_API_KEY is not configured.")
+        if not payload.issue_id:
+            raise LinearClientError("Linear issue_id is required when creating a comment.")
+        if not payload.body.strip():
+            raise LinearClientError("Comment body is required.")
+
+        data = self._post_graphql(self._comment_body(payload))
+
+        if error_summary := _graphql_error_summary(data):
+            raise LinearClientError(f"Linear GraphQL error: {error_summary}")
+        if _mutation_success(data, "commentCreate") is False:
+            raise LinearClientError("Linear comment mutation did not report success.")
+
+        comment = self._extract_comment(data)
+        if comment is None:
+            raise LinearClientError(f"Linear comment write failed: {data}")
+        return comment
 
     def list_workspace_metadata(self) -> LinearWorkspaceMetadata:
         if not self.api_key:
@@ -205,6 +237,21 @@ class LinearClient:
         }
 
     @staticmethod
+    def _comment_body(payload: LinearCommentPayload) -> dict[str, Any]:
+        return {
+            "query": (
+                "mutation($input: CommentCreateInput!) "
+                "{ commentCreate(input: $input) { success comment { id url } } }"
+            ),
+            "variables": {
+                "input": {
+                    "issueId": payload.issue_id,
+                    "body": payload.body,
+                },
+            },
+        }
+
+    @staticmethod
     def _metadata_body() -> dict[str, Any]:
         return {
             "query": (
@@ -270,6 +317,16 @@ class LinearClient:
             id=str(attachment.get("id") or ""),
             title=str(attachment.get("title") or ""),
             url=str(attachment.get("url") or ""),
+        )
+
+    @staticmethod
+    def _extract_comment(data: dict[str, Any]) -> LinearComment | None:
+        comment = (((data.get("data") or {}).get("commentCreate") or {}).get("comment"))
+        if not isinstance(comment, dict) or not comment.get("id"):
+            return None
+        return LinearComment(
+            id=str(comment.get("id") or ""),
+            url=str(comment.get("url") or ""),
         )
 
 

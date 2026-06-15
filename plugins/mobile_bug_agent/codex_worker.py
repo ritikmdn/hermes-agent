@@ -54,9 +54,16 @@ class CodexCliWorker:
             "worker": "codex_cli",
             "output_file": str(output_file),
         }
+        result.update(_worktree_base_metadata(worktree))
         proof_deep_link = _extract_proof_deep_link(summary)
         if proof_deep_link:
             result["proof_deep_link"] = proof_deep_link
+        proof_expected_text = _extract_proof_expected_text(summary)
+        if proof_expected_text:
+            result["proof_expected_text"] = proof_expected_text
+        proof_screen = _extract_proof_screen(summary)
+        if proof_screen:
+            result["proof_screen"] = proof_screen
         return result
 
     def _command(self, *, worktree_path: Path, output_file: Path) -> list[str]:
@@ -137,9 +144,16 @@ class InternalCodexWorker:
             "worktree": str(worktree_path),
             "worker": "internal_agent",
         }
+        payload.update(_worktree_base_metadata(worktree))
         proof_deep_link = _extract_proof_deep_link(summary)
         if proof_deep_link:
             payload["proof_deep_link"] = proof_deep_link
+        proof_expected_text = _extract_proof_expected_text(summary)
+        if proof_expected_text:
+            payload["proof_expected_text"] = proof_expected_text
+        proof_screen = _extract_proof_screen(summary)
+        if proof_screen:
+            payload["proof_screen"] = proof_screen
         return payload
 
     def _agent(self, *, run_id: str) -> Any:
@@ -171,12 +185,17 @@ class InternalCodexWorker:
 def _system_prompt() -> str:
     return (
         "You are Monica's code worker for a React Native mobile app.\n"
+        "Handle only marketplace copy/design fixes for Monica.\n"
         "Work only inside the provided repository worktree.\n"
         "Fix the bug described in the brief with the smallest maintainable change.\n"
         "Add or update focused tests when the repo has a nearby pattern.\n"
         "Do not commit. Do not push. Do not create a pull request. Do not modify Hermes.\n"
-        "If you find a dev-client deep link or route that opens the affected screen, "
-        "include a final line exactly `Monica proof deep link: <url>`.\n"
+        "For marketplace copy/design fixes, your final response must include both proof "
+        "target final lines exactly, plus the optional screen line when you know the "
+        "route or screen name:\n"
+        "Monica proof deep link: <url>\n"
+        "Monica proof expected text: <text visible on the fixed screen>\n"
+        "Monica proof screen: <route or screen name>\n"
         "Stop and report blockers if the brief lacks enough information."
     )
 
@@ -199,14 +218,22 @@ def _read_text(path: Path) -> str:
         return ""
 
 
-_PROOF_DEEP_LINK_RE = re.compile(
-    r"(?im)^\s*Monica proof deep link\s*:\s*(?P<value>\S+)\s*$"
-)
+def _proof_target_re(label: str) -> re.Pattern[str]:
+    escaped = re.escape(label)
+    return re.compile(
+        rf"(?im)^\s*(?:[-*]\s*)?(?:\*\*{escaped}(?::\*\*|\*\*\s*:)|{escaped}\s*:)\s*(?P<value>.+?)\s*$"
+    )
+
+
+_PROOF_DEEP_LINK_RE = _proof_target_re("Monica proof deep link")
+_PROOF_EXPECTED_TEXT_RE = _proof_target_re("Monica proof expected text")
+_PROOF_SCREEN_RE = _proof_target_re("Monica proof screen")
+_MARKDOWN_LINK_RE = re.compile(r"^\[[^\]]+\]\((?P<url>[^)\s]+)\)$")
 
 
 def _extract_proof_deep_link(summary: str) -> str:
     for match in _PROOF_DEEP_LINK_RE.finditer(str(summary or "")):
-        value = match.group("value").strip()
+        value = _normalized_proof_deep_link_value(match.group("value"))
         if value.lower() in {"none", "n/a", "na", "unknown", "unavailable"}:
             continue
         if "://" in value or value.startswith(("exp+", "http://", "https://")):
@@ -214,11 +241,96 @@ def _extract_proof_deep_link(summary: str) -> str:
     return ""
 
 
+def _extract_proof_expected_text(summary: str) -> str:
+    for match in _PROOF_EXPECTED_TEXT_RE.finditer(str(summary or "")):
+        value = _normalized_proof_expected_text_value(match.group("value"))
+        if value.lower() in _UNUSABLE_PROOF_EXPECTED_TEXT_VALUES:
+            continue
+        return value
+    return ""
+
+
+def _extract_proof_screen(summary: str) -> str:
+    for match in _PROOF_SCREEN_RE.finditer(str(summary or "")):
+        value = _normalized_proof_screen_value(match.group("value"))
+        if value.lower() in _UNUSABLE_PROOF_SCREEN_VALUES:
+            continue
+        return value
+    return ""
+
+
+def _normalized_proof_deep_link_value(value: str) -> str:
+    text = _normalized_proof_line_value(value, trim_sentence_punctuation=True)
+    match = _MARKDOWN_LINK_RE.fullmatch(text)
+    if match:
+        text = _normalized_proof_line_value(
+            match.group("url"),
+            trim_sentence_punctuation=True,
+        )
+    return text
+
+
+def _normalized_proof_expected_text_value(value: str) -> str:
+    text = str(value or "").strip()
+    while len(text) >= 2 and text[-1] in ".,;" and text[-2] in "*`>\"'":
+        text = text[:-1].strip()
+    return _normalized_proof_line_value(text)
+
+
+def _normalized_proof_screen_value(value: str) -> str:
+    return _normalized_proof_line_value(value, trim_sentence_punctuation=True)
+
+
+def _normalized_proof_line_value(value: str, *, trim_sentence_punctuation: bool = False) -> str:
+    text = str(value or "").strip()
+    wrappers = (("**", "**"), ("`", "`"), ("<", ">"), ('"', '"'), ("'", "'"))
+    while text:
+        original = text
+        if trim_sentence_punctuation:
+            text = text.rstrip(".,;").strip()
+        for opener, closer in wrappers:
+            if len(text) >= 2 and text.startswith(opener) and text.endswith(closer):
+                text = text[len(opener) : -len(closer)].strip()
+        if text == original:
+            break
+    return text
+
+
+_UNUSABLE_PROOF_EXPECTED_TEXT_VALUES = {
+    "n/a",
+    "na",
+    "none",
+    "text visible on fixed screen",
+    "text visible on the fixed screen",
+    "unknown",
+    "unavailable",
+}
+_UNUSABLE_PROOF_SCREEN_VALUES = {
+    "n/a",
+    "na",
+    "none",
+    "route or screen name",
+    "unknown",
+    "unavailable",
+}
+
+
 def _require_worktree(path: Path) -> None:
     if not path.is_dir():
         raise CodexWorkerError(f"worktree does not exist: {path}")
     if not (path / ".git").exists():
         raise CodexWorkerError(f"worktree is not a git worktree: {path}")
+
+
+def _worktree_base_metadata(worktree: Any) -> dict[str, str]:
+    metadata: dict[str, str] = {}
+    base_ref = str(getattr(worktree, "base_ref", "") or "").strip()
+    base_commit = str(getattr(worktree, "base_commit", "") or "").strip()
+    if base_ref:
+        metadata["base_ref"] = base_ref
+    if base_commit:
+        metadata["base_commit"] = base_commit
+    return metadata
 
 
 def _require_expected_branch(*, run: Any, worktree: Any) -> None:

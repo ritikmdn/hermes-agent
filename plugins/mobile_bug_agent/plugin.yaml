@@ -4,3 +4,5 @@ description: "Agentic Slack-to-Linear mobile bug loop. Docs: docs/monica-agent.m
 author: "NousResearch"
 hooks:
   - pre_gateway_dispatch
+  - pre_update
+  - post_update

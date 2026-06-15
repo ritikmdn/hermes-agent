@@ -52,7 +52,9 @@ class ProofConfig:
     required_for_done: bool = False
     platform_order: tuple[str, ...] = ("ios", "android")
     artifact_dir: str = "proof"
+    setup_commands: tuple[str, ...] = ()
     commands: tuple[str, ...] = ()
+    required_env_keys: tuple[str, ...] = ()
     deep_link: str = ""
     dev_client_scheme: str = ""
     ios_simulator_udid: str = ""
@@ -183,7 +185,9 @@ def config_from_mapping(data: Mapping[str, Any] | None) -> MonicaConfig:
             required_for_done=_as_bool(proof.get("required_for_done"), False),
             platform_order=_as_tuple(proof.get("platform_order")) or ("ios", "android"),
             artifact_dir=str(proof.get("artifact_dir") or "proof").strip() or "proof",
+            setup_commands=_as_tuple(proof.get("setup_commands")),
             commands=_as_tuple(proof.get("commands")),
+            required_env_keys=_as_tuple(proof.get("required_env_keys")),
             deep_link=str(proof.get("deep_link") or "").strip(),
             dev_client_scheme=str(proof.get("dev_client_scheme") or "").strip(),
             ios_simulator_udid=str(proof.get("ios_simulator_udid") or "").strip(),

@@ -37,7 +37,7 @@ from plugins.mobile_bug_agent.config import (
     WorkerConfig,
     config_from_mapping,
 )
-from plugins.mobile_bug_agent.state import MonicaState
+from plugins.mobile_bug_agent.state import MonicaState, RUNTIME_SYNC_BLOCKING_STATUSES
 
 
 def test_status_lists_recent_runs(tmp_path, capsys):
@@ -102,11 +102,21 @@ def test_status_json_lists_recent_runs(tmp_path, capsys):
         linear_identifier="MOB-123",
         linear_url="https://linear.app/acme/issue/MOB-123",
         branch_name="monica/MOB-123-checkout-crash",
+        base_branch="origin/dev",
+        base_commit="abc123base",
+        proof_deep_link="elixir-card://marketplace/offer/fitness-first",
+        proof_expected_text="Fitness First",
     )
 
-    exit_code = run_status_command(state=state, limit=5, json_output=True)
+    exit_code = run_status_command(
+        state=state,
+        limit=5,
+        json_output=True,
+        current_commit="fed67890",
+    )
 
-    payload = json.loads(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
     assert exit_code == 0
     assert payload["count"] == 1
     assert payload["runs"][0]["id"] == run.id
@@ -114,7 +124,155 @@ def test_status_json_lists_recent_runs(tmp_path, capsys):
     assert payload["runs"][0]["slack"]["channel_id"] == "C123"
     assert payload["runs"][0]["linear"]["identifier"] == "MOB-123"
     assert payload["runs"][0]["branch_name"] == "monica/MOB-123-checkout-crash"
+    assert payload["runs"][0]["base"] == {
+        "ref": "origin/dev",
+        "commit": "abc123base",
+    }
+    assert payload["runs"][0]["proof_target"] == {
+        "deep_link": "elixir-card://marketplace/offer/fitness-first",
+        "expected_text": "Fitness First",
+    }
     assert payload["runs"][0]["request_text"] == "@monica checkout crash"
+
+
+def test_status_json_reports_runtime_sync_guard(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    state.record_runtime_sync(commit="abc12345", synced_at="2026-06-13T10:00:00Z")
+    active = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U1",
+        request_text="@monica checkout crash",
+    )
+    state.update_run(active.id, status="proofing", linear_identifier="MOB-123")
+    waiting = state.create_run(
+        platform="slack",
+        channel_id="C456",
+        thread_ts="1710000001.000100",
+        message_ts="1710000001.000100",
+        user_id="U2",
+        request_text="@monica another bug",
+    )
+    state.update_run(waiting.id, status="awaiting_fix_approval", linear_identifier="MOB-456")
+
+    exit_code = run_status_command(
+        state=state,
+        limit=5,
+        json_output=True,
+        current_commit="fed67890",
+    )
+
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert exit_code == 0
+    assert payload["runtime_sync"]["idle"] is False
+    assert payload["runtime_sync"]["current_commit"] == "fed67890"
+    assert payload["runtime_sync"]["stale"] is True
+    assert payload["runtime_sync"]["last_synced_commit"] == "abc12345"
+    assert payload["runtime_sync"]["last_synced_at"] == "2026-06-13T10:00:00Z"
+    assert payload["runtime_sync"]["blocking_statuses"] == list(RUNTIME_SYNC_BLOCKING_STATUSES)
+    assert payload["runtime_sync"]["active_run_count"] == 2
+    assert payload["runtime_sync"]["active_runs"][0]["id"] == active.id
+    assert payload["runtime_sync"]["active_runs"][0]["status"] == "proofing"
+    assert payload["runtime_sync"]["active_runs"][1]["id"] == waiting.id
+    assert payload["runtime_sync"]["active_runs"][1]["status"] == "awaiting_fix_approval"
+
+
+def test_status_json_reports_gateway_health_and_commit(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+
+    exit_code = run_status_command(
+        state=state,
+        limit=5,
+        json_output=True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": 2,
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["health"] == {
+        "hermes_commit": "abc12345",
+        "gateway": {
+            "state": "running",
+            "pid": 1234,
+            "active_agents": 2,
+            "start_time": 100.0,
+            "uptime_seconds": 60,
+            "updated_at": "2026-06-13T00:00:00Z",
+            "updated_age_seconds": 0,
+            "stale": False,
+        },
+    }
+
+
+def test_status_json_tolerates_malformed_gateway_active_agents(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+
+    exit_code = run_status_command(
+        state=state,
+        limit=5,
+        json_output=True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": "not-an-int",
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["health"]["gateway"]["active_agents"] == 0
+
+
+def test_status_text_reports_health_and_runtime_sync(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    state.record_runtime_sync(commit="c0ffee12", synced_at="2026-06-13T10:00:00Z")
+    active = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(active.id, status="proofing", linear_identifier="MOB-123")
+
+    exit_code = run_status_command(
+        state=state,
+        limit=5,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": 2,
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Hermes commit: abc12345" in out
+    assert "Gateway: running pid:1234 uptime:60s active_agents:2" in out
+    assert "Runtime sync: blocked active_runs:1 last_commit:c0ffee12 last_synced:2026-06-13T10:00:00Z" in out
+    assert "stale:true" in out
+    assert "blocked_by:MOB-123/proofing" in out
+    assert "marketplace PDP copy bug" in out
 
 
 def test_show_missing_run_returns_error(tmp_path, capsys):
@@ -290,6 +448,99 @@ def test_retry_proof_blocked_run_resumes_from_proof_gate(tmp_path, capsys, monke
     assert f"Retried Monica run {run.id}" in capsys.readouterr().out
 
 
+def test_retry_approved_pr_proof_blocked_run_refuses_when_readiness_check_fails(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="T1",
+        message_ts="T1",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(
+        run.id,
+        status="proof_blocked",
+        failure_reason="proof_unavailable: proof.setup_commands is empty",
+        branch_name="monica/MOB-123-marketplace-copy-bug",
+        approved_by_user_id="U_APPROVER",
+    )
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = run_retry_command(
+        state=state,
+        run_id=run.id,
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(approver_user_ids=("U_APPROVER",)),
+        ),
+        readiness_checker=lambda: 1,
+    )
+
+    updated = state.get_run(run.id)
+    out = capsys.readouterr().out
+    assert updated is not None
+    assert exit_code == 1
+    assert updated.status == "proof_blocked"
+    assert updated.failure_reason == "proof_unavailable: proof.setup_commands is empty"
+    assert updated.branch_name == "monica/MOB-123-marketplace-copy-bug"
+    assert launched == []
+    assert "Monica readiness check failed" in out
+
+
+def test_retry_approved_pr_proof_blocked_run_refuses_unconfigured_stored_approver(
+    tmp_path,
+    capsys,
+    monkeypatch,
+):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="T1",
+        message_ts="T1",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(
+        run.id,
+        status="proof_blocked",
+        failure_reason="proof_unavailable: simulator not configured",
+        branch_name="monica/MOB-123-marketplace-copy-bug",
+        approved_by_user_id="U_OLD_APPROVER",
+    )
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = run_retry_command(
+        state=state,
+        run_id=run.id,
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(approver_user_ids=("U_CURRENT_APPROVER",)),
+        ),
+        readiness_checker=lambda: 0,
+    )
+
+    updated = state.get_run(run.id)
+    out = capsys.readouterr().out
+    assert updated is not None
+    assert exit_code == 1
+    assert updated.status == "proof_blocked"
+    assert updated.failure_reason == "proof_unavailable: simulator not configured"
+    assert updated.branch_name == "monica/MOB-123-marketplace-copy-bug"
+    assert updated.approved_by_user_id == "U_OLD_APPROVER"
+    assert launched == []
+    assert "stored approver U_OLD_APPROVER is not configured" in out
+
+
 def test_retry_interrupted_proofing_run_resumes_from_proof_gate(tmp_path, capsys, monkeypatch):
     state = MonicaState.open(tmp_path / "state.sqlite")
     run = state.create_run(
@@ -458,6 +709,70 @@ def test_retry_approved_run_refuses_when_readiness_check_fails(tmp_path, capsys,
     assert "Monica readiness check failed" in out
 
 
+def test_mobile_command_retry_refuses_when_plugin_is_not_enabled(
+    tmp_path, capsys, monkeypatch
+):
+    runtime = tmp_path / "monica-runtime"
+    config = MonicaConfig(
+        enabled=True,
+        rollout_mode="approved_pr",
+        runtime=RuntimeConfig(home_subdir=str(runtime)),
+        slack=SlackConfig(approver_user_ids=("U_APPROVER",)),
+    )
+    state = MonicaState.open(runtime / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="T1",
+        message_ts="T1",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(
+        run.id,
+        status="failed",
+        failure_reason="opening_pr_failed: gh pr create failed",
+        approved_by_user_id="U_APPROVER",
+    )
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value=str(runtime),
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {"enabled": ["other-plugin"], "disabled": []},
+        "mobile_bug_agent": {"enabled": True, "rollout_mode": "approved_pr"},
+    }
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "load_monica_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(mobile_bug_agent_action="retry", run_id=run.id, json=True)
+    )
+
+    updated = state.get_run(run.id)
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert updated is not None
+    assert exit_code == 1
+    assert updated.status == "failed"
+    assert updated.failure_reason == "opening_pr_failed: gh pr create failed"
+    assert updated.approved_by_user_id == "U_APPROVER"
+    assert launched == []
+    assert payload["error"]["code"] == "readiness_failed"
+
+
 def test_retry_refuses_run_that_already_has_pr_url(tmp_path, capsys, monkeypatch):
     state = MonicaState.open(tmp_path / "state.sqlite")
     run = state.create_run(
@@ -507,14 +822,27 @@ def test_retry_clears_stale_branch_metadata_before_relaunch(tmp_path, capsys, mo
         status="failed",
         failure_reason="opening_pr_failed: stale gh failure",
         branch_name="monica/old-branch",
+        base_branch="origin/dev",
+        base_commit="abc1234",
+        proof_deep_link="elixir-card://marketplace/offer/old-offer",
+        proof_expected_text="Old Offer",
     )
-    relaunched_state: list[tuple[str, str, str, str]] = []
+    relaunched_state: list[tuple[str, str, str, str, str, str, str, str]] = []
 
     def fake_run_loop(run_id: str, *, state: MonicaState) -> None:
         current = state.get_run(run_id)
         assert current is not None
         relaunched_state.append(
-            (current.status, current.failure_reason, current.branch_name, current.pr_url)
+            (
+                current.status,
+                current.failure_reason,
+                current.branch_name,
+                current.base_branch,
+                current.base_commit,
+                current.proof_deep_link,
+                current.proof_expected_text,
+                current.pr_url,
+            )
         )
 
     monkeypatch.setattr(cli, "_run_loop", fake_run_loop)
@@ -527,8 +855,12 @@ def test_retry_clears_stale_branch_metadata_before_relaunch(tmp_path, capsys, mo
     assert updated.status == "queued"
     assert updated.failure_reason == ""
     assert updated.branch_name == ""
+    assert updated.base_branch == ""
+    assert updated.base_commit == ""
+    assert updated.proof_deep_link == ""
+    assert updated.proof_expected_text == ""
     assert updated.pr_url == ""
-    assert relaunched_state == [("queued", "", "", "")]
+    assert relaunched_state == [("queued", "", "", "", "", "", "", "")]
     assert f"Retried Monica run {run.id}" in capsys.readouterr().out
 
 
@@ -645,7 +977,8 @@ def test_approve_json_unconfigured_user_outputs_error(tmp_path, capsys, monkeypa
     )
 
     updated = state.get_run(run.id)
-    payload = json.loads(capsys.readouterr().out)
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
     assert updated is not None
     assert exit_code == 1
     assert updated.status == "awaiting_fix_approval"
@@ -724,6 +1057,70 @@ def test_approve_refuses_approved_pr_when_readiness_check_fails(tmp_path, capsys
     assert "Monica readiness check failed" in out
 
 
+def test_mobile_command_approve_refuses_when_plugin_is_not_enabled(
+    tmp_path, capsys, monkeypatch
+):
+    runtime = tmp_path / "monica-runtime"
+    config = MonicaConfig(
+        enabled=True,
+        rollout_mode="approved_pr",
+        runtime=RuntimeConfig(home_subdir=str(runtime)),
+        slack=SlackConfig(approver_user_ids=("U_APPROVER",)),
+    )
+    state = MonicaState.open(runtime / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="T1",
+        message_ts="T1",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value=str(runtime),
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {"enabled": ["other-plugin"], "disabled": []},
+        "mobile_bug_agent": {"enabled": True, "rollout_mode": "approved_pr"},
+    }
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "load_monica_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(
+            mobile_bug_agent_action="approve",
+            run_id=run.id,
+            user_id="U_APPROVER",
+            json=True,
+        )
+    )
+
+    updated = state.get_run(run.id)
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert updated is not None
+    assert exit_code == 1
+    assert updated.status == "awaiting_fix_approval"
+    assert updated.approved_by_user_id == ""
+    assert launched == []
+    assert payload["error"]["code"] == "readiness_failed"
+    assert payload["run"]["id"] == run.id
+
+
 def test_approve_does_not_launch_when_atomic_approval_already_changed(tmp_path, capsys, monkeypatch):
     state = MonicaState.open(tmp_path / "state.sqlite")
     run = state.create_run(
@@ -784,7 +1181,7 @@ def test_sync_approvals_reads_slack_thread_and_invokes_loop(tmp_path, capsys, mo
             return SimpleNamespace(
                 messages=[
                     SimpleNamespace(ts="1710000000.000100", user_id="U_REPORTER", text="@monica checkout crash"),
-                    SimpleNamespace(ts="1710000001.000100", user_id="U_APPROVER", text="approved, fix it"),
+                    SimpleNamespace(ts="4102444800.000100", user_id="U_APPROVER", text="<@BMONICA> approved, fix it"),
                 ]
             )
 
@@ -819,11 +1216,11 @@ def test_sync_approvals_reads_slack_thread_and_invokes_loop(tmp_path, capsys, mo
     assert updated.approved_by_user_id == "U_APPROVER"
     assert payload == {
         "ok": True,
-        "results": [
-            {
-                "action": "approved",
-                "approval_message_ts": "1710000001.000100",
-                "approved_by_user_id": "U_APPROVER",
+                "results": [
+                    {
+                        "action": "approved",
+                        "approval_message_ts": "4102444800.000100",
+                        "approved_by_user_id": "U_APPROVER",
                 "channel_id": "C123",
                 "final_status": "done",
                 "pr_url": "https://github.com/acme/mobile/pull/123",
@@ -833,6 +1230,147 @@ def test_sync_approvals_reads_slack_thread_and_invokes_loop(tmp_path, capsys, mo
             }
         ],
     }
+
+
+def test_sync_approvals_requires_recovered_approval_to_tag_monica(tmp_path, capsys, monkeypatch):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U_REPORTER",
+        request_text="@monica checkout crash",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "monica_slack_bot_token", lambda: "xoxb-token")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    class FakeClient:
+        def __init__(self, **_: Any):
+            pass
+
+        def read_thread(self, **_: Any):
+            return SimpleNamespace(
+                messages=[
+                    SimpleNamespace(
+                        ts="4102444800.000100",
+                        user_id="U_APPROVER",
+                        text="approved, fix it",
+                    ),
+                ]
+            )
+
+    exit_code = run_sync_approvals_command(
+        config=MonicaConfig(
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                approver_user_ids=("U_APPROVER",),
+                bot_user_ids=("BMONICA",),
+            ),
+        ),
+        state=state,
+        run_id=run.id,
+        json_output=True,
+        client_factory=FakeClient,
+        readiness_checker=lambda: 0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    updated = state.get_run(run.id)
+    assert updated is not None
+    assert exit_code == 0
+    assert launched == []
+    assert updated.status == "awaiting_fix_approval"
+    assert updated.approved_by_user_id == ""
+    assert payload["ok"] is True
+    assert payload["results"][0]["action"] == "skipped"
+    assert payload["results"][0]["reason"] == "no configured approver approval found in Slack thread"
+
+
+def test_mobile_command_sync_approvals_refuses_when_plugin_is_not_enabled(
+    tmp_path, capsys, monkeypatch
+):
+    runtime = tmp_path / "monica-runtime"
+    config = MonicaConfig(
+        enabled=True,
+        rollout_mode="approved_pr",
+        runtime=RuntimeConfig(home_subdir=str(runtime)),
+        slack=SlackConfig(approver_user_ids=("U_APPROVER",), bot_user_ids=("BMONICA",)),
+    )
+    state = MonicaState.open(runtime / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U_REPORTER",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value=str(runtime),
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {"enabled": ["other-plugin"], "disabled": []},
+        "mobile_bug_agent": {"enabled": True, "rollout_mode": "approved_pr"},
+    }
+    launched: list[str] = []
+
+    class FakeClient:
+        def __init__(self, **_kwargs):
+            pass
+
+        def read_thread(self, *, channel_id, thread_ts, limit):
+            return SimpleNamespace(
+                messages=[
+                    SimpleNamespace(ts="1710000000.000100", user_id="U_REPORTER", text="@monica bug"),
+                    SimpleNamespace(ts="4102444800.000100", user_id="U_APPROVER", text="<@BMONICA> approved, fix it"),
+                ]
+            )
+
+    monkeypatch.setattr(cli, "load_monica_config", lambda: config)
+    monkeypatch.setattr(cli, "monica_slack_bot_token", lambda: "xoxb-token")
+    monkeypatch.setitem(
+        cli.run_sync_approvals_command.__kwdefaults__,
+        "client_factory",
+        FakeClient,
+    )
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(
+            mobile_bug_agent_action="sync_approvals",
+            run_id=run.id,
+            limit=20,
+            json=True,
+        )
+    )
+
+    updated = state.get_run(run.id)
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert updated is not None
+    assert exit_code == 1
+    assert updated.status == "awaiting_fix_approval"
+    assert updated.approved_by_user_id == ""
+    assert launched == []
+    assert payload["ok"] is False
+    assert payload["results"][0]["action"] == "error"
+    assert payload["results"][0]["error"]["code"] == "readiness_failed"
 
 
 def test_sync_approvals_ignores_non_approver_and_question_text(tmp_path, capsys, monkeypatch):
@@ -857,9 +1395,59 @@ def test_sync_approvals_ignores_non_approver_and_question_text(tmp_path, capsys,
         def read_thread(self, **_: Any):
             return SimpleNamespace(
                 messages=[
-                    SimpleNamespace(ts="1710000001.000100", user_id="U_RANDOM", text="approved, fix it"),
-                    SimpleNamespace(ts="1710000002.000100", user_id="U_APPROVER", text="should I approve?"),
-                    SimpleNamespace(ts="1710000003.000100", user_id="U_APPROVER", text="not approved"),
+                    SimpleNamespace(ts="4102444800.000100", user_id="U_RANDOM", text="approved, fix it"),
+                    SimpleNamespace(ts="4102444801.000100", user_id="U_APPROVER", text="should I approve?"),
+                    SimpleNamespace(ts="4102444802.000100", user_id="U_APPROVER", text="not approved"),
+                ]
+            )
+
+    exit_code = run_sync_approvals_command(
+        config=MonicaConfig(slack=SlackConfig(approver_user_ids=("U_APPROVER",))),
+        state=state,
+        run_id=run.id,
+        json_output=True,
+        client_factory=FakeClient,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    updated = state.get_run(run.id)
+    assert updated is not None
+    assert exit_code == 0
+    assert launched == []
+    assert updated.status == "awaiting_fix_approval"
+    assert updated.approved_by_user_id == ""
+    assert payload["ok"] is True
+    assert payload["results"][0]["action"] == "skipped"
+    assert payload["results"][0]["reason"] == "no configured approver approval found in Slack thread"
+
+
+def test_sync_approvals_ignores_approval_that_predates_waiting_state(tmp_path, capsys, monkeypatch):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U_REPORTER",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(run.id, status="awaiting_fix_approval", linear_identifier="MOB-123")
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "monica_slack_bot_token", lambda: "xoxb-token")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    class FakeClient:
+        def __init__(self, **_: Any):
+            pass
+
+        def read_thread(self, **_: Any):
+            return SimpleNamespace(
+                messages=[
+                    SimpleNamespace(
+                        ts="1710000001.000100",
+                        user_id="U_APPROVER",
+                        text="approved, fix it",
+                    ),
                 ]
             )
 
@@ -1164,6 +1752,64 @@ def test_simulate_refuses_side_effect_rollout_when_readiness_check_fails(tmp_pat
     assert state.list_runs() == []
     assert launched == []
     assert "Monica readiness check failed" in out
+
+
+def test_mobile_command_simulate_refuses_side_effects_when_plugin_is_not_enabled(
+    tmp_path, capsys, monkeypatch
+):
+    runtime = tmp_path / "monica-runtime"
+    config = MonicaConfig(
+        enabled=True,
+        rollout_mode="approved_pr",
+        runtime=RuntimeConfig(home_subdir=str(runtime)),
+        slack=SlackConfig(
+            allowed_channels=("C123MOBILE",),
+            bot_user_ids=("U123MONICA",),
+            approver_user_ids=("U_APPROVER",),
+        ),
+    )
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value=str(runtime),
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {"enabled": ["other-plugin"], "disabled": []},
+        "mobile_bug_agent": {"enabled": True, "rollout_mode": "approved_pr"},
+    }
+    launched: list[str] = []
+    monkeypatch.setattr(cli, "load_monica_config", lambda: config)
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+    monkeypatch.setattr(cli, "_run_loop", lambda run_id, *, state: launched.append(run_id))
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(
+            mobile_bug_agent_action="simulate",
+            text=["@monica", "marketplace", "PDP", "copy", "bug"],
+            channel_id="C123MOBILE",
+            user_id="U_REPORTER",
+            thread_ts="",
+            allow_side_effects=True,
+            json=True,
+        )
+    )
+
+    state = MonicaState.open(runtime / "state.sqlite")
+    out = capsys.readouterr().out
+    payload = json.loads(out.strip().splitlines()[-1])
+    assert exit_code == 1
+    assert state.list_runs() == []
+    assert launched == []
+    assert payload["error"]["code"] == "readiness_failed"
 
 
 def test_simulate_json_reports_readiness_failure_without_creating_run(tmp_path, capsys):
@@ -1582,6 +2228,7 @@ def test_slack_manifest_outputs_required_monica_app_manifest(capsys):
         "im:read",
         "chat:write",
         "files:read",
+        "files:write",
     ]
 
 
@@ -1598,6 +2245,7 @@ def test_slack_manifest_omits_files_scope_when_attachment_downloads_disabled(cap
     assert manifest["display_information"]["name"] == "Monica"
     assert manifest["features"]["bot_user"]["display_name"] == "monica"
     assert "files:read" not in scopes
+    assert "files:write" in scopes
 
 
 def test_linear_metadata_json_outputs_teams_projects_and_labels(capsys):
@@ -1912,6 +2560,7 @@ def test_setup_plan_json_has_no_steps_when_rollout_is_ready(capsys):
         },
         which=lambda command: f"/usr/bin/{command}",
         module_available=lambda name: True,
+        gateway_status={},
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -1920,7 +2569,443 @@ def test_setup_plan_json_has_no_steps_when_rollout_is_ready(capsys):
     assert payload["steps"] == []
 
 
-def test_setup_plan_json_lists_proof_warning_steps_when_rollout_is_ready(capsys):
+def test_setup_plan_json_lists_gateway_step_when_gateway_is_stopped(capsys):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="linear_only",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+        ),
+        target_rollout_mode="linear_only",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "stopped",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "2026-06-12T18:12:10Z",
+        },
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["ready"] is True
+    assert payload["warnings"] == [
+        {
+            "code": "gateway_not_running",
+            "message": (
+                "Monica gateway is stopped; live Slack tag/DM intake and approvals "
+                "will not be received until the gateway is running."
+            ),
+        }
+    ]
+    assert payload["health"]["gateway"]["state"] == "stopped"
+    assert payload["steps"] == [
+        {
+            "id": "start_gateway",
+            "title": "Start Monica's Slack gateway",
+            "command": "hermes gateway start",
+            "why": (
+                "The gateway must be running for live Slack tag/DM intake and approvals; "
+                "doctor will keep warning until it is running."
+            ),
+        },
+        {
+            "id": "rerun_doctor",
+            "title": "Re-run the rollout readiness check",
+            "command": "hermes mobile-bug-agent doctor --rollout-mode linear_only --json",
+            "why": "Only continue to a live Slack test once Monica reports ready.",
+        },
+    ]
+
+
+def test_setup_plan_json_lists_supervised_gateway_install_for_approved_pr_when_gateway_is_stopped(
+    capsys,
+):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof"),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "stopped",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "2026-06-12T18:12:10Z",
+        },
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert step_ids == ["install_gateway_service", "rerun_doctor"]
+    assert payload["steps"][0] == {
+        "id": "install_gateway_service",
+        "title": "Install Monica's supervised Slack gateway",
+        "command": "hermes gateway install",
+        "why": (
+            "Approved PR work depends on live Slack tag/DM intake and approvals. "
+            "Install the profile-aware gateway service so Monica stays running "
+            "under the platform supervisor."
+        ),
+    }
+
+
+def test_setup_plan_json_lists_supervised_gateway_install_for_manual_approved_pr_gateway(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_service_status",
+        lambda: {
+            "available": True,
+            "manager": "manual process",
+            "service_installed": False,
+            "service_running": False,
+            "gateway_pids": [53960],
+            "service_scope": None,
+            "supervised": False,
+        },
+        raising=False,
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof"),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert step_ids == ["install_gateway_service", "rerun_doctor"]
+    assert payload["steps"][0]["command"] == "hermes gateway install"
+
+
+def test_setup_plan_json_lists_gateway_restart_step_when_gateway_status_is_stale(capsys):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": "app_mentions:read,chat:write,channels:history,files:read,files:write",
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "1970-01-01T00:00:00Z",
+        },
+        now=2000.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_status_stale",
+        "message": (
+            "Monica gateway status is stale; live Slack tag/DM intake and approvals "
+            "may not be received until the gateway heartbeat is fresh."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["stale"] is True
+    assert step_ids == ["restart_gateway", "rerun_doctor"]
+    assert payload["steps"][0] == {
+        "id": "restart_gateway",
+        "title": "Restart Monica's Slack gateway",
+        "command": "hermes gateway restart",
+        "why": (
+            "The gateway heartbeat is stale, so restart it before relying on "
+            "live Slack tag/DM intake or approvals."
+        ),
+    }
+
+
+def test_setup_plan_json_lists_gateway_restart_step_when_gateway_runtime_metadata_is_missing(capsys):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": "app_mentions:read,chat:write,channels:history,files:read,files:write",
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_runtime_metadata_missing",
+        "message": (
+            "Monica gateway runtime metadata is incomplete; restart the gateway "
+            "so doctor can verify uptime before approved_pr work runs."
+        ),
+    } in payload["failures"]
+    assert step_ids == ["restart_gateway", "rerun_doctor"]
+    assert payload["steps"][0] == {
+        "id": "restart_gateway",
+        "title": "Restart Monica's Slack gateway",
+        "command": "hermes gateway restart",
+        "why": (
+            "The gateway heartbeat or runtime metadata is incomplete, so restart it "
+            "before relying on live Slack tag/DM intake or approvals."
+        ),
+    }
+
+
+def test_setup_plan_json_lists_plugin_enable_step_when_plugin_is_not_enabled(
+    monkeypatch, capsys
+):
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value="/tmp/monica",
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {
+            "enabled": ["other-plugin"],
+            "disabled": [],
+        },
+        "mobile_bug_agent": {
+            "enabled": True,
+            "rollout_mode": "approved_pr",
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(mobile_bug_agent_action="setup_plan", rollout_mode="approved_pr", json=True)
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "plugin_not_enabled",
+        "message": (
+            "plugins.enabled must include mobile-bug-agent and plugins.disabled must not; "
+            "otherwise Monica's Slack gateway hooks will not load."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["plugin"]["enabled"] is False
+    assert payload["steps"][0] == {
+        "id": "enable_mobile_bug_agent_plugin",
+        "title": "Enable the Monica plugin",
+        "command": "hermes plugins enable mobile-bug-agent",
+        "why": (
+            "The gateway only loads Monica's Slack intake, approval, and runtime-sync hooks "
+            "when the bundled plugin is enabled."
+        ),
+    }
+    assert payload["steps"][-1]["id"] == "rerun_doctor"
+
+
+def test_setup_plan_json_lists_slack_manifest_step_when_files_write_scope_is_missing(capsys):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                setup_commands=("npm run monica:seed-auth",),
+                commands=("npm run monica:proof",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": "app_mentions:read,chat:write,channels:history,files:read",
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "slack_scope_files_write",
+        "message": "SLACK_BOT_SCOPES is missing required scope: files:write",
+    } in payload["failures"]
+    assert "create_slack_app" in step_ids
+    assert payload["steps"][-1]["id"] == "rerun_doctor"
+
+
+def test_setup_plan_json_lists_proof_setup_failure_steps_before_rollout_is_ready(capsys):
     exit_code = run_setup_plan_command(
         config=MonicaConfig(
             enabled=True,
@@ -1955,15 +3040,1161 @@ def test_setup_plan_json_lists_proof_warning_steps_when_rollout_is_ready(capsys)
         if command in {"xcrun", "xcodebuild", "adb", "emulator"}
         else f"/usr/bin/{command}",
         module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert step_ids == [
+        "configure_simulator_proof",
+        "configure_proof_setup_commands",
+        "prepare_ios_simulator",
+        "prepare_android_emulator",
+        "rerun_doctor",
+    ]
+    setup_step = payload["steps"][1]
+    assert "--proof-setup-command '<auth/session seed command>'" in setup_step["command"]
+    assert "MONICA_WORKTREE" in setup_step["why"]
+    assert "MONICA_PROOF_DIR" in setup_step["why"]
+    assert "MONICA_LINEAR_URL" in setup_step["why"]
+    assert "MONICA_BRANCH_NAME" in setup_step["why"]
+    assert "MONICA_BASE_REF" in setup_step["why"]
+    assert "MONICA_BASE_COMMIT" in setup_step["why"]
+    assert "MONICA_DEEP_LINK" in setup_step["why"]
+    assert "MONICA_PROOF_EXPECTED_TEXT" in setup_step["why"]
+    assert "MONICA_PROOF_SCREEN" in setup_step["why"]
+    assert "screen.load" in setup_step["why"]
+    assert "target route" in setup_step["why"]
+    assert "Monica profile .env" in setup_step["why"]
+    simulator_step = payload["steps"][0]
+    assert "proof.android_package" in simulator_step["command"]
+    assert "Install full Xcode" in payload["steps"][2]["why"]
+    assert "Install Android SDK" in payload["steps"][3]["why"]
+
+
+def test_setup_plan_json_gives_configure_command_when_only_proof_setup_is_missing(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_setup_commands", "rerun_doctor"]
+    setup_command = payload["steps"][0]["command"]
+    assert setup_command.startswith("hermes mobile-bug-agent configure-proof-setup ")
+    assert "--proof-setup-command '<auth/session seed command>'" in setup_command
+    assert "--proof-required-env-key '<test-auth env key>'" in setup_command
+    assert "--repo-url" not in setup_command
+    assert proof_command not in setup_command
+
+
+def test_setup_plan_lists_cached_mobile_repo_cleanup_step(tmp_path):
+    runtime = tmp_path / "monica-runtime"
+    config = MonicaConfig(
+        rollout_mode="approved_pr",
+        runtime=RuntimeConfig(home_subdir=str(runtime)),
+        repo=RepoConfig(local_name="elixir-card-app"),
+    )
+    report = SimpleNamespace(
+        rollout_mode="approved_pr",
+        failures=[
+            SimpleNamespace(
+                code="repo_cached_dirty",
+                message=(
+                    "cached mobile repo has uncommitted changes: "
+                    f"{runtime / 'workspace' / 'repos' / 'elixir-card-app'}"
+                ),
+            )
+        ],
+        warnings=[],
+    )
+
+    steps = cli._setup_plan_steps(report, config=config)
+
+    assert [step["id"] for step in steps] == ["clean_cached_mobile_repo", "rerun_doctor"]
+    cleanup_step = steps[0]
+    assert "cached mobile repo" in cleanup_step["title"].lower()
+    assert str(runtime / "workspace" / "repos" / "elixir-card-app") in cleanup_step["command"]
+    assert "status --short --branch" in cleanup_step["command"]
+    assert "archive" in cleanup_step["why"].lower()
+
+
+def test_setup_plan_json_gives_configure_command_when_proof_setup_is_noop(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("true", "exit 0"),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_setup_commands", "rerun_doctor"]
+    setup_command = payload["steps"][0]["command"]
+    assert "--proof-setup-command '<auth/session seed command>'" in setup_command
+
+
+def test_setup_plan_json_gives_configure_command_when_proof_setup_is_invalid(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    for setup_command in (
+        "<auth/session seed command>",
+        "MONICA_TEST_LOGIN_TOKEN=secret npm run monica:seed-auth",
+        "npm run monica:seed-auth -- --token token",
+    ):
+        exit_code = run_setup_plan_command(
+            config=MonicaConfig(
+                enabled=True,
+                rollout_mode="approved_pr",
+                dry_run=False,
+                slack=SlackConfig(
+                    allowed_channels=("C123MOBILE",),
+                    bot_user_ids=("U123MONICA",),
+                    approver_user_ids=("U123APPROVER",),
+                ),
+                linear=LinearConfig(team_id="team-mobile"),
+                repo=RepoConfig(
+                    url="git@github.com:acme/mobile.git",
+                    local_name="elixir-card-app",
+                    default_branch="dev",
+                    branch_prefix="monica",
+                ),
+                verification=VerificationConfig(commands=("npm test",)),
+                proof=ProofConfig(
+                    enabled=True,
+                    required_for_done=True,
+                    commands=(proof_command,),
+                    setup_commands=(setup_command,),
+                    required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                    platform_order=("ios", "android"),
+                    dev_client_scheme="elixir-card",
+                    ios_bundle_id="com.elixir.card",
+                    android_package="com.elixir.card",
+                ),
+            ),
+            target_rollout_mode="approved_pr",
+            json_output=True,
+            environ={
+                "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+                "MONICA_SLACK_APP_TOKEN": "xapp-token",
+                "LINEAR_API_KEY": "lin_api_key",
+                "GITHUB_TOKEN": "gh_token",
+                "MONICA_TEST_LOGIN_TOKEN": "token",
+                "SLACK_BOT_SCOPES": (
+                    "app_mentions:read,chat:write,channels:history,files:read,files:write"
+                ),
+            },
+            which=lambda command: f"/usr/bin/{command}",
+            module_available=lambda name: True,
+            gateway_status={
+                "gateway_state": "running",
+                "pid": 53960,
+                "start_time": 100.0,
+                "active_agents": 0,
+                "updated_at": "100.0",
+            },
+            now=160.0,
+        )
+
+        payload = json.loads(capsys.readouterr().out)
+        step_ids = [step["id"] for step in payload["steps"]]
+        assert exit_code == 1
+        assert step_ids == ["configure_proof_setup_commands", "rerun_doctor"]
+        repair_command = payload["steps"][0]["command"]
+        assert repair_command.startswith(
+            "hermes mobile-bug-agent configure-proof-setup "
+        )
+        assert "--proof-setup-command '<auth/session seed command>'" in repair_command
+
+
+def test_setup_plan_json_reuses_configured_env_keys_when_repairing_proof_setup(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("<auth/session seed command>",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    repair_command = payload["steps"][0]["command"]
+    assert exit_code == 1
+    assert payload["steps"][0]["id"] == "configure_proof_setup_commands"
+    assert "--proof-setup-command '<auth/session seed command>'" in repair_command
+    assert "--proof-required-env-key '<test-auth env key>'" not in repair_command
+
+
+def test_setup_plan_json_keeps_env_key_placeholder_when_existing_keys_are_invalid(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("<auth/session seed command>",),
+                required_env_keys=("MONICA_WORKTREE",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    repair_command = payload["steps"][0]["command"]
+    assert exit_code == 1
+    assert payload["steps"][0]["id"] == "configure_proof_setup_commands"
+    assert "--proof-setup-command '<auth/session seed command>'" in repair_command
+    assert "--proof-required-env-key '<test-auth env key>'" in repair_command
+
+
+def test_setup_plan_json_gives_env_secret_step_when_required_proof_env_key_is_missing(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_required_env_keys", "rerun_doctor"]
+    command = payload["steps"][0]["command"]
+    assert "MONICA_TEST_LOGIN_TOKEN" in command
+    assert "profile .env" in command
+
+
+def test_setup_plan_json_gives_env_key_config_step_when_required_proof_env_keys_are_empty(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_required_env_keys", "rerun_doctor"]
+    command = payload["steps"][0]["command"]
+    assert command.startswith("hermes mobile-bug-agent configure-proof-setup ")
+    assert "--proof-setup-command 'npm run monica:seed-auth'" in command
+    assert "--proof-required-env-key MONICA_TEST_LOGIN_TOKEN" in command
+
+
+def test_setup_plan_json_preserves_existing_setup_command_when_required_env_keys_are_empty(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    command = payload["steps"][0]["command"]
+    assert "--proof-setup-command 'npm run monica:seed-auth'" in command
+    assert "<auth/session seed command>" not in command
+    assert "--proof-required-env-key MONICA_TEST_LOGIN_TOKEN" in command
+
+
+def test_setup_plan_json_gives_env_key_config_step_when_required_proof_env_key_is_invalid(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN=secret",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_required_env_keys", "rerun_doctor"]
+    command = payload["steps"][0]["command"]
+    assert "--proof-required-env-key MONICA_TEST_LOGIN_TOKEN" in command
+    assert "secret" not in command
+
+
+def test_setup_plan_json_does_not_suggest_invalid_required_proof_env_key_name(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("bad key",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_required_env_keys", "rerun_doctor"]
+    command = payload["steps"][0]["command"]
+    assert "--proof-required-env-key MONICA_TEST_LOGIN_TOKEN" in command
+    assert "bad key" not in command
+
+
+def test_setup_plan_json_gives_configure_command_when_proof_command_is_noop(capsys):
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=("true", "exit 0"),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_simulator_proof", "rerun_doctor"]
+    assert "Set mobile_bug_agent.proof.commands" in payload["steps"][0]["command"]
+
+
+def test_setup_plan_json_gives_configure_command_when_proof_command_is_invalid(capsys):
+    for proof_command in (
+        "<simulator proof command>",
+        "MONICA_TEST_LOGIN_TOKEN=secret npm run monica:proof",
+        "npm run monica:proof -- --token=token",
+    ):
+        exit_code = run_setup_plan_command(
+            config=MonicaConfig(
+                enabled=True,
+                rollout_mode="approved_pr",
+                dry_run=False,
+                slack=SlackConfig(
+                    allowed_channels=("C123MOBILE",),
+                    bot_user_ids=("U123MONICA",),
+                    approver_user_ids=("U123APPROVER",),
+                ),
+                linear=LinearConfig(team_id="team-mobile"),
+                repo=RepoConfig(
+                    url="git@github.com:acme/mobile.git",
+                    local_name="elixir-card-app",
+                    default_branch="dev",
+                    branch_prefix="monica",
+                ),
+                verification=VerificationConfig(commands=("npm test",)),
+                proof=ProofConfig(
+                    enabled=True,
+                    required_for_done=True,
+                    commands=(proof_command,),
+                    setup_commands=("npm run monica:seed-auth",),
+                    required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                    platform_order=("ios", "android"),
+                    dev_client_scheme="elixir-card",
+                    ios_bundle_id="com.elixir.card",
+                    android_package="com.elixir.card",
+                ),
+            ),
+            target_rollout_mode="approved_pr",
+            json_output=True,
+            environ={
+                "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+                "MONICA_SLACK_APP_TOKEN": "xapp-token",
+                "LINEAR_API_KEY": "lin_api_key",
+                "GITHUB_TOKEN": "gh_token",
+                "MONICA_TEST_LOGIN_TOKEN": "token",
+                "SLACK_BOT_SCOPES": (
+                    "app_mentions:read,chat:write,channels:history,files:read,files:write"
+                ),
+            },
+            which=lambda command: f"/usr/bin/{command}",
+            module_available=lambda name: True,
+            gateway_status={
+                "gateway_state": "running",
+                "pid": 53960,
+                "start_time": 100.0,
+                "active_agents": 0,
+                "updated_at": "100.0",
+            },
+            now=160.0,
+        )
+
+        payload = json.loads(capsys.readouterr().out)
+        step_ids = [step["id"] for step in payload["steps"]]
+        assert exit_code == 1
+        assert step_ids == ["configure_simulator_proof", "rerun_doctor"]
+        assert "Set mobile_bug_agent.proof.commands" in payload["steps"][0]["command"]
+
+
+def test_setup_plan_json_gives_platform_order_step_when_approved_pr_omits_android(capsys):
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios",),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 1
+    assert step_ids == ["configure_proof_platform_order", "rerun_doctor"]
+    step = payload["steps"][0]
+    assert "proof.platform_order" in step["command"]
+    assert "ios" in step["command"]
+    assert "android" in step["command"]
+    assert "approved_pr cannot open a PR" in step["why"]
+
+
+def test_setup_plan_commands_preserve_active_named_profile(monkeypatch, capsys):
+    monkeypatch.setattr("hermes_cli.profiles.get_active_profile_name", lambda: "monica")
+    proof_command = (
+        "uv run --project \"$MONICA_HERMES_AGENT_ROOT\" "
+        "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600"
+    )
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(
+                url="git@github.com:acme/mobile.git",
+                local_name="elixir-card-app",
+                default_branch="dev",
+                branch_prefix="monica",
+            ),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=(proof_command,),
+                platform_order=("ios", "android"),
+                dev_client_scheme="elixir-card",
+                ios_bundle_id="com.elixir.card",
+                android_package="com.elixir.card",
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    setup_command = payload["steps"][0]["command"]
+    rerun_command = payload["steps"][1]["command"]
+    assert setup_command.startswith("hermes -p monica mobile-bug-agent configure-proof-setup ")
+    assert rerun_command == "hermes -p monica mobile-bug-agent doctor --rollout-mode approved_pr --json"
+
+
+def test_setup_plan_json_recommends_hermes_update_when_runtime_sync_unrecorded_and_idle(
+    tmp_path,
+    capsys,
+):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        state=state,
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        current_commit="abc12345",
+        now=160.0,
     )
 
     payload = json.loads(capsys.readouterr().out)
     step_ids = [step["id"] for step in payload["steps"]]
     assert exit_code == 0
-    assert payload["ready"] is True
-    assert step_ids == ["prepare_ios_simulator", "prepare_android_emulator", "rerun_doctor"]
-    assert "Install full Xcode" in payload["steps"][0]["why"]
-    assert "Install Android SDK" in payload["steps"][1]["why"]
+    assert step_ids == ["sync_hermes_runtime", "rerun_doctor"]
+    assert payload["steps"][0]["command"] == "hermes update"
+    assert "Monica is idle" in payload["steps"][0]["why"]
+
+
+def test_setup_plan_json_does_not_recommend_update_while_runtime_sync_is_active(
+    tmp_path,
+    capsys,
+):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    state.record_runtime_sync(commit="dead1234", synced_at="2026-06-13T10:00:00Z")
+    active = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(active.id, status="proofing", linear_identifier="MOB-123")
+
+    exit_code = run_setup_plan_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            dry_run=False,
+            slack=SlackConfig(
+                allowed_channels=("C123MOBILE",),
+                bot_user_ids=("U123MONICA",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                enabled=True,
+                required_for_done=True,
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        state=state,
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        current_commit="fed67890",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    step_ids = [step["id"] for step in payload["steps"]]
+    assert exit_code == 0
+    assert step_ids == ["wait_for_monica_idle_runtime_sync", "rerun_doctor"]
+    assert payload["steps"][0]["command"] == "hermes mobile-bug-agent status --json"
+    assert "proofing" in payload["steps"][0]["why"]
+    assert "hermes update" not in payload["steps"][0]["command"]
 
 
 def test_setup_plan_json_lists_approved_pr_rollout_steps(capsys):
@@ -1997,6 +4228,15 @@ def test_setup_plan_json_lists_approved_pr_rollout_steps(capsys):
     assert "prepare_pr_tools" in step_ids
     assert payload["steps"][-1]["id"] == "rerun_doctor"
     assert "configure-approved-pr" in next(
+        step["command"] for step in payload["steps"] if step["id"] == "configure_approved_pr"
+    )
+    assert "--proof-setup-command" in next(
+        step["command"] for step in payload["steps"] if step["id"] == "configure_approved_pr"
+    )
+    assert "--proof-required-env-key" in next(
+        step["command"] for step in payload["steps"] if step["id"] == "configure_approved_pr"
+    )
+    assert "--proof-command" in next(
         step["command"] for step in payload["steps"] if step["id"] == "configure_approved_pr"
     )
 
@@ -2186,12 +4426,36 @@ def test_configure_approved_pr_parser_accepts_non_secret_rollout_values():
             "npm test",
             "--verification-command",
             "npm run lint",
+            "--proof-setup-command",
+            "npm run monica:seed-auth",
+            "--proof-command",
+            "npm run monica:proof",
+            "--proof-required-env-key",
+            "MONICA_TEST_LOGIN_TOKEN",
+            "--proof-required-env-key",
+            "MONICA_TEST_LOGIN_OTP",
             "--repo-local-name",
             "mobile-app",
             "--default-branch",
             "main",
             "--branch-prefix",
             "monica",
+            "--proof-dev-client-scheme",
+            "elixir-card",
+            "--proof-ios-bundle-id",
+            "com.elixir.card",
+            "--proof-ios-simulator-udid",
+            "IOS-UDID-123",
+            "--proof-android-serial",
+            "emulator-5554",
+            "--proof-android-avd",
+            "MonicaPixel",
+            "--proof-android-package",
+            "com.joinelixir.elixirclub",
+            "--proof-timeout-minutes",
+            "45",
+            "--proof-artifact-dir",
+            "proof",
         ]
     )
 
@@ -2199,9 +4463,47 @@ def test_configure_approved_pr_parser_accepts_non_secret_rollout_values():
     assert args.approver_user_ids == ["U123APPROVER"]
     assert args.repo_url == "git@github.com:acme/mobile-app.git"
     assert args.verification_commands == ["npm test", "npm run lint"]
+    assert args.proof_setup_commands == ["npm run monica:seed-auth"]
+    assert args.proof_commands == ["npm run monica:proof"]
+    assert args.proof_required_env_keys == [
+        "MONICA_TEST_LOGIN_TOKEN",
+        "MONICA_TEST_LOGIN_OTP",
+    ]
     assert args.repo_local_name == "mobile-app"
     assert args.default_branch == "main"
     assert args.branch_prefix == "monica"
+    assert args.proof_dev_client_scheme == "elixir-card"
+    assert args.proof_ios_bundle_id == "com.elixir.card"
+    assert args.proof_ios_simulator_udid == "IOS-UDID-123"
+    assert args.proof_android_serial == "emulator-5554"
+    assert args.proof_android_avd == "MonicaPixel"
+    assert args.proof_android_package == "com.joinelixir.elixirclub"
+    assert args.proof_timeout_minutes == 45
+    assert args.proof_artifact_dir == "proof"
+
+
+def test_configure_proof_setup_parser_accepts_auth_seed_commands():
+    parser = ArgumentParser()
+
+    cli.register_cli(parser)
+    args = parser.parse_args(
+        [
+            "configure-proof-setup",
+            "--proof-setup-command",
+            "npm run monica:seed-auth",
+            "--proof-setup-command",
+            "npm run monica:seed-pdp-session",
+            "--proof-required-env-key",
+            "MONICA_TEST_LOGIN_TOKEN",
+        ]
+    )
+
+    assert args.mobile_bug_agent_action == "configure_proof_setup"
+    assert args.proof_setup_commands == [
+        "npm run monica:seed-auth",
+        "npm run monica:seed-pdp-session",
+    ]
+    assert args.proof_required_env_keys == ["MONICA_TEST_LOGIN_TOKEN"]
 
 
 def test_configure_local_fix_only_parser_accepts_non_secret_rollout_values():
@@ -2417,6 +4719,9 @@ def test_configure_approved_pr_persists_non_secret_full_loop_config(capsys):
         approver_user_ids=("U123APPROVER",),
         repo_url="git@github.com:acme/mobile-app.git",
         verification_commands=("npm test", "npm run lint"),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("npm run monica:proof",),
+        proof_required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
         repo_local_name="mobile-app",
         default_branch="main",
         branch_prefix="monica",
@@ -2442,6 +4747,9 @@ def test_configure_approved_pr_persists_non_secret_full_loop_config(capsys):
     assert monica["repo"]["default_branch"] == "main"
     assert monica["repo"]["branch_prefix"] == "monica"
     assert monica["verification"]["commands"] == ["npm test", "npm run lint"]
+    assert monica["proof"]["setup_commands"] == ["npm run monica:seed-auth"]
+    assert monica["proof"]["commands"] == ["npm run monica:proof"]
+    assert monica["proof"]["required_env_keys"] == ["MONICA_TEST_LOGIN_TOKEN"]
     assert monica["runtime"]["worker_session_prefix"] == "monica"
     assert monica["runtime"]["skip_memory"] is True
     assert monica["worker"]["backend"] == "codex_cli"
@@ -2454,6 +4762,467 @@ def test_configure_approved_pr_persists_non_secret_full_loop_config(capsys):
     assert saved[0]["plugins"]["enabled"] == ["mobile-bug-agent"]
     assert "GITHUB_TOKEN" not in str(saved[0])
     assert "SLACK_BOT_TOKEN" not in str(saved[0])
+
+
+def test_configure_proof_setup_persists_setup_commands_without_overwriting_rollout(capsys):
+    existing_config = {
+        "plugins": {"enabled": ["mobile-bug-agent"], "disabled": []},
+        "mobile_bug_agent": {
+            "enabled": True,
+            "rollout_mode": "approved_pr",
+            "repo": {
+                "url": "git@github.com:acme/mobile.git",
+                "local_name": "elixir-card-app",
+                "default_branch": "dev",
+            },
+            "proof": {
+                "enabled": True,
+                "required_for_done": True,
+                "platform_order": ["ios", "android"],
+                "commands": ["npm run monica:proof"],
+                "dev_client_scheme": "elixir-card",
+            },
+        },
+    }
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_required_env_keys=(
+            " MONICA_TEST_LOGIN_TOKEN ",
+            "MONICA_TEST_LOGIN_TOKEN",
+            " ",
+        ),
+        load_config_fn=lambda: copy.deepcopy(existing_config),
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Configured Monica proof setup commands" in out
+    assert len(saved) == 1
+    monica = saved[0]["mobile_bug_agent"]
+    assert monica["rollout_mode"] == "approved_pr"
+    assert monica["repo"] == existing_config["mobile_bug_agent"]["repo"]
+    assert monica["proof"]["setup_commands"] == ["npm run monica:seed-auth"]
+    assert monica["proof"]["required_env_keys"] == ["MONICA_TEST_LOGIN_TOKEN"]
+    assert monica["proof"]["commands"] == ["npm run monica:proof"]
+    assert monica["proof"]["dev_client_scheme"] == "elixir-card"
+    assert saved[0]["plugins"]["enabled"] == ["mobile-bug-agent"]
+
+
+def test_configure_proof_setup_preserves_existing_required_env_keys_when_not_repassed(capsys):
+    existing_config = {
+        "plugins": {"enabled": ["mobile-bug-agent"], "disabled": []},
+        "mobile_bug_agent": {
+            "enabled": True,
+            "rollout_mode": "approved_pr",
+            "proof": {
+                "enabled": True,
+                "required_for_done": True,
+                "platform_order": ["ios", "android"],
+                "setup_commands": ["npm run monica:old-seed-auth"],
+                "commands": ["npm run monica:proof"],
+                "required_env_keys": ["MONICA_TEST_LOGIN_TOKEN"],
+            },
+        },
+    }
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("npm run monica:new-seed-auth",),
+        load_config_fn=lambda: copy.deepcopy(existing_config),
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Configured Monica proof setup commands" in out
+    assert len(saved) == 1
+    proof = saved[0]["mobile_bug_agent"]["proof"]
+    assert proof["setup_commands"] == ["npm run monica:new-seed-auth"]
+    assert proof["required_env_keys"] == ["MONICA_TEST_LOGIN_TOKEN"]
+    assert proof["commands"] == ["npm run monica:proof"]
+
+
+def test_configure_proof_setup_rejects_placeholder_without_saving(capsys):
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("<auth/session seed command>",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must be the real auth/session seed command" in out
+
+
+def test_configure_proof_setup_rejects_inline_secret_env_assignment(capsys):
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("MONICA_TEST_LOGIN_TOKEN=secret npm run monica:seed-auth",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must not inline secret env assignment" in out
+    assert "MONICA_TEST_LOGIN_TOKEN" in out
+
+
+def test_configure_proof_setup_rejects_inline_session_secret_assignment(capsys):
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("MONICA_TEST_SESSION=session-secret npm run monica:seed-auth",),
+        proof_required_env_keys=("MONICA_TEST_SESSION",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must not inline secret env assignment" in out
+    assert "MONICA_TEST_SESSION" in out
+    assert "session-secret" not in out
+
+
+def test_configure_proof_setup_rejects_required_env_key_assignment(capsys):
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_required_env_keys=("MONICA_TEST_LOGIN_TOKEN=secret",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-required-env-key must name an environment key" in out
+    assert "MONICA_TEST_LOGIN_TOKEN" in out
+    assert "secret" not in out
+
+
+def test_configure_proof_setup_requires_required_env_key(capsys):
+    saved: list[dict] = []
+
+    exit_code = cli.run_configure_proof_setup_command(
+        proof_setup_commands=("npm run monica:seed-auth",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "at least one --proof-required-env-key is required" in out
+    assert "Monica proof setup configuration was not saved." in out
+
+
+def test_configure_approved_pr_persists_non_secret_proof_commands(capsys):
+    existing_config = {
+        "plugins": {
+            "enabled": ["mobile-bug-agent"],
+        },
+        "mobile_bug_agent": {
+            "enabled": True,
+            "rollout_mode": "linear_only",
+            "slack": {
+                "bot_user_ids": ["U123MONICA"],
+                "allowed_channels": ["C123MOBILE"],
+            },
+            "linear": {
+                "team_id": "team-id",
+            },
+        },
+    }
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("npm run monica:proof",),
+        proof_required_env_keys=(
+            " MONICA_TEST_LOGIN_TOKEN ",
+            "MONICA_TEST_LOGIN_OTP",
+            "MONICA_TEST_LOGIN_TOKEN",
+            " ",
+        ),
+        load_config_fn=lambda: copy.deepcopy(existing_config),
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Configured Monica for approved_pr rollout" in out
+    proof = saved[0]["mobile_bug_agent"]["proof"]
+    assert proof["enabled"] is True
+    assert proof["required_for_done"] is True
+    assert proof["platform_order"] == ["ios", "android"]
+    assert proof["setup_commands"] == ["npm run monica:seed-auth"]
+    assert proof["commands"] == ["npm run monica:proof"]
+    assert proof["required_env_keys"] == [
+        "MONICA_TEST_LOGIN_TOKEN",
+        "MONICA_TEST_LOGIN_OTP",
+    ]
+    assert "profile-secret" not in str(saved[0])
+    assert "GITHUB_TOKEN" not in str(saved[0])
+
+
+def test_configure_approved_pr_persists_non_secret_proof_environment(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("npm run monica:proof",),
+        proof_required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+        proof_dev_client_scheme="elixir-card",
+        proof_ios_bundle_id="com.elixir.card",
+        proof_ios_simulator_udid="IOS-UDID-123",
+        proof_android_serial="emulator-5554",
+        proof_android_avd="MonicaPixel",
+        proof_android_package="com.joinelixir.elixirclub",
+        proof_timeout_minutes=45,
+        proof_artifact_dir="proof",
+        load_config_fn=lambda: {"mobile_bug_agent": {"proof": {"timeout_minutes": 10}}},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Configured Monica for approved_pr rollout" in out
+    proof = saved[0]["mobile_bug_agent"]["proof"]
+    assert proof["dev_client_scheme"] == "elixir-card"
+    assert proof["ios_bundle_id"] == "com.elixir.card"
+    assert proof["ios_simulator_udid"] == "IOS-UDID-123"
+    assert proof["android_serial"] == "emulator-5554"
+    assert proof["android_avd"] == "MonicaPixel"
+    assert proof["android_package"] == "com.joinelixir.elixirclub"
+    assert proof["timeout_minutes"] == 45
+    assert proof["artifact_dir"] == "proof"
+    assert proof["required_env_keys"] == ["MONICA_TEST_LOGIN_TOKEN"]
+    assert "profile-secret" not in str(saved[0])
+    assert "SUPABASE_ANON_KEY" not in str(saved[0])
+
+
+def test_configure_approved_pr_requires_proof_setup_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_commands=("npm run monica:proof",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "at least one --proof-setup-command is required" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_placeholder_proof_setup_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("<auth/session seed command>",),
+        proof_commands=("npm run monica:proof",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must be the real auth/session seed command" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_embedded_placeholder_proof_commands(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed -- '<auth/session seed command>'",),
+        proof_commands=("sh -c '<simulator proof command>'",),
+        proof_required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must be the real auth/session seed command" in out
+    assert "--proof-command must be the real simulator proof command" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_noop_proof_setup_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("true", "exit 0"),
+        proof_commands=("npm run monica:proof",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must seed test auth/session state" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_inline_secret_proof_setup_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("MONICA_TEST_LOGIN_OTP=123456 npm run monica:seed-auth",),
+        proof_commands=("npm run monica:proof",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-setup-command must not inline secret env assignment" in out
+    assert "MONICA_TEST_LOGIN_OTP" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_requires_required_proof_env_key(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("npm run monica:proof",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "at least one --proof-required-env-key is required" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_requires_proof_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "at least one --proof-command is required" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_placeholder_proof_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("<simulator proof command>",),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-command must be the real simulator proof command" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_rejects_noop_proof_command(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=("true", "exit 0"),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "--proof-command must capture simulator proof artifacts" in out
+    assert "Monica approved_pr configuration was not saved." in out
+
+
+def test_configure_approved_pr_requires_builtin_simulator_proof_app_settings(capsys):
+    saved: list[dict] = []
+
+    exit_code = run_configure_approved_pr_command(
+        approver_user_ids=("U123APPROVER",),
+        repo_url="git@github.com:acme/mobile-app.git",
+        verification_commands=("npm test",),
+        proof_setup_commands=("npm run monica:seed-auth",),
+        proof_commands=(
+            'uv run --project "$MONICA_HERMES_AGENT_ROOT" '
+            "python -m plugins.mobile_bug_agent.simulator_proof --timeout-seconds 600",
+        ),
+        load_config_fn=lambda: {},
+        save_config_fn=lambda config: saved.append(config),
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 1
+    assert saved == []
+    assert "proof.dev_client_scheme is required for built-in simulator proof" in out
+    assert "proof.ios_bundle_id is required for built-in simulator proof" in out
+    assert "proof.android_package is required for built-in simulator proof" in out
+    assert "Monica approved_pr configuration was not saved." in out
 
 
 def test_configure_local_fix_only_persists_non_secret_local_code_config(capsys):
@@ -2641,6 +5410,7 @@ def test_doctor_json_outputs_machine_readable_readiness(capsys):
         environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
         which=lambda name: f"/usr/bin/{name}",
         module_available=lambda name: name != "slack_sdk",
+        gateway_status={},
     )
 
     payload = json.loads(capsys.readouterr().out)
@@ -2661,6 +5431,629 @@ def test_doctor_json_outputs_machine_readable_readiness(capsys):
         }
     ]
     assert "xoxb-token" not in json.dumps(payload)
+
+
+def test_doctor_json_warns_when_gateway_is_stopped(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="dry_run",
+            slack=SlackConfig(bot_user_ids=("U123MONICA",), allowed_channels=("C123MOBILE",)),
+        ),
+        json_output=True,
+        environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "stopped",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "2026-06-12T18:12:10Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["warnings"] == [
+        {
+            "code": "slack_app_token",
+            "message": "MONICA_SLACK_APP_TOKEN is missing; Monica Slack Socket Mode may not start",
+        },
+        {
+            "code": "gateway_not_running",
+            "message": (
+                "Monica gateway is stopped; live Slack tag/DM intake and approvals "
+                "will not be received until the gateway is running."
+            ),
+        },
+    ]
+    assert payload["health"]["gateway"]["state"] == "stopped"
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_is_stopped(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "stopped",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "2026-06-12T18:12:10Z",
+        },
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_not_running",
+        "message": (
+            "Monica gateway is stopped; live Slack tag/DM intake and approvals "
+            "will not be received until the gateway is running."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["state"] == "stopped"
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_is_manual_process(
+    capsys,
+    monkeypatch,
+):
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+    )
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_service_status",
+        lambda: {
+            "available": True,
+            "manager": "manual process",
+            "service_installed": False,
+            "service_running": False,
+            "gateway_pids": [53960],
+            "service_scope": None,
+            "supervised": False,
+        },
+        raising=False,
+    )
+
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        target_rollout_mode="approved_pr",
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin_api_key",
+            "GITHUB_TOKEN": "gh_token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+            "SLACK_BOT_SCOPES": (
+                "app_mentions:read,chat:write,channels:history,files:read,files:write"
+            ),
+        },
+        which=lambda command: f"/usr/bin/{command}",
+        module_available=lambda name: True,
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert payload["health"]["gateway_service"]["manager"] == "manual process"
+    assert {
+        "code": "gateway_not_supervised",
+        "message": (
+            "Monica gateway is running manually; approved_pr work needs the "
+            "profile-aware gateway service so Slack approvals survive restarts "
+            "and terminal exits."
+        ),
+    } in payload["failures"]
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_status_is_stale(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "1970-01-01T00:00:00Z",
+        },
+        now=2000.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_status_stale",
+        "message": (
+            "Monica gateway status is stale; live Slack tag/DM intake and approvals "
+            "may not be received until the gateway heartbeat is fresh."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["state"] == "running"
+    assert payload["health"]["gateway"]["stale"] is True
+    assert payload["health"]["gateway"]["updated_age_seconds"] == 2000
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_heartbeat_is_missing(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+        },
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_heartbeat_missing",
+        "message": (
+            "Monica gateway heartbeat is missing; restart the gateway so live Slack "
+            "tag/DM intake and approvals run on the current Monica runtime."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["state"] == "running"
+    assert payload["health"]["gateway"]["updated_at"] == ""
+    assert payload["health"]["gateway"]["updated_age_seconds"] is None
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_start_time_is_missing(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_runtime_metadata_missing",
+        "message": (
+            "Monica gateway runtime metadata is incomplete; restart the gateway "
+            "so doctor can verify uptime before approved_pr work runs."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["state"] == "running"
+    assert payload["health"]["gateway"]["start_time"] is None
+    assert payload["health"]["gateway"]["uptime_seconds"] is None
+    assert payload["health"]["gateway"]["updated_age_seconds"] == 60
+
+
+def test_doctor_json_blocks_approved_pr_when_gateway_status_is_unavailable(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={},
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "gateway_not_running",
+        "message": (
+            "Monica gateway status is unavailable; live Slack tag/DM intake "
+            "and approvals will not be received until the gateway is running."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["gateway"]["state"] == ""
+
+
+def test_doctor_json_blocks_approved_pr_when_plugin_is_not_enabled(monkeypatch, capsys):
+    ready_report = SimpleNamespace(
+        ready=True,
+        rollout_mode="approved_pr",
+        runtime_root_value="/tmp/monica",
+        warnings=(),
+        failures=(),
+    )
+    hermes_config = {
+        "plugins": {
+            "enabled": ["other-plugin"],
+            "disabled": [],
+        },
+        "mobile_bug_agent": {
+            "enabled": True,
+            "rollout_mode": "approved_pr",
+        },
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: copy.deepcopy(hermes_config))
+    monkeypatch.setattr(cli, "check_monica_readiness", lambda **_kwargs: ready_report)
+    monkeypatch.setattr(
+        cli,
+        "_read_gateway_status",
+        lambda: {"gateway_state": "running", "pid": 53960, "active_agents": 0},
+    )
+    monkeypatch.setattr(cli, "_current_hermes_commit", lambda: "abc12345")
+
+    exit_code = cli.mobile_bug_agent_command(
+        SimpleNamespace(mobile_bug_agent_action="doctor", rollout_mode="approved_pr", json=True)
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 1
+    assert payload["ready"] is False
+    assert {
+        "code": "plugin_not_enabled",
+        "message": (
+            "plugins.enabled must include mobile-bug-agent and plugins.disabled must not; "
+            "otherwise Monica's Slack gateway hooks will not load."
+        ),
+    } in payload["failures"]
+    assert payload["health"]["plugin"] == {
+        "configured": True,
+        "enabled": False,
+        "disabled": False,
+        "name": "mobile-bug-agent",
+    }
+
+
+def test_doctor_json_reports_gateway_health_and_commit(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="dry_run",
+            slack=SlackConfig(bot_user_ids=("U123MONICA",), allowed_channels=("C123MOBILE",)),
+        ),
+        state=state,
+        json_output=True,
+        environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": 2,
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["health"] == {
+        "hermes_commit": "abc12345",
+        "gateway": {
+            "state": "running",
+            "pid": 1234,
+            "active_agents": 2,
+            "start_time": 100.0,
+            "uptime_seconds": 60,
+            "updated_at": "2026-06-13T00:00:00Z",
+            "updated_age_seconds": 0,
+            "stale": False,
+        },
+        "gateway_service": {"available": False},
+        "runtime_sync": {
+            "available": True,
+            "idle": True,
+            "current_commit": "abc12345",
+            "stale": False,
+            "last_synced_commit": "",
+            "last_synced_at": "",
+            "blocking_statuses": list(RUNTIME_SYNC_BLOCKING_STATUSES),
+            "active_run_count": 0,
+            "active_runs": [],
+        },
+    }
+
+
+def test_doctor_json_warns_when_runtime_sync_has_never_been_recorded(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="approved_pr",
+            slack=SlackConfig(
+                bot_user_ids=("U123MONICA",),
+                allowed_channels=("C123MOBILE",),
+                approver_user_ids=("U123APPROVER",),
+            ),
+            linear=LinearConfig(team_id="team-mobile"),
+            repo=RepoConfig(url="git@github.com:acme/mobile.git"),
+            verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
+        ),
+        state=state,
+        json_output=True,
+        environ={
+            "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
+            "MONICA_SLACK_APP_TOKEN": "xapp-token",
+            "LINEAR_API_KEY": "lin-key",
+            "GITHUB_TOKEN": "gh-token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
+        },
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["health"]["runtime_sync"]["idle"] is True
+    assert payload["health"]["runtime_sync"]["current_commit"] == "abc12345"
+    assert payload["health"]["runtime_sync"]["last_synced_commit"] == ""
+    assert any(warning["code"] == "runtime_sync_unrecorded" for warning in payload["warnings"])
+
+
+def test_doctor_json_reports_runtime_sync_health(tmp_path, capsys):
+    state = MonicaState.open(tmp_path / "state.sqlite")
+    state.record_runtime_sync(commit="abc12345", synced_at="2026-06-13T10:00:00Z")
+    active = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U1",
+        request_text="@monica marketplace PDP copy bug",
+    )
+    state.update_run(active.id, status="opening_pr", linear_identifier="MOB-123")
+
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="dry_run",
+            slack=SlackConfig(bot_user_ids=("U123MONICA",), allowed_channels=("C123MOBILE",)),
+        ),
+        state=state,
+        json_output=True,
+        environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={"gateway_state": "running", "pid": 1234, "active_agents": 0},
+        current_commit="def67890",
+    )
+
+    payload = json.loads(capsys.readouterr().out)
+    assert exit_code == 0
+    assert payload["health"]["runtime_sync"]["idle"] is False
+    assert payload["health"]["runtime_sync"]["active_run_count"] == 1
+    assert payload["health"]["runtime_sync"]["stale"] is True
+    assert payload["health"]["runtime_sync"]["last_synced_commit"] == "abc12345"
+    assert payload["health"]["runtime_sync"]["last_synced_at"] == "2026-06-13T10:00:00Z"
+    assert payload["health"]["runtime_sync"]["active_runs"][0]["id"] == active.id
+    assert payload["health"]["runtime_sync"]["active_runs"][0]["status"] == "opening_pr"
+    assert any(warning["code"] == "runtime_sync_stale" for warning in payload["warnings"])
+
+
+def test_doctor_text_warns_when_gateway_is_stopped(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="dry_run",
+            slack=SlackConfig(bot_user_ids=("U123MONICA",), allowed_channels=("C123MOBILE",)),
+        ),
+        environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "stopped",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "2026-06-12T18:12:10Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Gateway: stopped pid:53960 uptime:- active_agents:0" in out
+    assert (
+        "WARN: Monica gateway is stopped; live Slack tag/DM intake and approvals "
+        "will not be received until the gateway is running."
+    ) in out
+    assert "Monica doctor: ready" in out
+
+
+def test_doctor_text_reports_gateway_health_and_commit(capsys):
+    exit_code = run_doctor_command(
+        config=MonicaConfig(
+            enabled=True,
+            rollout_mode="dry_run",
+            slack=SlackConfig(bot_user_ids=("U123MONICA",), allowed_channels=("C123MOBILE",)),
+        ),
+        environ={"MONICA_SLACK_BOT_TOKEN": "xoxb-token"},
+        which=lambda name: f"/usr/bin/{name}",
+        module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 1234,
+            "start_time": 100.0,
+            "active_agents": 2,
+            "updated_at": "2026-06-13T00:00:00Z",
+        },
+        current_commit="abc12345",
+        now=160.0,
+    )
+
+    out = capsys.readouterr().out
+    assert exit_code == 0
+    assert "Hermes commit: abc12345" in out
+    assert "Gateway: running pid:1234 uptime:60s active_agents:2" in out
+    assert "Monica doctor: ready" in out
 
 
 def test_doctor_fails_when_slack_sdk_is_missing(capsys):
@@ -2783,6 +6176,13 @@ def test_doctor_blocks_side_effect_rollouts_with_bot_id_mentions(capsys):
         },
         which=lambda name: f"/usr/bin/{name}",
         module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
     )
 
     out = capsys.readouterr().out
@@ -2809,6 +6209,14 @@ def test_doctor_blocks_side_effect_rollouts_with_handle_style_bot_user_id(capsys
         },
         which=lambda name: f"/usr/bin/{name}",
         module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
     )
 
     out = capsys.readouterr().out
@@ -2919,6 +6327,11 @@ def test_doctor_blocks_approved_pr_without_configured_approvers(capsys):
             linear=LinearConfig(team_id="team-id"),
             repo=RepoConfig(url="git@github.com:acme/mobile.git"),
             verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+            ),
         ),
         environ={
             "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
@@ -2928,6 +6341,14 @@ def test_doctor_blocks_approved_pr_without_configured_approvers(capsys):
         },
         which=lambda name: f"/usr/bin/{name}",
         module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
     )
 
     out = capsys.readouterr().out
@@ -3108,6 +6529,11 @@ def test_doctor_blocks_approved_pr_with_handle_style_approver(capsys):
             linear=LinearConfig(team_id="team-id"),
             repo=RepoConfig(url="git@github.com:acme/mobile.git"),
             verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                platform_order=("ios", "android"),
+            ),
         ),
         environ={
             "SLACK_BOT_TOKEN": "xoxb-token",
@@ -3440,15 +6866,30 @@ def test_doctor_accepts_approved_pr_when_required_setup_exists(capsys):
             linear=LinearConfig(team_id="team-id"),
             repo=RepoConfig(url="git@github.com:acme/mobile.git"),
             verification=VerificationConfig(commands=("npm test",)),
+            proof=ProofConfig(
+                commands=("npm run monica:proof",),
+                setup_commands=("npm run monica:seed-auth",),
+                required_env_keys=("MONICA_TEST_LOGIN_TOKEN",),
+                platform_order=("ios", "android"),
+            ),
         ),
         environ={
             "MONICA_SLACK_BOT_TOKEN": "xoxb-token",
             "MONICA_SLACK_APP_TOKEN": "xapp-token",
             "LINEAR_API_KEY": "lin-key",
             "GITHUB_TOKEN": "gh-token",
+            "MONICA_TEST_LOGIN_TOKEN": "token",
         },
         which=lambda name: f"/usr/bin/{name}",
         module_available=lambda name: True,
+        gateway_status={
+            "gateway_state": "running",
+            "pid": 53960,
+            "start_time": 100.0,
+            "active_agents": 0,
+            "updated_at": "100.0",
+        },
+        now=160.0,
     )
 
     out = capsys.readouterr().out

@@ -17,10 +17,13 @@ class RepoManagerError(RuntimeError):
 class Worktree:
     branch_name: str
     path: Path
+    base_ref: str = ""
+    base_commit: str = ""
 
 
 RunCommand = Callable[[list[str], Path | None], str]
 _UNSAFE_GIT_REF_CHARS_RE = re.compile(r"[\s~^:?*\\[\]\x00-\x1f\x7f]")
+_GIT_COMMIT_RE = re.compile(r"^[0-9a-fA-F]{7,40}$")
 
 
 class RepoManager:
@@ -42,7 +45,7 @@ class RepoManager:
             raise RepoManagerError("mobile_bug_agent.repo.url is not configured.")
 
         local_name = safe_repo_local_name(self.config.local_name)
-        default_branch = safe_default_branch(self.config.default_branch)
+        base_ref = configured_remote_base_ref(self.config.default_branch)
         branch_prefix = safe_branch_prefix(self.config.branch_prefix)
         repo_path = self.workspace_root / "repos" / local_name
         worktrees_root = self.workspace_root / "worktrees"
@@ -52,19 +55,37 @@ class RepoManager:
         if repo_path.exists():
             if not repo_path.is_dir():
                 raise RepoManagerError(f"repo path exists but is not a directory: {repo_path}")
-            self._run_command(
-                [
-                    "git",
-                    "-C",
-                    str(repo_path),
-                    "fetch",
-                    "origin",
-                    default_branch,
-                ],
+            origin_url = self._run_command(
+                ["git", "-C", str(repo_path), "remote", "get-url", "origin"],
                 None,
-            )
+            ).strip()
+            if origin_url and origin_url != self.config.url:
+                raise RepoManagerError(
+                    "cached repo origin does not match mobile_bug_agent.repo.url; "
+                    f"expected {self.config.url}, got {origin_url}: {repo_path}"
+                )
         else:
             self._run_command(["git", "clone", self.config.url, str(repo_path)], None)
+
+        self._run_command(["git", "-C", str(repo_path), "fetch", "--prune", "origin"], None)
+        repo_status = self._run_command(
+            ["git", "-C", str(repo_path), "status", "--porcelain"],
+            None,
+        ).strip()
+        if repo_status:
+            raise RepoManagerError(
+                "cached repo has uncommitted changes; clean or archive the Monica repo "
+                f"before starting a fresh run: {repo_path}"
+            )
+        base_commit = self._run_command(
+            ["git", "-C", str(repo_path), "rev-parse", base_ref],
+            None,
+        ).strip()
+        if not _looks_like_git_commit(base_commit):
+            raise RepoManagerError(
+                f"could not resolve valid latest base commit for {base_ref}; "
+                "check mobile_bug_agent.repo.default_branch and the origin remote."
+            )
 
         branch_name = self._branch_name(
             branch_prefix=branch_prefix,
@@ -94,7 +115,41 @@ class RepoManager:
                     "worktree has uncommitted changes; clean or archive the existing Monica "
                     f"worktree before retrying: {worktree_path}"
                 )
-            return Worktree(branch_name=branch_name, path=worktree_path)
+            current_head = self._run_command(
+                ["git", "-C", str(worktree_path), "rev-parse", "HEAD"],
+                None,
+            ).strip()
+            if current_head != base_commit:
+                raise RepoManagerError(
+                    "existing Monica worktree is not at latest base; archive the existing "
+                    f"worktree before starting a fresh run: {worktree_path}"
+                )
+            return Worktree(
+                branch_name=branch_name,
+                path=worktree_path,
+                base_ref=base_ref,
+                base_commit=base_commit,
+            )
+
+        local_branch = self._run_command(
+            ["git", "-C", str(repo_path), "branch", "--list", branch_name],
+            None,
+        )
+        if _branch_list_contains(local_branch, branch_name):
+            raise RepoManagerError(
+                "local Monica branch already exists without its expected worktree; "
+                f"archive or remove the stale branch before starting a fresh run: {branch_name}"
+            )
+        remote_branch = f"origin/{branch_name}"
+        remote_branch_list = self._run_command(
+            ["git", "-C", str(repo_path), "branch", "-r", "--list", remote_branch],
+            None,
+        )
+        if _branch_list_contains(remote_branch_list, remote_branch):
+            raise RepoManagerError(
+                "remote Monica branch already exists; choose a new Linear issue/summary "
+                f"or archive the stale remote branch before starting a fresh run: {remote_branch}"
+            )
 
         self._run_command(
             [
@@ -106,11 +161,16 @@ class RepoManager:
                 "-B",
                 branch_name,
                 str(worktree_path),
-                f"origin/{default_branch}",
+                base_commit,
             ],
             None,
         )
-        return Worktree(branch_name=branch_name, path=worktree_path)
+        return Worktree(
+            branch_name=branch_name,
+            path=worktree_path,
+            base_ref=base_ref,
+            base_commit=base_commit,
+        )
 
     def _branch_name(self, *, branch_prefix: str, linear_identifier: str, summary: str) -> str:
         ident = _slug(linear_identifier, fallback="slack", lowercase=False)
@@ -170,6 +230,21 @@ def _looks_like_git_worktree(path: Path) -> bool:
     return (path / ".git").exists()
 
 
+def _branch_list_contains(output: str, branch_name: str) -> bool:
+    expected = str(branch_name or "").strip()
+    for line in str(output or "").splitlines():
+        candidate = line.strip()
+        if candidate.startswith("*"):
+            candidate = candidate[1:].strip()
+        if candidate == expected:
+            return True
+    return False
+
+
+def _looks_like_git_commit(value: str) -> bool:
+    return bool(_GIT_COMMIT_RE.fullmatch(str(value or "").strip()))
+
+
 def safe_repo_local_name(value: str) -> str:
     name = value.strip()
     path = Path(name)
@@ -194,6 +269,11 @@ def safe_default_branch(value: str) -> str:
     if not is_safe_git_branch_name(branch):
         raise RepoManagerError("repo.default_branch must be a safe git branch name.")
     return branch
+
+
+def configured_remote_base_ref(value: str) -> str:
+    branch = safe_default_branch(value)
+    return branch if branch.startswith("origin/") else f"origin/{branch}"
 
 
 def is_safe_git_branch_name(value: str) -> bool:

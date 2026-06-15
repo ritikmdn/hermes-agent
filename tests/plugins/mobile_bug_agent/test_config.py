@@ -25,7 +25,9 @@ def test_config_defaults_are_safe():
     assert cfg.proof.required_for_done is False
     assert cfg.proof.platform_order == ("ios", "android")
     assert cfg.proof.artifact_dir == "proof"
+    assert cfg.proof.setup_commands == ()
     assert cfg.proof.commands == ()
+    assert cfg.proof.required_env_keys == ()
     assert cfg.proof.deep_link == ""
     assert cfg.proof.dev_client_scheme == ""
 
@@ -88,7 +90,9 @@ def test_config_loads_nested_values():
                 "required_for_done": True,
                 "platform_order": ["ios"],
                 "artifact_dir": "monica-proof",
+                "setup_commands": ["seed-test-auth"],
                 "commands": ["npm run proof:ios"],
+                "required_env_keys": ["MONICA_TEST_LOGIN_TOKEN", "MONICA_TEST_LOGIN_OTP"],
                 "deep_link": "elixir-card://marketplace/offer/fitness-first",
                 "dev_client_scheme": "elixir-card",
                 "ios_simulator_udid": "SIM-UDID",
@@ -126,7 +130,12 @@ def test_config_loads_nested_values():
     assert cfg.proof.required_for_done is True
     assert cfg.proof.platform_order == ("ios",)
     assert cfg.proof.artifact_dir == "monica-proof"
+    assert cfg.proof.setup_commands == ("seed-test-auth",)
     assert cfg.proof.commands == ("npm run proof:ios",)
+    assert cfg.proof.required_env_keys == (
+        "MONICA_TEST_LOGIN_TOKEN",
+        "MONICA_TEST_LOGIN_OTP",
+    )
     assert cfg.proof.deep_link == "elixir-card://marketplace/offer/fitness-first"
     assert cfg.proof.dev_client_scheme == "elixir-card"
     assert cfg.proof.ios_simulator_udid == "SIM-UDID"

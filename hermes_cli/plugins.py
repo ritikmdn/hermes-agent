@@ -153,6 +153,16 @@ VALID_HOOKS: Set[str] = {
     #   {"action": "allow"}  /  None             -> normal dispatch
     # Kwargs: event: MessageEvent, gateway: GatewayRunner, session_store.
     "pre_gateway_dispatch",
+    # Update lifecycle hook. Fired by `hermes update` before any repository,
+    # install, or autostash mutation. Plugins may return:
+    #   {"action": "block", "message": "..."} -> abort update with exit 2
+    # Observer-only plugins may return None.
+    # Kwargs: args: argparse.Namespace, project_root: str.
+    "pre_update",
+    # Fired by `hermes update` after a successful repository/install update.
+    # Observer-only plugins may return metadata for logging/diagnostics.
+    # Kwargs: args: argparse.Namespace, project_root: str.
+    "post_update",
     # Approval lifecycle hooks. Fired by tools/approval.py when a dangerous
     # command needs user approval -- fires BOTH for CLI-interactive prompts
     # and for gateway/ACP approvals (Telegram, Discord, Slack, TUI, etc.).

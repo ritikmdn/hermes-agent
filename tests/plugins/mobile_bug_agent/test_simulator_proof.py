@@ -16,6 +16,7 @@ from plugins.mobile_bug_agent.simulator_proof import SimulatorProofHarness
 def _fast_simulator_settle(monkeypatch):
     monkeypatch.setenv("MONICA_IOS_SETTLE_SECONDS", "0")
     monkeypatch.setenv("MONICA_ANDROID_SETTLE_SECONDS", "0")
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "0")
 
 
 def _worktree(path: Path) -> Path:
@@ -38,6 +39,12 @@ def test_simulator_proof_ios_builds_launches_deep_link_and_screenshots(tmp_path)
 
     def run_text(args, cwd, timeout):
         calls.append((args, cwd, timeout))
+        if args[:4] == ("xcrun", "simctl", "openurl", "SIM-123"):
+            proof_dir.mkdir(parents=True, exist_ok=True)
+            (proof_dir / "ios-metro.stdout.log").write_text(
+                "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+                encoding="utf-8",
+            )
         if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
             Path(args[-1]).write_bytes(_png_bytes())
         return "ok"
@@ -67,6 +74,107 @@ def test_simulator_proof_ios_builds_launches_deep_link_and_screenshots(tmp_path)
         ),
         (("xcrun", "simctl", "io", "SIM-123", "screenshot", str(proof_dir / "ios-screenshot.png")), worktree, 90),
     ]
+
+
+def test_simulator_proof_ios_records_target_text_note_after_route_match(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "openurl", "SIM-123"):
+            proof_dir.mkdir(parents=True, exist_ok=True)
+            (proof_dir / "ios-metro.stdout.log").write_text(
+                "LOG  [APP-PERF-METRIC] ui.load | screen.load /marketplace/SearchScreen | 180ms | ok",
+                encoding="utf-8",
+            )
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        ios_simulator_udid="SIM-123",
+        deep_link="elixir-card://marketplace/SearchScreen",
+        expected_text="Search wellness products",
+        timeout_seconds=90,
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert "visible target text: Search wellness products" in (
+        proof_dir / "ios-target.log"
+    ).read_text(encoding="utf-8")
+
+
+def test_simulator_proof_ios_waits_for_target_screen_without_deep_link(monkeypatch, tmp_path):
+    calls = []
+    sleeps = []
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "5")
+    timeline = iter([10.0, 10.5])
+    monkeypatch.setattr(simulator_proof.time, "monotonic", lambda: next(timeline))
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        (proof_dir / "ios-metro.stdout.log").write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(simulator_proof.time, "sleep", sleep)
+
+    def run_text(args, cwd, timeout):
+        calls.append((args, cwd, timeout))
+        if args == ("npx", "expo", "run:ios", "--no-install"):
+            proof_dir.mkdir(parents=True, exist_ok=True)
+            (proof_dir / "ios-metro.stdout.log").write_text(
+                "LOG  [APP-PERF-METRIC] ui.load | screen.load /SplashScreen | 6ms | ok",
+                encoding="utf-8",
+            )
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        ios_simulator_udid="SIM-123",
+        proof_screen="/MarketplacePdp",
+        timeout_seconds=90,
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert sleeps == [0.5]
+    assert not any(call[0][:4] == ("xcrun", "simctl", "openurl", "SIM-123") for call in calls)
+
+
+def test_simulator_proof_accepts_ios_platform_alias(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios-simulator",),
+        ios_simulator_udid="SIM-123",
+        timeout_seconds=90,
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
 
 
 def test_simulator_proof_ios_patches_fmt_before_no_install_run(tmp_path):
@@ -198,6 +306,11 @@ def test_simulator_proof_ios_captures_while_expo_runner_is_alive(monkeypatch, tm
 
     def run_ios_until_ready(args, cwd, timeout, target, bundle_id, dev_client_url, log_dir, while_ready):
         ready_calls.append((args, cwd, timeout, target, bundle_id, dev_client_url, log_dir))
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
         while_ready()
 
     harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
@@ -232,12 +345,322 @@ def test_simulator_proof_ios_captures_while_expo_runner_is_alive(monkeypatch, tm
         (("pod", "install", "--ansi"), worktree / "ios", 90),
         (("npx", "expo", "run:ios", "--no-install", "--no-bundler"), worktree, 90),
         (
+            ("xcrun", "simctl", "privacy", "SIM-123", "grant", "notifications", "com.elixir.card"),
+            worktree,
+            90,
+        ),
+        (
             ("xcrun", "simctl", "openurl", "SIM-123", "elixir://marketplace/offer/fitness-first"),
             worktree,
             90,
         ),
         (("xcrun", "simctl", "io", "SIM-123", "screenshot", str(proof_dir / "ios-screenshot.png")), worktree, 90),
     ]
+
+
+def test_simulator_proof_ios_records_expected_text_from_metro_log(monkeypatch, tmp_path):
+    monkeypatch.setenv("MONICA_PACKAGER_HOSTNAME", "localhost")
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "LOG [Monica proof] visible target text: Fitness First\n",
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("ios",),
+        dev_client_scheme="elixir-card",
+        ios_simulator_udid="SIM-123",
+        ios_bundle_id="com.elixir.card",
+        expected_text="Fitness First",
+        timeout_seconds=90,
+    )
+
+    assert result == [str(proof_dir / "ios-screenshot.png")]
+    assert "Fitness First" in (proof_dir / "ios-target.log").read_text(encoding="utf-8")
+
+
+def test_simulator_proof_ios_rejects_expected_text_without_visible_target_marker(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+                    "LOG  Loaded offer copy for Fitness First from API",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof target text was not observed"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+    assert not (proof_dir / "ios-target.log").exists()
+
+
+def test_simulator_proof_ios_rejects_missing_expected_text(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "LOG [Monica proof] visible target text: Other offer\n",
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof target text was not observed"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+
+
+def test_simulator_proof_ios_rejects_splash_screen_final_route(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "LOG [Monica proof] visible target text: Fitness First",
+                    "LOG  [APP-PERF-METRIC] ui.load | screen.load /SplashScreen | 6ms | ok",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof captured non-target app screen"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+
+
+def test_simulator_proof_ios_rejects_route_that_does_not_match_target_before_screenshot(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "LOG [Monica proof] visible target text: Fitness First",
+                    "LOG  [APP-PERF-METRIC] ui.load | screen.load /Home | 6ms | ok",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof target route does not match proof target"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+
+
+def test_simulator_proof_ios_rejects_generic_marketplace_route_before_screenshot(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "LOG [Monica proof] visible target text: Fitness First",
+                    "LOG  [APP-PERF-METRIC] ui.load | screen.load /Marketplace | 6ms | ok",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof target route does not match proof target"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+
+
+def test_simulator_proof_ios_rejects_missing_target_route_before_screenshot(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    with pytest.raises(RuntimeError, match="iOS proof did not observe a target screen route"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            ios_simulator_udid="SIM-123",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            timeout_seconds=90,
+        )
+
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+
+
+def test_simulator_proof_ios_rejects_stale_target_route_before_screenshot(tmp_path):
+    proof_dir = tmp_path / "proof"
+    proof_dir.mkdir()
+    (proof_dir / "ios-metro.stdout.log").write_text(
+        "\n".join(
+            [
+                "LOG [Monica proof] visible target text: Fitness First",
+                "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    (proof_dir / "ios-target.log").write_text("visible target text: Fitness First", encoding="utf-8")
+    (proof_dir / "ios-screenshot.png").write_bytes(_png_bytes())
+    worktree = _worktree(tmp_path / "app")
+    screenshot_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            screenshot_calls.append(args)
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    harness = SimulatorProofHarness(run_text=run_text)
+
+    with pytest.raises(RuntimeError, match="iOS proof did not observe a target screen route"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            ios_simulator_udid="SIM-123",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            expected_text="Fitness First",
+            timeout_seconds=90,
+        )
+
+    assert screenshot_calls == []
+    assert not (proof_dir / "ios-screenshot.png").exists()
+    assert not (proof_dir / "ios-target.log").exists()
 
 
 def test_simulator_proof_ios_preserves_installed_app_by_default(monkeypatch, tmp_path):
@@ -308,6 +731,46 @@ def test_simulator_proof_ios_rejects_auth_gated_deep_link(tmp_path):
             ios_simulator_udid="SIM-123",
             ios_bundle_id="com.elixir.card",
             deep_link="elixir-card://gymMembership/screens/GymPdpScreen?programSlug=fitness-first",
+            timeout_seconds=90,
+        )
+
+
+def test_simulator_proof_ios_rejects_expo_dev_client_error_log(tmp_path):
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[:4] == ("xcrun", "simctl", "io", "SIM-123"):
+            Path(args[-1]).write_bytes(_png_bytes())
+        return "ok"
+
+    def run_ios_until_ready(_args, _cwd, _timeout, _target, _bundle_id, _dev_client_url, log_dir, while_ready):
+        assert log_dir is not None
+        (log_dir / "ios-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "iOS Bundled 2634ms apps/elixir-card/index.ts (12563 modules)",
+                    "ERROR  This development build encountered the following error:",
+                    "Invariant Violation: Native module cannot be null",
+                    "Reload",
+                    "Go home",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        while_ready()
+
+    harness = SimulatorProofHarness(run_text=run_text, run_ios_until_ready=run_ios_until_ready)
+
+    with pytest.raises(RuntimeError, match="iOS proof captured Expo Dev Client error"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("ios",),
+            dev_client_scheme="elixir-card",
+            ios_simulator_udid="SIM-123",
+            ios_bundle_id="com.elixir.card",
+            deep_link="elixir-card://marketplace/offer/fitness-first",
             timeout_seconds=90,
         )
 
@@ -389,6 +852,19 @@ def test_simulator_proof_android_builds_launches_deep_link_and_screenshots(tmp_p
 
     def run_text(args, cwd, timeout):
         text_calls.append((args, cwd, timeout))
+        if args[:6] == (
+            "adb",
+            "-s",
+            "emulator-5554",
+            "shell",
+            "am",
+            "start",
+        ):
+            proof_dir.mkdir(parents=True, exist_ok=True)
+            (proof_dir / "android-metro.stdout.log").write_text(
+                "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+                encoding="utf-8",
+            )
         return "ok"
 
     def run_bytes(args, cwd, timeout):
@@ -466,6 +942,11 @@ def test_simulator_proof_android_captures_while_long_lived_run_is_foreground(mon
     ):
         foreground_calls.append(
             (args, cwd, timeout, adb, package, log_dir, open_dev_client_before_foreground)
+        )
+        assert log_dir is not None
+        (log_dir / "android-metro.stdout.log").write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
         )
         open_dev_client()
         capture_foreground()
@@ -555,6 +1036,373 @@ def test_simulator_proof_android_captures_while_long_lived_run_is_foreground(mon
     assert bytes_calls == [
         (("adb", "-s", "emulator-5554", "exec-out", "screencap", "-p"), worktree, 120)
     ]
+
+
+def test_simulator_proof_android_saves_ui_tree_for_expected_text_proof(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    ui_tree = "<hierarchy><node text='Fitness First' /></hierarchy>"
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return ui_tree
+        return "ok"
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        _log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=lambda _args, _cwd, _timeout: _png_bytes(),
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    result = harness.run(
+        worktree=worktree,
+        proof_dir=proof_dir,
+        platforms=("android",),
+        dev_client_scheme="elixir-card",
+        android_serial="emulator-5554",
+        android_package="com.elixir.card.staging",
+        expected_text="Fitness First",
+        timeout_seconds=120,
+    )
+
+    assert result == [str(proof_dir / "android-screenshot.png")]
+    assert (proof_dir / "android-ui.xml").read_text(encoding="utf-8") == ui_tree
+
+
+def test_simulator_proof_android_rejects_missing_expected_text(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    bytes_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return "<hierarchy><node text='Other offer' /></hierarchy>"
+        return "ok"
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        _log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=lambda args, cwd, timeout: bytes_calls.append((args, cwd, timeout)) or _png_bytes(),
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof target text was not observed"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            expected_text="Fitness First",
+            timeout_seconds=120,
+        )
+    assert bytes_calls == []
+    assert not (proof_dir / "android-screenshot.png").exists()
+
+
+def test_simulator_proof_android_rejects_splash_screen_final_route(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return "<hierarchy><node text='Fitness First' /></hierarchy>"
+        return "ok"
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        assert log_dir is not None
+        (log_dir / "android-metro.stdout.log").write_text(
+            "\n".join(
+                [
+                    "LOG [Monica proof] visible target text: Fitness First",
+                    "LOG  [APP-PERF-METRIC] ui.load | screen.load /SplashScreen | 19ms | ok",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=lambda _args, _cwd, _timeout: _png_bytes(),
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof captured non-target app screen"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            expected_text="Fitness First",
+            timeout_seconds=120,
+        )
+
+
+def test_simulator_proof_android_rejects_route_that_does_not_match_target_before_screencap(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    bytes_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return "<hierarchy><node text='Fitness First' /></hierarchy>"
+        return "ok"
+
+    def run_bytes(args, cwd, timeout):
+        bytes_calls.append(args)
+        return _png_bytes()
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        assert log_dir is not None
+        (log_dir / "android-metro.stdout.log").write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /Home | 19ms | ok",
+            encoding="utf-8",
+        )
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=run_bytes,
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof target route does not match proof target"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            expected_text="Fitness First",
+            timeout_seconds=120,
+        )
+
+    assert bytes_calls == []
+    assert not (proof_dir / "android-screenshot.png").exists()
+    assert not (proof_dir / "android-ui.xml").exists()
+
+
+def test_simulator_proof_android_rejects_generic_marketplace_route_before_screencap(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    bytes_calls = []
+
+    def run_text(args, cwd, timeout):
+        if args[-4:] == ("exec-out", "uiautomator", "dump", "/dev/tty"):
+            return "<hierarchy><node text='Fitness First' /></hierarchy>"
+        return "ok"
+
+    def run_bytes(args, cwd, timeout):
+        bytes_calls.append(args)
+        return _png_bytes()
+
+    def run_android_until_foreground(
+        _args,
+        _cwd,
+        _timeout,
+        _adb,
+        _package,
+        log_dir,
+        open_dev_client,
+        capture_foreground,
+        open_dev_client_before_foreground=False,
+    ):
+        assert log_dir is not None
+        (log_dir / "android-metro.stdout.log").write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /Marketplace | 19ms | ok",
+            encoding="utf-8",
+        )
+        open_dev_client()
+        capture_foreground()
+
+    harness = SimulatorProofHarness(
+        run_text=run_text,
+        run_bytes=run_bytes,
+        run_android_until_foreground=run_android_until_foreground,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof target route does not match proof target"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            dev_client_scheme="elixir-card",
+            android_serial="emulator-5554",
+            android_package="com.elixir.card.staging",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            expected_text="Fitness First",
+            timeout_seconds=120,
+        )
+
+    assert bytes_calls == []
+    assert not (proof_dir / "android-screenshot.png").exists()
+    assert not (proof_dir / "android-ui.xml").exists()
+
+
+def test_simulator_proof_android_rejects_missing_target_route_before_screencap(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+    bytes_calls = []
+
+    def run_bytes(args, cwd, timeout):
+        bytes_calls.append(args)
+        return _png_bytes()
+
+    harness = SimulatorProofHarness(
+        run_text=lambda _args, _cwd, _timeout: "ok",
+        run_bytes=run_bytes,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof did not observe a target screen route"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            android_serial="emulator-5554",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            timeout_seconds=120,
+        )
+
+    assert bytes_calls == []
+    assert not (proof_dir / "android-screenshot.png").exists()
+
+
+def test_simulator_proof_android_rejects_stale_target_route_before_screencap(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    proof_dir.mkdir()
+    (proof_dir / "android-metro.stdout.log").write_text(
+        "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+        encoding="utf-8",
+    )
+    (proof_dir / "android-ui.xml").write_text("<node text='Fitness First' />", encoding="utf-8")
+    (proof_dir / "android-screenshot.png").write_bytes(_png_bytes())
+    worktree = _worktree(tmp_path / "app")
+    bytes_calls = []
+
+    def run_bytes(args, cwd, timeout):
+        bytes_calls.append(args)
+        return _png_bytes()
+
+    harness = SimulatorProofHarness(
+        run_text=lambda _args, _cwd, _timeout: "ok",
+        run_bytes=run_bytes,
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof did not observe a target screen route"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            android_serial="emulator-5554",
+            deep_link="elixir://marketplace/offer/fitness-first",
+            timeout_seconds=120,
+        )
+
+    assert bytes_calls == []
+    assert not (proof_dir / "android-screenshot.png").exists()
+    assert not (proof_dir / "android-ui.xml").exists()
+
+
+def test_simulator_proof_android_requires_package_for_expected_text_validation(monkeypatch, tmp_path):
+    monkeypatch.delenv("MONICA_ANDROID_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("MONICA_PACKAGER_HOSTNAME", raising=False)
+    monkeypatch.delenv("REACT_NATIVE_PACKAGER_HOSTNAME", raising=False)
+    proof_dir = tmp_path / "proof"
+    worktree = _worktree(tmp_path / "app")
+
+    harness = SimulatorProofHarness(
+        run_text=lambda _args, _cwd, _timeout: "ok",
+        run_bytes=lambda _args, _cwd, _timeout: _png_bytes(),
+    )
+
+    with pytest.raises(RuntimeError, match="Android proof requires android_package"):
+        harness.run(
+            worktree=worktree,
+            proof_dir=proof_dir,
+            platforms=("android",),
+            android_serial="emulator-5554",
+            expected_text="Fitness First",
+            timeout_seconds=120,
+        )
+
+    assert not (proof_dir / "android-screenshot.png").exists()
+    assert not (proof_dir / "android-ui.xml").exists()
 
 
 def test_simulator_proof_android_rejects_expo_dev_client_launcher(monkeypatch, tmp_path):
@@ -710,7 +1558,7 @@ def test_simulator_proof_android_rejects_auth_gated_deep_link(tmp_path):
         )
 
 
-def test_open_android_url_shell_quotes_dev_client_url_with_query_separator(tmp_path):
+def test_open_android_url_quotes_deep_link_before_android_shell_package_args(tmp_path):
     calls = []
 
     def run_text(args, cwd, timeout):
@@ -1357,6 +2205,134 @@ def test_metro_bundle_request_detector_accepts_expo_bundled_line(tmp_path):
     stderr.write_text("Android Bundled 1240ms apps/elixir-card/index.js", encoding="utf-8")
 
     assert simulator_proof._metro_bundle_was_requested(stdout, stderr, "android")
+
+
+def test_final_route_parser_accepts_json_screen_route():
+    assert (
+        simulator_proof._last_screen_load_route(
+            'LOG  [APP-PERF-METRIC] ui.load | ok {"screen": "/SplashScreen"}'
+        )
+        == "/splashscreen"
+    )
+
+
+def test_target_route_wait_polls_until_metro_leaves_splash(monkeypatch, tmp_path):
+    stdout = tmp_path / "ios-metro.stdout.log"
+    stdout.write_text(
+        "LOG  [APP-PERF-METRIC] ui.load | screen.load /SplashScreen | 6ms | ok",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "5")
+    timeline = iter([10.0, 10.5])
+    monkeypatch.setattr(simulator_proof.time, "monotonic", lambda: next(timeline))
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        stdout.write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(simulator_proof.time, "sleep", sleep)
+
+    simulator_proof._wait_until_final_route_leaves_non_target(
+        "iOS",
+        stdout,
+        timeout_seconds=30,
+    )
+
+    assert sleeps == [0.5]
+
+
+def test_target_route_wait_polls_until_metro_leaves_short_splash_route(monkeypatch, tmp_path):
+    stdout = tmp_path / "ios-metro.stdout.log"
+    stdout.write_text(
+        "LOG  [APP-PERF-METRIC] ui.load | screen.load /Splash | 6ms | ok",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "5")
+    timeline = iter([10.0, 10.5])
+    monkeypatch.setattr(simulator_proof.time, "monotonic", lambda: next(timeline))
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        stdout.write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(simulator_proof.time, "sleep", sleep)
+
+    simulator_proof._wait_until_final_route_leaves_non_target(
+        "iOS",
+        stdout,
+        timeout_seconds=30,
+    )
+
+    assert sleeps == [0.5]
+
+
+def test_target_route_wait_polls_until_route_matches_deep_link(monkeypatch, tmp_path):
+    stdout = tmp_path / "ios-metro.stdout.log"
+    stdout.write_text(
+        "LOG  [APP-PERF-METRIC] ui.load | screen.load /Home | 6ms | ok",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "5")
+    timeline = iter([10.0, 10.5])
+    monkeypatch.setattr(simulator_proof.time, "monotonic", lambda: next(timeline))
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        stdout.write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(simulator_proof.time, "sleep", sleep)
+
+    simulator_proof._wait_until_final_route_leaves_non_target(
+        "iOS",
+        stdout,
+        timeout_seconds=30,
+        target_deep_link="elixir://marketplace/offer/fitness-first",
+    )
+
+    assert sleeps == [0.5]
+
+
+def test_target_route_wait_polls_until_route_matches_screen_marker(monkeypatch, tmp_path):
+    stdout = tmp_path / "ios-metro.stdout.log"
+    stdout.write_text(
+        "LOG  [APP-PERF-METRIC] ui.load | screen.load /Marketplace | 6ms | ok",
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("MONICA_PROOF_TARGET_WAIT_SECONDS", "5")
+    timeline = iter([10.0, 10.5])
+    monkeypatch.setattr(simulator_proof.time, "monotonic", lambda: next(timeline))
+    sleeps = []
+
+    def sleep(seconds):
+        sleeps.append(seconds)
+        stdout.write_text(
+            "LOG  [APP-PERF-METRIC] ui.load | screen.load /MarketplacePdp | 180ms | ok",
+            encoding="utf-8",
+        )
+
+    monkeypatch.setattr(simulator_proof.time, "sleep", sleep)
+
+    simulator_proof._wait_until_final_route_leaves_non_target(
+        "iOS",
+        stdout,
+        timeout_seconds=30,
+        require_route=True,
+        target_screen="/MarketplacePdp",
+    )
+
+    assert sleeps == [0.5]
 
 
 def test_metro_bundle_request_wait_fails_closed_with_log_paths(monkeypatch, tmp_path):

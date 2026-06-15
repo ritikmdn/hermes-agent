@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import sqlite3
 
+import pytest
+
 from plugins.mobile_bug_agent.state import MonicaState
 
 
@@ -22,6 +24,10 @@ def test_state_can_store_full_run_metadata(tmp_path):
         linear_identifier="MOB-42",
         linear_url="https://linear.app/acme/issue/MOB-42",
         branch_name="monica/MOB-42-checkout-crash",
+        base_branch="origin/dev",
+        base_commit="abc123base",
+        proof_deep_link="elixir-card://marketplace/offer/fitness-first",
+        proof_expected_text="Fitness First",
         pr_url="https://github.com/acme/mobile/pull/123",
     )
 
@@ -29,7 +35,111 @@ def test_state_can_store_full_run_metadata(tmp_path):
     assert saved is not None
     assert saved.status == "done"
     assert saved.linear_identifier == "MOB-42"
+    assert saved.base_branch == "origin/dev"
+    assert saved.base_commit == "abc123base"
+    assert saved.proof_deep_link == "elixir-card://marketplace/offer/fitness-first"
+    assert saved.proof_expected_text == "Fitness First"
     assert saved.pr_url.endswith("/123")
+
+
+def test_state_approval_clears_stale_fix_and_proof_metadata(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U123",
+        request_text="@monica marketplace PDP copy is wrong",
+    )
+    state.update_run(
+        run.id,
+        status="awaiting_fix_approval",
+        branch_name="monica/MOB-123-old-copy-fix",
+        base_branch="origin/dev",
+        base_commit="abc1234",
+        proof_deep_link="elixir-card://marketplace/offer/old-offer",
+        proof_expected_text="Old Offer",
+        proof_screen="/OldPdpScreen",
+        pr_url="https://github.com/acme/mobile/pull/123",
+        failure_reason="old failure",
+    )
+
+    approved = state.approve_fix(run.id, approved_by_user_id="U_APPROVER")
+
+    assert approved.status == "approved"
+    assert approved.approved_by_user_id == "U_APPROVER"
+    assert approved.branch_name == ""
+    assert approved.base_branch == ""
+    assert approved.base_commit == ""
+    assert approved.proof_deep_link == ""
+    assert approved.proof_expected_text == ""
+    assert approved.proof_screen == ""
+    assert approved.pr_url == ""
+    assert approved.failure_reason == ""
+
+
+def test_state_approve_once_clears_stale_fix_and_proof_metadata(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+    run = state.create_run(
+        platform="slack",
+        channel_id="C123",
+        thread_ts="1710000000.000100",
+        message_ts="1710000000.000100",
+        user_id="U123",
+        request_text="@monica marketplace PDP copy is wrong",
+    )
+    state.update_run(
+        run.id,
+        status="awaiting_fix_approval",
+        branch_name="monica/MOB-123-old-copy-fix",
+        base_branch="origin/dev",
+        base_commit="abc1234",
+        proof_deep_link="elixir-card://marketplace/offer/old-offer",
+        proof_expected_text="Old Offer",
+        proof_screen="/OldPdpScreen",
+        pr_url="https://github.com/acme/mobile/pull/123",
+        failure_reason="old failure",
+    )
+
+    approved, changed = state.approve_fix_once(run.id, approved_by_user_id="U_APPROVER")
+
+    assert changed is True
+    assert approved.status == "approved"
+    assert approved.approved_by_user_id == "U_APPROVER"
+    assert approved.branch_name == ""
+    assert approved.base_branch == ""
+    assert approved.base_commit == ""
+    assert approved.proof_deep_link == ""
+    assert approved.proof_expected_text == ""
+    assert approved.proof_screen == ""
+    assert approved.pr_url == ""
+    assert approved.failure_reason == ""
+
+
+def test_state_records_runtime_sync_metadata(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+
+    saved = state.record_runtime_sync(commit="abc12345", synced_at="2026-06-13T10:00:00Z")
+
+    assert saved == {
+        "last_synced_commit": "abc12345",
+        "last_synced_at": "2026-06-13T10:00:00Z",
+    }
+    reopened = MonicaState.open(tmp_path / "monica.sqlite")
+    assert reopened.runtime_sync_metadata() == saved
+
+
+def test_state_rejects_invalid_runtime_sync_commit(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+
+    with pytest.raises(ValueError, match="runtime sync commit must be a git SHA"):
+        state.record_runtime_sync(commit="not-a-sha", synced_at="2026-06-13T10:00:00Z")
+
+    assert state.runtime_sync_metadata() == {
+        "last_synced_commit": "",
+        "last_synced_at": "",
+    }
 
 
 def test_state_persists_raw_slack_payload(tmp_path):
@@ -92,6 +202,10 @@ def test_state_migrates_existing_run_table(tmp_path):
     assert run is not None
     assert run.linear_identifier == ""
     assert run.approved_by_user_id == ""
+    assert run.base_branch == ""
+    assert run.base_commit == ""
+    assert run.proof_deep_link == ""
+    assert run.proof_expected_text == ""
     assert run.raw_event == {}
 
 
@@ -222,3 +336,46 @@ def test_state_migration_collapses_duplicate_legacy_thread_rows_before_indexing(
     )
     assert created is False
     assert run.id == "run-done"
+
+
+def test_state_lists_runtime_sync_blocking_runs(tmp_path):
+    state = MonicaState.open(tmp_path / "monica.sqlite")
+    for status in (
+        "queued",
+        "triaging",
+        "awaiting_fix_approval",
+        "approved",
+        "fixing",
+        "verifying",
+        "proofing",
+        "opening_pr",
+        "proof_blocked",
+        "needs_clarification",
+        "blocked",
+        "failed",
+        "done",
+    ):
+        run = state.create_run(
+            platform="slack",
+            channel_id=f"C_{status}",
+            thread_ts=status,
+            message_ts=status,
+            user_id="U1",
+            request_text=f"@monica {status}",
+        )
+        state.update_run(run.id, status=status)
+
+    blocking = state.list_runtime_sync_blocking_runs()
+
+    assert [run.status for run in blocking] == [
+        "opening_pr",
+        "proof_blocked",
+        "proofing",
+        "verifying",
+        "fixing",
+        "approved",
+        "awaiting_fix_approval",
+        "triaging",
+        "queued",
+    ]
+    assert not state.is_idle_for_runtime_sync()

@@ -9,6 +9,7 @@ from plugins.mobile_bug_agent.linear_client import (
     LinearAttachmentPayload,
     LinearClient,
     LinearClientError,
+    LinearCommentPayload,
     LinearIssuePayload,
 )
 
@@ -328,6 +329,45 @@ def test_linear_client_creates_attachment():
         "title": "crash.png",
         "url": "https://files/crash.png",
         "subtitle": "image/png",
+    }
+
+
+def test_linear_client_creates_comment():
+    requests: list[dict] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        requests.append(json.loads(request.content.decode("utf-8")))
+        assert request.headers["Authorization"] == "lin_api_key"
+        return httpx.Response(
+            200,
+            json={
+                "data": {
+                    "commentCreate": {
+                        "success": True,
+                        "comment": {
+                            "id": "comment-id",
+                            "url": "https://linear.app/acme/issue/MOB-123#comment-id",
+                        },
+                    }
+                }
+            },
+        )
+
+    client = LinearClient(api_key="lin_api_key", transport=httpx.MockTransport(handler))
+
+    comment = client.create_comment(
+        LinearCommentPayload(
+            issue_id="issue-id",
+            body="Base: origin/dev @ abc123base",
+        )
+    )
+
+    assert comment.id == "comment-id"
+    assert comment.url == "https://linear.app/acme/issue/MOB-123#comment-id"
+    assert "commentCreate" in requests[0]["query"]
+    assert requests[0]["variables"]["input"] == {
+        "issueId": "issue-id",
+        "body": "Base: origin/dev @ abc123base",
     }
 
 
