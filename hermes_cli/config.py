@@ -4159,7 +4159,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates", "mobile_bug_agent",
+    "sessions", "streaming", "updates", "mcp_servers", "mobile_bug_agent",
 }
 
 # Valid fields inside a custom_providers list entry
