@@ -2299,6 +2299,74 @@ DEFAULT_CONFIG = {
         },
     },
 
+    # Monica mobile bug agent plugin. Disabled by default and loaded only
+    # when `plugins.enabled` includes `mobile-bug-agent`.
+    "mobile_bug_agent": {
+        "enabled": False,
+        "rollout_mode": "dry_run",
+        "dry_run": True,
+        "slack": {
+            "allowed_channels": [],
+            "approver_user_ids": [],
+            "bot_user_ids": [],
+            "download_attachments": True,
+        },
+        "loop": {
+            "max_iterations": 8,
+            "timeout_minutes": 30,
+            "no_progress_limit": 2,
+            "create_linear": True,
+            "require_fix_approval": True,
+            "max_thread_messages": 40,
+            "max_attachment_bytes": 15_000_000,
+        },
+        "linear": {
+            "team_id": "",
+            "project_id": "",
+            "label_ids": [],
+        },
+        "repo": {
+            "url": "",
+            "local_name": "mobile-app",
+            "default_branch": "main",
+            "branch_prefix": "monica",
+        },
+        "verification": {
+            "commands": [],
+        },
+        "proof": {
+            "enabled": False,
+            "required_for_done": False,
+            "platform_order": ["ios", "android"],
+            "artifact_dir": "proof",
+            "setup_commands": [],
+            "commands": [],
+            "required_env_keys": [],
+            "deep_link": "",
+            "dev_client_scheme": "",
+            "ios_simulator_udid": "",
+            "ios_bundle_id": "",
+            "android_serial": "",
+            "android_avd": "",
+            "android_package": "",
+            "timeout_minutes": 10,
+        },
+        "runtime": {
+            "home_subdir": "agents/monica",
+            "worker_session_prefix": "monica",
+            "skip_memory": True,
+        },
+        "worker": {
+            "backend": "codex_cli",
+            "codex_command": "codex",
+            "codex_model": "",
+            "codex_profile": "",
+            "codex_sandbox": "workspace-write",
+            "codex_approval_policy": "never",
+            "timeout_minutes": 45,
+        },
+    },
+
     # Real-time token streaming to messaging platforms (Telegram, Discord,
     # Slack, etc.). Read at the top level by the gateway; absent this block the
     # gateway falls back to these same defaults, so adding it here only makes
@@ -3292,6 +3360,20 @@ OPTIONAL_ENV_VARS = {
         "password": True,
         "category": "messaging",
     },
+    "MONICA_SLACK_BOT_TOKEN": {
+        "description": "Monica Slack bot token (xoxb-). Keep separate from Chandler's SLACK_BOT_TOKEN.",
+        "prompt": "Monica Slack Bot Token (xoxb-...)",
+        "url": "https://api.slack.com/apps",
+        "password": True,
+        "category": "messaging",
+    },
+    "MONICA_SLACK_APP_TOKEN": {
+        "description": "Monica Slack app-level token (xapp-) for Socket Mode. Keep separate from Chandler.",
+        "prompt": "Monica Slack App Token (xapp-...)",
+        "url": "https://api.slack.com/apps",
+        "password": True,
+        "category": "messaging",
+    },
     "MATTERMOST_URL": {
         "description": "Mattermost server URL (e.g. https://mm.example.com)",
         "prompt": "Mattermost server URL",
@@ -4129,7 +4211,7 @@ _KNOWN_ROOT_KEYS = {
     "fallback_providers", "credential_pool_strategies", "toolsets",
     "agent", "terminal", "display", "compression", "delegation",
     "auxiliary", "custom_providers", "context", "memory", "gateway",
-    "sessions", "streaming", "updates",
+    "sessions", "streaming", "updates", "mcp_servers", "mobile_bug_agent",
 }
 
 # Valid fields inside a custom_providers list entry

@@ -311,6 +311,43 @@ class TestLoadGatewayConfig:
 
         assert config.quick_commands == {"limits": {"type": "exec", "command": "echo ok"}}
 
+    def test_monica_enabled_profile_bridges_monica_slack_tokens(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text(
+            "mobile_bug_agent:\n"
+            "  enabled: true\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("MONICA_SLACK_BOT_TOKEN", "xoxb-monica")
+        monkeypatch.setenv("MONICA_SLACK_APP_TOKEN", "xapp-monica")
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+
+        config = load_gateway_config()
+
+        assert config.platforms[Platform.SLACK].enabled is True
+        assert config.platforms[Platform.SLACK].token == "xoxb-monica"
+        assert os.environ["SLACK_APP_TOKEN"] == "xapp-monica"
+
+    def test_non_monica_profile_ignores_monica_slack_tokens(self, tmp_path, monkeypatch):
+        hermes_home = tmp_path / ".hermes"
+        hermes_home.mkdir()
+        config_path = hermes_home / "config.yaml"
+        config_path.write_text("{}\n", encoding="utf-8")
+        monkeypatch.setenv("HERMES_HOME", str(hermes_home))
+        monkeypatch.setenv("MONICA_SLACK_BOT_TOKEN", "xoxb-monica")
+        monkeypatch.setenv("MONICA_SLACK_APP_TOKEN", "xapp-monica")
+        monkeypatch.delenv("SLACK_BOT_TOKEN", raising=False)
+        monkeypatch.delenv("SLACK_APP_TOKEN", raising=False)
+
+        config = load_gateway_config()
+
+        assert Platform.SLACK not in config.platforms
+        assert "SLACK_APP_TOKEN" not in os.environ
+
     def test_bridges_group_sessions_per_user_from_config_yaml(self, tmp_path, monkeypatch):
         hermes_home = tmp_path / ".hermes"
         hermes_home.mkdir()

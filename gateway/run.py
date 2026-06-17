@@ -94,6 +94,15 @@ _TELEGRAM_NOISY_STATUS_RE = re.compile(
     re.IGNORECASE | re.DOTALL,
 )
 
+_CHAT_NOISY_STATUS_RE = re.compile(
+    r"("
+    r"codex\s+gpt-5\.5\s+caps\s+context"
+    r"|auto-compaction\s+was\s+raised"
+    r"|compression\.codex_gpt55_autoraise"
+    r")",
+    re.IGNORECASE | re.DOTALL,
+)
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -376,6 +385,8 @@ def _prepare_gateway_status_message(platform: Any, event_type: str, message: str
     if not text:
         return None
     platform_value = _gateway_platform_value(platform)
+    if platform_value != "local" and _CHAT_NOISY_STATUS_RE.search(text):
+        return None
     if not _gateway_should_sanitize_chat(platform):
         return text
 
@@ -1285,6 +1296,16 @@ from gateway.whatsapp_identity import (
 
 
 logger = logging.getLogger(__name__)
+
+
+def _invoke_gateway_startup_plugin_hooks(gateway: Any) -> list[Any]:
+    try:
+        from hermes_cli.plugins import invoke_hook as _invoke_hook
+
+        return list(_invoke_hook("gateway_startup", gateway=gateway))
+    except Exception as exc:
+        logger.warning("gateway_startup plugin hook invocation failed: %s", exc)
+        return []
 
 
 # Sentinel placed into _running_agents immediately when a session starts
@@ -3165,6 +3186,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         except Exception:
             pass
+
+    async def _runtime_status_heartbeat_watcher(self, interval: float = 60.0) -> None:
+        """Refresh gateway_state.json while the gateway is healthy but idle."""
+        while self._running and not self._shutdown_event.is_set():
+            try:
+                await asyncio.wait_for(self._shutdown_event.wait(), timeout=interval)
+            except asyncio.TimeoutError:
+                pass
+            except asyncio.CancelledError:
+                raise
+
+            if not self._running or self._shutdown_event.is_set():
+                break
+            self._update_runtime_status("running")
 
     def _update_platform_runtime_status(
         self,
@@ -5068,6 +5103,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
+        _invoke_gateway_startup_plugin_hooks(self)
         
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
@@ -5143,6 +5179,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         asyncio.create_task(self._session_expiry_watcher())
+
+        # Keep runtime status fresh even when a gateway is healthy but idle.
+        asyncio.create_task(self._runtime_status_heartbeat_watcher())
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers
@@ -6484,6 +6523,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #    "text_type": "transport_normalization"} -> agent-only context, continue
         #   {"action": "respond", "text":  ...,
         #    "response_type": "guardrail"|...}      -> send text, stop dispatch
+        #   {"action": "skip_reply", "text": ...}   -> legacy alias for respond
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Conversational responses are deliberately not allowed here: hooks
         # may guard, annotate, normalize transport noise, or drop, but Chandler's

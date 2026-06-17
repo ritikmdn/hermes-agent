@@ -11,6 +11,7 @@ Covers:
 import sys
 from unittest.mock import MagicMock
 
+import pytest
 
 from hermes_cli.plugins import (
     PluginContext,
@@ -183,3 +184,48 @@ class TestProviderCollectorCliNoop:
         )
         # Should not store anything — CLI is discovered via file convention
         assert not hasattr(collector, "_cli_commands")
+
+
+def test_main_exits_with_plugin_command_status(monkeypatch):
+    """Plugin CLI handlers can return a process exit status."""
+    import hermes_cli.main as main_mod
+    import hermes_cli.plugins as plugin_mod
+    import plugins.memory as memory_mod
+
+    def setup_plugin_parser(_parser):
+        return None
+
+    def plugin_handler(_args):
+        return 7
+
+    monkeypatch.setattr(sys, "argv", ["hermes", "fake-plugin"])
+    monkeypatch.setattr(main_mod, "_set_process_title", lambda: None)
+    monkeypatch.setattr(main_mod, "_cleanup_quarantined_exes", lambda: None)
+    monkeypatch.setattr(main_mod, "_recover_from_interrupted_install", lambda: None)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_tui_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_try_termux_fast_cli_launch", lambda: False)
+    monkeypatch.setattr(main_mod, "_plugin_cli_discovery_needed", lambda: True)
+    monkeypatch.setattr(main_mod, "_prepare_agent_startup", lambda _args: None)
+    monkeypatch.setattr(
+        memory_mod,
+        "discover_plugin_cli_commands",
+        lambda: [
+            {
+                "name": "fake-plugin",
+                "help": "Fake plugin",
+                "description": "Fake plugin",
+                "setup_fn": setup_plugin_parser,
+                "handler_fn": plugin_handler,
+            }
+        ],
+    )
+    monkeypatch.setattr(plugin_mod, "discover_plugins", lambda: None)
+
+    manager = MagicMock()
+    manager._cli_commands = {}
+    monkeypatch.setattr(plugin_mod, "get_plugin_manager", lambda: manager)
+
+    with pytest.raises(SystemExit) as exc:
+        main_mod.main()
+
+    assert exc.value.code == 7

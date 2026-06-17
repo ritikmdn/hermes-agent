@@ -31,7 +31,11 @@ def _clear_auth_env(monkeypatch) -> None:
         monkeypatch.delenv(key, raising=False)
 
 
-def _make_event(text: str = "hello", platform: Platform = Platform.WHATSAPP) -> MessageEvent:
+def _make_event(
+    text: str = "hello",
+    platform: Platform = Platform.WHATSAPP,
+    thread_id: str | None = None,
+) -> MessageEvent:
     return MessageEvent(
         text=text,
         message_id="m1",
@@ -41,6 +45,7 @@ def _make_event(text: str = "hello", platform: Platform = Platform.WHATSAPP) -> 
             chat_id="15551234567@s.whatsapp.net",
             user_name="tester",
             chat_type="dm",
+            thread_id=thread_id,
         ),
     )
 
@@ -83,6 +88,64 @@ async def test_hook_skip_short_circuits_dispatch(monkeypatch):
 
     assert result is None
     adapter.send.assert_not_awaited()
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hook_skip_reply_sends_reply_then_short_circuits(monkeypatch):
+    """A plugin can drop dispatch while sending a visible reply."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "skip_reply", "text": "Approval denied."}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.SLACK)
+
+    result = await runner._handle_message(
+        _make_event("approved, fix it", platform=Platform.SLACK)
+    )
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "15551234567@s.whatsapp.net",
+        "Approval denied.",
+        metadata=None,
+    )
+    runner.pairing_store.generate_code.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_hook_skip_reply_preserves_thread_metadata(monkeypatch):
+    """Visible hook replies stay in the originating Slack thread."""
+    _clear_auth_env(monkeypatch)
+
+    def _fake_hook(name, **kwargs):
+        if name == "pre_gateway_dispatch":
+            return [{"action": "skip_reply", "text": "Approval denied."}]
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, adapter = _make_runner(Platform.SLACK)
+
+    result = await runner._handle_message(
+        _make_event(
+            "approved, fix it",
+            platform=Platform.SLACK,
+            thread_id="1710000000.000100",
+        )
+    )
+
+    assert result is None
+    adapter.send.assert_awaited_once_with(
+        "15551234567@s.whatsapp.net",
+        "Approval denied.",
+        metadata={"thread_id": "1710000000.000100"},
+    )
     runner.pairing_store.generate_code.assert_not_called()
 
 

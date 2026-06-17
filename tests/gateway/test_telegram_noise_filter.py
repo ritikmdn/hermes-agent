@@ -57,6 +57,18 @@ def test_slack_final_response_sanitizes_provider_rate_limits():
     assert "API call failed" not in sanitized
 
 
+def test_slack_status_suppresses_codex_auto_compaction_notice():
+    """Codex compression config notices should stay out of Slack chat."""
+    message = (
+        "ℹ Codex gpt-5.5 caps context at 272K, so auto-compaction was "
+        "raised to 85% (from 50%) to use more of the window before summarizing.\n"
+        "Opt back out: hermes config set compression.codex_gpt55_autoraise false"
+    )
+
+    assert _prepare_gateway_status_message(Platform.SLACK, "lifecycle", message) is None
+    assert _prepare_gateway_status_message("local", "lifecycle", message) == message
+
+
 def test_telegram_status_sanitizes_raw_provider_security_errors():
     """Provider policy/security bodies should be replaced before chat delivery."""
     raw = (

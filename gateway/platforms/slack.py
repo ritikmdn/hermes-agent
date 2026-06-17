@@ -54,6 +54,70 @@ from gateway.platforms.base import (
 
 logger = logging.getLogger(__name__)
 
+
+def _approval_command_kind(command: str) -> str:
+    """Return a plain-language command category for Slack approval prompts."""
+    cmd = (command or "").lower()
+    if (
+        "scripts/run-ad-hoc-query.ts" in cmd
+        or "scripts/run-posthog-query.ts" in cmd
+        or "scripts/run-analytics-question.ts" in cmd
+        or "claude-analytics" in cmd
+    ):
+        return "local analytics command"
+    return "local command"
+
+
+def _humanize_approval_reason(description: str) -> str:
+    """Translate internal approval-rule names into Slack-user copy."""
+    desc = (description or "command flagged for review").strip()
+    normalized = desc.lower()
+
+    if "script execution via -e/-c flag" in normalized:
+        return (
+            "This command runs a short inline script. That can be normal for "
+            "analytics glue code, but Hermes asks before running generated scripts."
+        )
+    if "shell command via -c" in normalized:
+        return (
+            "This command asks a shell to run another command string. Hermes "
+            "pauses these because they can hide extra work inside the string."
+        )
+    if "sql delete without where" in normalized:
+        return "This looks like a broad SQL delete, so Hermes needs explicit confirmation."
+    if "sql drop" in normalized:
+        return "This looks like it could drop database objects, so Hermes needs explicit confirmation."
+
+    return f"Hermes flagged this command for review: {desc}."
+
+
+def _build_slack_exec_approval_text(command: str, description: str) -> str:
+    """Build a Slack section block under Slack's 3000-character cap."""
+    command_kind = _approval_command_kind(command)
+    reason = _humanize_approval_reason(description)
+    prefix = (
+        ":warning: *Permission needed to continue*\n"
+        f"The assistant needs to run a {command_kind} before it can answer. "
+        "If this matches the lookup you just asked for, choose *Allow Once*. "
+        "Choose *Deny* if this looks unexpected.\n\n"
+        f"*Why Hermes paused:* {reason}\n\n"
+        "*Command preview:*\n```"
+    )
+    suffix = "```"
+    budget = 3000 - len(prefix) - len(suffix) - len("...")
+    if budget < 0:
+        prefix = (
+            ":warning: *Permission needed to continue*\n"
+            "The assistant needs confirmation before running a local command. "
+            "Choose *Allow Once* only if this matches your request; otherwise choose *Deny*.\n\n"
+            "*Command preview:*\n```"
+        )
+        budget = 3000 - len(prefix) - len(suffix) - len("...")
+
+    cmd_preview = command[:budget] + "..." if len(command) > budget else command
+    return f"{prefix}{cmd_preview}{suffix}"
+
+
 # ContextVar carrying the user_id of the slash-command invoker.
 # Set in _handle_slash_command, read in send() to match the correct
 # stashed response_url when multiple users issue commands on the same
@@ -3008,24 +3072,15 @@ class SlackAdapter(BasePlatformAdapter):
         try:
             thread_ts = self._resolve_thread_ts(None, metadata)
 
-            # Slack hard-caps a section block's text at 3000 chars; an
-            # oversized block fails the whole send with ``invalid_blocks``
-            # and the gateway falls back to the plain-text prompt (no
-            # buttons).  execute_code approvals embed the entire script in
-            # ``command``, so budget the preview against the fixed parts
-            # instead of a flat truncation that overflows once the header +
-            # reason are added.
-            header = ":warning: *Command Approval Required*\n"
-            reason = f"Reason: {description[:500]}"
-            budget = 3000 - len(header) - len(reason) - len("``````\n") - len("...")
-            cmd_preview = command[:budget] + "..." if len(command) > budget else command
+            section_text = _build_slack_exec_approval_text(command, description)
+            cmd_preview = command[:100] + "..." if len(command) > 100 else command
 
             blocks = [
                 {
                     "type": "section",
                     "text": {
                         "type": "mrkdwn",
-                        "text": f"{header}```{cmd_preview}```\n{reason}",
+                        "text": section_text,
                     },
                 },
                 {

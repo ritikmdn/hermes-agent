@@ -239,6 +239,20 @@ def route_pre_gateway_hooks(hook_results: list[Any]) -> RouteDecision:
             )
             continue
 
+        if action == "skip_reply":
+            text = result.get("text") or result.get("content")
+            decision.hook_decisions.append(_hook_decision(result, applied=True))
+            decision.final_reason = str(result.get("reason") or "hook_skip_reply")
+            if isinstance(text, str) and text.strip():
+                decision.route = "respond"
+                decision.response_text = text.strip()
+                decision.response_type = "system_notice"
+                metadata = result.get("metadata")
+                decision.metadata = metadata if isinstance(metadata, dict) else None
+            else:
+                decision.route = "skip"
+            return decision
+
         if action == "respond":
             response_type = str(result.get("response_type") or result.get("kind") or "").strip().lower()
             if response_type not in INFRASTRUCTURE_RESPONSE_TYPES:

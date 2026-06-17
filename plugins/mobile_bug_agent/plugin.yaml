@@ -1,0 +1,9 @@
+name: mobile-bug-agent
+version: 0.1.0
+description: "Agentic Slack-to-Linear mobile bug loop. Docs: docs/monica-agent.md."
+author: "NousResearch"
+hooks:
+  - pre_gateway_dispatch
+  - gateway_startup
+  - pre_update
+  - post_update

@@ -343,6 +343,28 @@ class TestReadManifest:
         assert result == {}
 
 
+def test_plugin_exists_accepts_bundled_manifest_name_with_different_directory(
+    tmp_path,
+    monkeypatch,
+):
+    import hermes_cli.plugins_cmd as pc
+
+    bundled_root = tmp_path / "bundled"
+    plugin_dir = bundled_root / "mobile_bug_agent"
+    plugin_dir.mkdir(parents=True)
+    (plugin_dir / "plugin.yaml").write_text(
+        yaml.safe_dump({"name": "mobile-bug-agent", "version": "0.1.0"}),
+        encoding="utf-8",
+    )
+    user_root = tmp_path / "user"
+    user_root.mkdir()
+
+    monkeypatch.setattr(pc, "_plugins_dir", lambda: user_root)
+    monkeypatch.setattr("hermes_cli.plugins.get_bundled_plugins_dir", lambda: bundled_root)
+
+    assert pc._plugin_exists("mobile-bug-agent") is True
+
+
 # ── cmd_install tests ─────────────────────────────────────────────────────────
 
 
