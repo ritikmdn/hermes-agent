@@ -3429,6 +3429,116 @@ class TestRunConversation:
         assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
         assert mock_handle_function_call.call_args.kwargs["session_id"] == agent.session_id
 
+    def test_tool_direct_final_response_short_circuits_follow_up_model_call(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("skill_view")
+        tc = _mock_tool_call(name="skill_view", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        direct_text = "Direct answer from the tool.\nDashboard: https://analytics.example.com/query?payload=abc"
+        agent.client.chat.completions.create.return_value = resp1
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "ok": True,
+                        "hermes_direct_final_response": direct_text,
+                    }
+                ),
+            ) as mock_handle_function_call,
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("search something")
+
+        assert result["final_response"] == direct_text
+        assert result["completed"] is True
+        assert result["turn_exit_reason"] == "direct_tool_final_response"
+        assert result["api_calls"] == 1
+        assert agent.client.chat.completions.create.call_count == 1
+        assert mock_handle_function_call.call_args.kwargs["tool_call_id"] == "c1"
+        assert result["messages"][-1] == {"role": "assistant", "content": direct_text}
+
+    def test_tool_agent_instruction_is_elevated_to_next_model_call(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.add("skill_view")
+        tc = _mock_tool_call(name="skill_view", arguments="{}", call_id="c1")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc])
+        resp2 = _mock_response(content="Done.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2]
+        instruction = (
+            "Call `clarify` with payload.clarificationQuestion before answering."
+        )
+
+        with (
+            patch(
+                "run_agent.handle_function_call",
+                return_value=json.dumps(
+                    {
+                        "ok": True,
+                        "hermes_agent_instruction": instruction,
+                    }
+                ),
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("ambiguous analytics question")
+
+        assert result["final_response"] == "Done."
+        assert agent.client.chat.completions.create.call_count == 2
+        second_call_messages = (
+            agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        )
+        assert second_call_messages[0]["role"] == "system"
+        assert (
+            "[Agent runtime instructions from tool results]"
+            in second_call_messages[0]["content"]
+        )
+        assert instruction in second_call_messages[0]["content"]
+        assert all(msg.get("role") != "system" for msg in result["messages"])
+
+    def test_tool_agent_instruction_is_one_shot(self, agent):
+        self._setup_agent(agent)
+        agent.valid_tool_names.update({"skill_view", "web_search"})
+        tc1 = _mock_tool_call(name="skill_view", arguments="{}", call_id="c1")
+        tc2 = _mock_tool_call(name="web_search", arguments="{}", call_id="c2")
+        resp1 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc1])
+        resp2 = _mock_response(content="", finish_reason="tool_calls", tool_calls=[tc2])
+        resp3 = _mock_response(content="Done.", finish_reason="stop")
+        agent.client.chat.completions.create.side_effect = [resp1, resp2, resp3]
+        instruction = "Treat the next response as a clarification turn."
+
+        def _tool_result(*args, **kwargs):
+            if kwargs.get("tool_call_id") == "c1":
+                return json.dumps({"hermes_agent_instruction": instruction})
+            return json.dumps({"ok": True, "result": "search complete"})
+
+        with (
+            patch("run_agent.handle_function_call", side_effect=_tool_result),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("ambiguous analytics question")
+
+        assert result["final_response"] == "Done."
+        assert agent.client.chat.completions.create.call_count == 3
+        second_call_messages = (
+            agent.client.chat.completions.create.call_args_list[1].kwargs["messages"]
+        )
+        third_call_messages = (
+            agent.client.chat.completions.create.call_args_list[2].kwargs["messages"]
+        )
+        assert instruction in second_call_messages[0]["content"]
+        assert (
+            "[Agent runtime instructions from tool results]"
+            not in third_call_messages[0]["content"]
+        )
+
     def test_request_scoped_api_hooks_fire_for_each_api_call(self, agent):
         self._setup_agent(agent)
         tc = _mock_tool_call(name="web_search", arguments="{}", call_id="c1")

@@ -1458,6 +1458,10 @@ class MessageEvent:
     # from ``text`` so the sender-prefix logic in run.py can operate on the
     # trigger message alone, then prepend this context afterward.
     channel_context: Optional[str] = None
+
+    # Agent-runtime context injected by gateway hooks. This is appended to
+    # the system prompt for the current turn and is not persisted as user text.
+    runtime_context: Optional[str] = None
     
     # Internal flag — set for synthetic events (e.g. background process
     # completion notifications) that must bypass user authorization checks.

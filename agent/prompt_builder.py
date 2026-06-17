@@ -530,6 +530,8 @@ PLATFORM_HINTS = {
     ),
     "slack": (
         "You are in a Slack workspace communicating with your user. "
+        "Markdown tables are supported and routed through Slack native table rendering; "
+        "use concise pipe tables when tabular data is the clearest format. "
         "You can send media files natively: include MEDIA:/absolute/path/to/file "
         "in your response. Images (.png, .jpg, .webp) are uploaded as photo "
         "attachments, audio as file attachments. You can also include image URLs "

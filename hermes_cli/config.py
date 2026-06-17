@@ -1302,6 +1302,14 @@ DEFAULT_CONFIG = {
             "timeout": 30,
             "extra_body": {},
         },
+        "agentic_router": {
+            "provider": "auto",
+            "model": "",           # fast advisory classifier; never answers users
+            "base_url": "",
+            "api_key": "",
+            "timeout": 15,
+            "extra_body": {},
+        },
         "title_generation": {
             "provider": "auto",
             "model": "",
@@ -2278,6 +2286,17 @@ DEFAULT_CONFIG = {
         # multi-tool agent turn. Bridged to HERMES_MEDIA_TRUST_RECENT_SECONDS.
         # Only consulted when ``strict`` is true.
         "trust_recent_files_seconds": 600,
+        "agentic_router": {
+            # Optional fast middle-model classifier. Disabled by default:
+            # accuracy lives in the main agent. When enabled, the model's
+            # output is reduced to advisory runtime context and cannot
+            # produce user-facing answers or override hook guardrails.
+            "middle_model": {
+                "enabled": False,
+                "max_tokens": 256,
+                "timeout": 15,
+            },
+        },
     },
 
     # Real-time token streaming to messaging platforms (Telegram, Discord,

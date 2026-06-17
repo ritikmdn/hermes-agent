@@ -635,7 +635,7 @@ class TestPluginHooks:
         assert "pre_gateway_dispatch" in VALID_HOOKS
 
     def test_pre_gateway_dispatch_collects_action_dicts(self, tmp_path, monkeypatch):
-        """pre_gateway_dispatch callbacks return action dicts (skip/rewrite/allow)."""
+        """pre_gateway_dispatch callbacks return gateway action dicts."""
         plugins_dir = tmp_path / "hermes_test" / "plugins"
         _make_plugin_dir(
             plugins_dir, "predispatch_plugin",

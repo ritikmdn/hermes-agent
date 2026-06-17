@@ -507,12 +507,32 @@ CREATE TABLE IF NOT EXISTS compression_locks (
     expires_at REAL NOT NULL
 );
 
+CREATE TABLE IF NOT EXISTS gateway_turns (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    session_id TEXT NOT NULL,
+    turn_id TEXT NOT NULL,
+    platform TEXT,
+    chat_id TEXT,
+    user_id TEXT,
+    message_id TEXT,
+    final_action TEXT,
+    final_reason TEXT,
+    decision_count INTEGER DEFAULT 0,
+    created_at REAL NOT NULL,
+    recorded_at REAL NOT NULL,
+    summary_json TEXT NOT NULL
+);
+
 CREATE INDEX IF NOT EXISTS idx_sessions_source ON sessions(source);
 CREATE INDEX IF NOT EXISTS idx_sessions_source_id ON sessions(source, id);
 CREATE INDEX IF NOT EXISTS idx_sessions_parent ON sessions(parent_session_id);
 CREATE INDEX IF NOT EXISTS idx_sessions_started ON sessions(started_at DESC);
 CREATE INDEX IF NOT EXISTS idx_messages_session ON messages(session_id, timestamp);
 CREATE INDEX IF NOT EXISTS idx_compression_locks_expires ON compression_locks(expires_at);
+CREATE INDEX IF NOT EXISTS idx_gateway_turns_session
+    ON gateway_turns(session_id, recorded_at);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_gateway_turns_turn_id
+    ON gateway_turns(turn_id);
 """
 
 # Indexes that reference columns added in later schema versions must be
@@ -2359,6 +2379,84 @@ class SessionDB:
             return msg_id
 
         return self._execute_write(_do)
+
+    def append_gateway_turn(self, session_id: str, summary: Dict[str, Any]) -> int:
+        """Persist an auditable gateway decision ledger for one inbound turn."""
+        if not session_id:
+            session_id = str(summary.get("session_id") or summary.get("turn_id") or "unknown")
+        stored_summary = dict(summary or {})
+        stored_summary.setdefault("session_id", session_id)
+        summary_json = json.dumps(stored_summary, ensure_ascii=False, sort_keys=True)
+        created_at = float(stored_summary.get("created_at") or time.time())
+        recorded_at = time.time()
+
+        def _do(conn):
+            cursor = conn.execute(
+                """INSERT OR REPLACE INTO gateway_turns (
+                   session_id, turn_id, platform, chat_id, user_id, message_id,
+                   final_action, final_reason, decision_count, created_at,
+                   recorded_at, summary_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                (
+                    session_id,
+                    str(stored_summary.get("turn_id") or ""),
+                    stored_summary.get("platform"),
+                    stored_summary.get("chat_id"),
+                    stored_summary.get("user_id"),
+                    stored_summary.get("message_id"),
+                    stored_summary.get("final_action"),
+                    stored_summary.get("final_reason"),
+                    int(stored_summary.get("decision_count") or 0),
+                    created_at,
+                    recorded_at,
+                    summary_json,
+                ),
+            )
+            return cursor.lastrowid
+
+        return self._execute_write(_do)
+
+    def get_gateway_turns(self, session_id: str, limit: int = 50) -> List[Dict[str, Any]]:
+        """Return recent gateway turn ledgers for a session."""
+        if not session_id:
+            return []
+        with self._lock:
+            rows = self._conn.execute(
+                """SELECT id, session_id, turn_id, platform, chat_id, user_id,
+                          message_id, final_action, final_reason, decision_count,
+                          created_at, recorded_at, summary_json
+                   FROM gateway_turns
+                   WHERE session_id = ?
+                   ORDER BY recorded_at DESC, id DESC
+                   LIMIT ?""",
+                (session_id, max(1, int(limit or 50))),
+            ).fetchall()
+
+        results: List[Dict[str, Any]] = []
+        for row in rows:
+            raw_summary = row["summary_json"] if isinstance(row, sqlite3.Row) else row[12]
+            try:
+                summary = json.loads(raw_summary) if raw_summary else {}
+            except (TypeError, json.JSONDecodeError):
+                summary = {}
+            results.append(
+                {
+                    "id": row["id"],
+                    "session_id": row["session_id"],
+                    "turn_id": row["turn_id"],
+                    "platform": row["platform"],
+                    "chat_id": row["chat_id"],
+                    "user_id": row["user_id"],
+                    "message_id": row["message_id"],
+                    "final_action": row["final_action"],
+                    "final_reason": row["final_reason"],
+                    "decision_count": row["decision_count"],
+                    "created_at": row["created_at"],
+                    "recorded_at": row["recorded_at"],
+                    "summary": summary,
+                }
+            )
+        return results
 
     def replace_messages(self, session_id: str, messages: List[Dict[str, Any]]) -> None:
         """Atomically replace every message for a session.

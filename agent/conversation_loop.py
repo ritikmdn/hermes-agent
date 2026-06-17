@@ -70,6 +70,160 @@ logger = logging.getLogger(__name__)
 # to treat it as cancellation metadata rather than assistant prose.
 INTERRUPT_WAITING_FOR_MODEL_PREFIX = "Operation interrupted: waiting for model response ("
 
+_DIRECT_TOOL_FINAL_RESPONSE_KEY = "hermes_direct_final_response"
+_DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS = 20_000
+_TOOL_AGENT_INSTRUCTION_KEY = "hermes_agent_instruction"
+_TOOL_AGENT_INSTRUCTION_MAX_CHARS = 4_000
+_TOOL_AGENT_INSTRUCTIONS_MAX_CHARS = 12_000
+
+
+def _extract_direct_tool_final_response(messages: list, tool_calls: list) -> str | None:
+    """Return an opt-in final response emitted by a single tool result.
+
+    This is deliberately narrow: the model must have made exactly one tool call,
+    and the most recent tool message must be that call's JSON result containing
+    `hermes_direct_final_response`. It lets deterministic tools return a
+    user-ready answer without paying for an extra model turn.
+    """
+    if len(tool_calls or []) != 1 or not messages:
+        return None
+
+    last_message = messages[-1]
+    if not isinstance(last_message, dict) or last_message.get("role") != "tool":
+        return None
+
+    tool_call = tool_calls[0]
+    if last_message.get("tool_call_id") != getattr(tool_call, "id", None):
+        return None
+
+    content = last_message.get("content")
+    if not isinstance(content, str) or not content.strip():
+        return None
+
+    try:
+        payload = json.loads(content)
+    except (TypeError, json.JSONDecodeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+
+    direct_response = payload.get(_DIRECT_TOOL_FINAL_RESPONSE_KEY)
+    if not isinstance(direct_response, str) or not direct_response.strip():
+        return None
+
+    direct_response = direct_response.strip()
+    if len(direct_response) <= _DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS:
+        return direct_response
+    return (
+        direct_response[:_DIRECT_TOOL_FINAL_RESPONSE_MAX_CHARS].rstrip()
+        + "\n\n[Direct tool response truncated.]"
+    )
+
+
+def _tool_call_id(tool_call: Any) -> str | None:
+    if isinstance(tool_call, dict):
+        call_id = tool_call.get("id")
+    else:
+        call_id = getattr(tool_call, "id", None)
+    return call_id if isinstance(call_id, str) and call_id else None
+
+
+def _tool_result_text(content: Any) -> str | None:
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: list[str] = []
+        for part in content:
+            if isinstance(part, dict) and part.get("type") == "text":
+                text = part.get("text")
+                if isinstance(text, str):
+                    parts.append(text)
+        return "\n".join(parts) if parts else None
+    return None
+
+
+def _loads_json_object_prefix(content: str) -> dict | None:
+    text = content.strip()
+    if not text:
+        return None
+    try:
+        payload = json.loads(text)
+    except (TypeError, json.JSONDecodeError):
+        try:
+            payload, _ = json.JSONDecoder().raw_decode(text)
+        except (TypeError, json.JSONDecodeError):
+            return None
+    return payload if isinstance(payload, dict) else None
+
+
+def _extract_tool_agent_instructions(messages: list, tool_calls: list) -> list[str]:
+    """Return opt-in agent-runtime instructions emitted by current tool results.
+
+    Unlike ``hermes_direct_final_response``, this does not finish the turn.
+    It gives deterministic tools a first-class way to steer the next model
+    iteration without rewriting user text or adding persisted synthetic chat.
+    """
+    ordered_ids = [_tool_call_id(tc) for tc in (tool_calls or [])]
+    ordered_ids = [call_id for call_id in ordered_ids if call_id]
+    if not ordered_ids or not messages:
+        return []
+
+    wanted_ids = set(ordered_ids)
+    result_by_id: dict[str, dict] = {}
+    for msg in reversed(messages):
+        if not isinstance(msg, dict):
+            continue
+        if msg.get("role") == "tool":
+            call_id = msg.get("tool_call_id")
+            if call_id in wanted_ids and call_id not in result_by_id:
+                result_by_id[call_id] = msg
+                if len(result_by_id) == len(wanted_ids):
+                    break
+        elif result_by_id and msg.get("role") == "assistant" and msg.get("tool_calls"):
+            break
+
+    instructions: list[str] = []
+    total_chars = 0
+    for call_id in ordered_ids:
+        msg = result_by_id.get(call_id)
+        if not msg:
+            continue
+        content = _tool_result_text(msg.get("content"))
+        if not content:
+            continue
+        payload = _loads_json_object_prefix(content)
+        if not payload:
+            continue
+        raw_instruction = payload.get(_TOOL_AGENT_INSTRUCTION_KEY)
+        if not isinstance(raw_instruction, str) or not raw_instruction.strip():
+            continue
+        instruction = raw_instruction.strip()
+        if len(instruction) > _TOOL_AGENT_INSTRUCTION_MAX_CHARS:
+            instruction = (
+                instruction[:_TOOL_AGENT_INSTRUCTION_MAX_CHARS].rstrip()
+                + "\n[Tool agent instruction truncated.]"
+            )
+        if total_chars + len(instruction) > _TOOL_AGENT_INSTRUCTIONS_MAX_CHARS:
+            remaining = _TOOL_AGENT_INSTRUCTIONS_MAX_CHARS - total_chars
+            suffix = "\n[Tool agent instructions truncated.]"
+            if remaining <= len(suffix):
+                break
+            instruction = (
+                instruction[: remaining - len(suffix)].rstrip()
+                + suffix
+            )
+        instructions.append(instruction)
+        total_chars += len(instruction)
+    return instructions
+
+
+def _format_tool_agent_instruction_block(instructions: list[str]) -> str:
+    if not instructions:
+        return ""
+    lines = ["[Agent runtime instructions from tool results]"]
+    lines.extend(f"- {instruction}" for instruction in instructions if instruction.strip())
+    return "\n".join(lines)
+
 
 def _ollama_context_limit_error(agent: Any, request_tokens: int) -> Optional[str]:
     """Return a user-facing error when Ollama is loaded with too little context."""
@@ -441,6 +595,7 @@ def run_conversation(
     length_continue_retries = 0
     truncated_tool_call_retries = 0
     truncated_response_parts: List[str] = []
+    tool_agent_instructions: list[str] = []
     compression_attempts = 0
     _turn_exit_reason = "unknown"  # Diagnostic: why the loop ended
 
@@ -666,6 +821,10 @@ def run_conversation(
         effective_system = active_system_prompt or ""
         if agent.ephemeral_system_prompt:
             effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        tool_agent_instruction_block = _format_tool_agent_instruction_block(tool_agent_instructions)
+        tool_agent_instructions_sent = bool(tool_agent_instruction_block)
+        if tool_agent_instruction_block:
+            effective_system = (effective_system + "\n\n" + tool_agent_instruction_block).strip()
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
@@ -3302,6 +3461,9 @@ def run_conversation(
             agent._persist_session(messages, conversation_history)
             break
 
+        if tool_agent_instructions_sent:
+            tool_agent_instructions.clear()
+
         try:
             _transport = agent._get_transport()
             _normalize_kwargs = {}
@@ -3752,6 +3914,23 @@ def run_conversation(
                             except Exception:
                                 pass
                     break
+
+                direct_final_response = _extract_direct_tool_final_response(
+                    messages,
+                    assistant_message.tool_calls,
+                )
+                if direct_final_response is not None:
+                    _turn_exit_reason = "direct_tool_final_response"
+                    final_response = direct_final_response
+                    messages.append({"role": "assistant", "content": final_response})
+                    break
+
+                tool_agent_instructions.extend(
+                    _extract_tool_agent_instructions(
+                        messages,
+                        assistant_message.tool_calls,
+                    )
+                )
 
                 # Reset per-turn retry counters after successful tool
                 # execution so a single truncation doesn't poison the

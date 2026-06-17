@@ -721,10 +721,13 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     except ImportError:
         _feishu_available = False
 
+    slack_blocks = None
     if platform == Platform.SLACK and message:
         try:
             slack_adapter = SlackAdapter.__new__(SlackAdapter)
-            message = slack_adapter.format_message(message)
+            slack_payload = slack_adapter._build_message_payload(message)
+            message = slack_payload["text"]
+            slack_blocks = slack_payload.get("blocks")
         except Exception:
             logger.debug("Failed to apply Slack mrkdwn formatting in _send_to_platform", exc_info=True)
 
@@ -751,7 +754,9 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     # For short messages or platforms without a known limit this is a no-op.
     # Telegram measures length in UTF-16 code units, not Unicode codepoints.
     max_len = _MAX_LENGTHS.get(platform)
-    if max_len:
+    if platform == Platform.SLACK and slack_blocks:
+        chunks = [message]
+    elif max_len:
         _len_fn = utf16_len if platform == Platform.TELEGRAM else None
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
@@ -887,7 +892,23 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
     last_result = None
     for chunk in chunks:
         if platform == Platform.SLACK:
-            result = await _send_slack(pconfig.token, chat_id, chunk, thread_ts=thread_id)
+            if slack_blocks:
+                slack_kwargs = {"blocks": slack_blocks}
+                if thread_id:
+                    slack_kwargs["thread_ts"] = thread_id
+                result = await _send_slack(
+                    pconfig.token,
+                    chat_id,
+                    chunk,
+                    **slack_kwargs,
+                )
+            else:
+                result = await _send_slack(
+                    pconfig.token,
+                    chat_id,
+                    chunk,
+                    thread_ts=thread_id,
+                )
         elif platform == Platform.WHATSAPP:
             result = await _send_whatsapp(pconfig.extra, chat_id, chunk)
         elif platform == Platform.SIGNAL:
@@ -898,6 +919,8 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
             result = await _send_sms(pconfig.api_key, chat_id, chunk)
         elif platform == Platform.MATRIX:
             result = await _send_matrix(pconfig.token, pconfig.extra, chat_id, chunk)
+        elif platform == Platform.HOMEASSISTANT:
+            result = await _send_homeassistant(pconfig.token, pconfig.extra, chat_id, chunk)
         elif platform == Platform.DINGTALK:
             result = await _send_dingtalk(pconfig.extra, chat_id, chunk)
         elif platform == Platform.FEISHU:
@@ -1167,7 +1190,7 @@ async def _send_telegram(token, chat_id, message, media_files=None, thread_id=No
         return _error(f"Telegram send failed: {e}")
 
 
-async def _send_slack(token, chat_id, message, thread_ts=None):
+async def _send_slack(token, chat_id, message, *, thread_ts=None, blocks=None):
     """Send via Slack Web API."""
     try:
         import aiohttp
@@ -1180,13 +1203,47 @@ async def _send_slack(token, chat_id, message, thread_ts=None):
         url = "https://slack.com/api/chat.postMessage"
         headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
         async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30), **_sess_kw) as session:
-            payload = {"channel": chat_id, "text": message, "mrkdwn": True}
+            payload = {"channel": chat_id, "text": message}
             if thread_ts:
                 payload["thread_ts"] = thread_ts
+            if blocks:
+                payload["blocks"] = blocks
+            else:
+                payload["mrkdwn"] = True
             async with session.post(url, headers=headers, json=payload, **_req_kw) as resp:
                 data = await resp.json()
                 if data.get("ok"):
                     return {"success": True, "platform": "slack", "chat_id": chat_id, "message_id": data.get("ts")}
+                if blocks:
+                    try:
+                        from gateway.platforms.slack import SlackAdapter
+
+                        slack_adapter = SlackAdapter.__new__(SlackAdapter)
+                        fallback_payload = slack_adapter._build_message_payload(
+                            message,
+                            force_text_fallback=True,
+                        )
+                    except Exception:
+                        logger.debug("Failed to build Slack fallback payload", exc_info=True)
+                        fallback_payload = {"text": message, "mrkdwn": True}
+
+                    retry_payload = {
+                        "channel": chat_id,
+                        "text": fallback_payload["text"],
+                        "mrkdwn": True,
+                    }
+                    if thread_ts:
+                        retry_payload["thread_ts"] = thread_ts
+                    async with session.post(url, headers=headers, json=retry_payload, **_req_kw) as retry_resp:
+                        retry_data = await retry_resp.json()
+                        if retry_data.get("ok"):
+                            return {
+                                "success": True,
+                                "platform": "slack",
+                                "chat_id": chat_id,
+                                "message_id": retry_data.get("ts"),
+                            }
+                        data = retry_data
                 return _error(f"Slack API error: {data.get('error', 'unknown')}")
     except Exception as e:
         return _error(f"Slack send failed: {e}")
@@ -1592,6 +1649,29 @@ async def _send_matrix_via_adapter(pconfig, chat_id, message, media_files=None, 
             await adapter.disconnect()
         except Exception:
             pass
+
+
+async def _send_homeassistant(token, extra, chat_id, message):
+    """Send via Home Assistant notify service."""
+    try:
+        import aiohttp
+    except ImportError:
+        return {"error": "aiohttp not installed. Run: pip install aiohttp"}
+    try:
+        hass_url = (extra.get("url") or os.getenv("HASS_URL", "")).rstrip("/")
+        token = token or os.getenv("HASS_TOKEN", "")
+        if not hass_url or not token:
+            return {"error": "Home Assistant not configured (HASS_URL, HASS_TOKEN required)"}
+        url = f"{hass_url}/api/services/notify/notify"
+        headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
+        async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=30)) as session:
+            async with session.post(url, headers=headers, json={"message": message, "target": chat_id}) as resp:
+                if resp.status not in {200, 201}:
+                    body = await resp.text()
+                    return _error(f"Home Assistant API error ({resp.status}): {body}")
+        return {"success": True, "platform": "homeassistant", "chat_id": chat_id}
+    except Exception as e:
+        return _error(f"Home Assistant send failed: {e}")
 
 
 async def _send_dingtalk(extra, chat_id, message):

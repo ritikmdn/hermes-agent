@@ -1,0 +1,46 @@
+# Docker Compose template for the Elixir analytics Slack gateway.
+#
+# Run from the Hermes repo root:
+#
+#   cp profile-distributions/elixir-analytics/deploy/.env.hosted-gateway.example .env.hosted-gateway
+#   $EDITOR .env.hosted-gateway
+#   docker compose -f profile-distributions/elixir-analytics/deploy/docker-compose.gateway.yml \
+#     --env-file .env.hosted-gateway \
+#     run --rm gateway profile install /opt/hermes/profile-distributions/elixir-analytics --name elixir-analytics
+#   docker compose -f profile-distributions/elixir-analytics/deploy/docker-compose.gateway.yml \
+#     --env-file .env.hosted-gateway \
+#     up -d --build
+#
+# Do not run this service while the local launchd gateway is connected to the
+# same Slack app token.
+
+services:
+  gateway:
+    build:
+      context: ../../..
+    image: hermes-agent:elixir-analytics
+    container_name: hermes-elixir-analytics-gateway
+    restart: unless-stopped
+    network_mode: host
+    volumes:
+      - hermes_elixir_analytics_data:/opt/data
+    env_file:
+      - ../../../.env.hosted-gateway
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+    command: ["--profile", "elixir-analytics", "gateway", "run"]
+    healthcheck:
+      test:
+        [
+          "CMD-SHELL",
+          "test -f /opt/data/profiles/elixir-analytics/logs/gateway.log && grep -q 'Socket Mode connected' /opt/data/profiles/elixir-analytics/logs/gateway.log",
+        ]
+      interval: 30s
+      timeout: 10s
+      retries: 5
+      start_period: 60s
+
+volumes:
+  hermes_elixir_analytics_data:
+
