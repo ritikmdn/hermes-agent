@@ -6,9 +6,24 @@ description: Answer Elixir analytics questions.
 # Elixir Analytics
 
 Support files:
+- `references/apple-health-wearable-source-checks.md` — workflow for checking Apple Health watch/source metadata in health-data columns without overclaiming when analytics tables lack populated metadata.
+- `references/wearable-provider-customer-counts.md` — provider-connectivity pattern for counting customers with active wearable/smartwatch/band health providers, including Apple Health caveats and Supabase ad hoc runner pitfalls.
 - `references/gym-last-purchases.md` — SQL shape and metadata for “who bought the last N gyms?” active gym milestone purchase questions.
+- `references/gym-milestone-spend.md` — current-active-cohort pattern for gym milestone users’ card spend/GTV and average monthly spend questions.
+- `references/gym-voucher-order-details.md` — order-level gym/voucher marketplace details with order value, card paid, rewards redeemed, and rewards earned.
+- `references/gym-buyer-regularity.md` — marketplace gym buyer prior-regularity drilldowns, including the default prior spend-history threshold and compact Slack table shape.
+- `references/gym-buyer-retention.md` — gym buyer onboarding-date and post-gym business-retention drilldowns, including the next-IST-date+ activity proxy to avoid counting the gym payment itself.
 - `references/marketplace-product-rankings.md` — partner-specific `marketplace_order.order_details` extraction for top marketplace product/item rankings.
+- `references/marketplace-gmv-nmv.md` — monthly/custom-window marketplace GMV + NMV answer pattern, including adjustment-period Net GMV and compact Slack output.
+- `references/gtv-spike-suspicious-review.md` — suspicious GTV spike review pattern covering concentration, MCC, reward, and single-user drilldowns.
+- `references/gtv-visa-reconciliation.md` — reconcile Elixir GTV against Visa/LivQuik spreadsheet exports.
+- `references/refund-reversal-spike-drilldowns.md` — follow-up playbook for refund/reversal spike cause, user concentration, and reward-benefit investigations.
+- `references/vkyc-status-lookups.md` — source-of-truth SQL shape and Slack answer guidance for user-level vKYC/KYC status lookups by email/identifier.
+- `references/user-demographics-health-sync.md` — ad hoc patterns for profile age-group breakdowns of transacting users and provider/wearable health-sync counts.
 - `references/operational-health-diagnostics.md` — diagnostic patterns for “is X broken?” flow-health questions such as card creation/onboarding.
+- `references/order-status-lookups.md` — source-of-truth SQL shape and Slack answer guidance for marketplace order status lookups.
+- `references/supabase-ad-hoc-transaction-semantics.md` — pitfalls for merchant/card-spend ad hoc SQL, including inlining transaction semantics when `classified_transactions` is not a DB relation; also includes external Visa/acquirer/network GTV reconciliation steps.
+- `references/transacting-user-age-groups.md` — reusable Supabase ad hoc pattern for age-band analyses of card transacting users using `profiles.dob`, including unknown-DOB handling, transaction-semantics CTE, and compact Slack answer shape.
 
 Use this skill for Elixir analytics questions, especially Slack questions
 about GTV, GMV, wallet loads, rewards, active users, marketplace usage, gym
@@ -32,6 +47,21 @@ Use this posture:
   write-query rejections, production blockers, errors, or surprising results.
 - Never let personality override metadata, caveats, freshness, or source
   clarity.
+
+## Slack Table Formatting
+
+For Slack analytics answers, prefer tables that remain readable in Slack, not
+just Markdown-preview neat:
+
+- Use compact fenced code-block tables for user lists, long product names, or
+  more than ~4 columns. Keep columns short and aligned.
+- Use Markdown tables only for short, narrow tables that will not wrap badly.
+- Split wide answers into two small tables rather than one cramped table, e.g.
+  summary table + detail table.
+- Shorten product names and labels in Slack while preserving full detail in the
+  dashboard link when one is present.
+- Keep metadata, fine print, and any runner-provided dashboard link outside the
+  code block.
 
 ## Self-Serve Boundary
 
@@ -286,12 +316,73 @@ bounded and must ultimately feed a deterministic runner-backed answer with rows,
 metadata, and a dashboard link only when the deterministic runner includes that
 link in `slackText`.
 
-Marketplace product/item ranking questions are a common ad hoc case. Use
+- Questions like "how many new users were added over the last N days?" are a
+  common ad hoc case. Interpret "new users added" as onboarded users by default,
+  using the source-of-truth onboarding date `cards.issued_at` (latest card row
+  per user) for non-deleted profiles. If the wording could also mean technical
+  account creation, include `profiles.created_at` only as a clearly labeled
+  secondary reference such as "registered profiles". Use a rolling
+  Asia/Kolkata calendar window through query time unless the user asks for
+  completed days. Sources: `cards`, `profiles`; metric contract: `none` unless
+  a future onboarding contract is added.
+
+- Health wearable/source questions are a common ad hoc case when the fast path
+  or planner falls through. Use
+  `references/apple-health-wearable-source-checks.md` when the user asks
+  whether Apple Health users can be split into Apple Watch vs iPhone-only or
+  hints that wearable data lives in a specific column. Do not overclaim that
+  Apple Watch data is unavailable; verify candidate columns
+  (`provider_metadata`, `scopes`, normalized `data` JSONB, and webhook
+  payloads), then state precisely whether the analytics tables have populated
+  source/device metadata.
+
+- Broad change-detection questions such as "what changed the most last week?"
+  are a common ad hoc case. After the fast path/planner fall through, build a
+  `supabase_ad_hoc` comparison of the last completed 7 Asia/Kolkata business
+  days versus the immediately preceding 7 days across core Supabase business
+  metrics. Rank by absolute percent change, show absolute deltas, and caveat
+  that low-base metrics can over-rank. Exclude PostHog/app metrics unless the
+  user explicitly asks for product/app changes.
+
+- Broad executive snapshot questions such as "update on today's key metrics" or
+  "today's key metrics" are a common ad hoc case. After the fast path/planner
+  fall through, interpret "today" as India business-day-to-date and return a
+  compact Supabase business snapshot: GTV/card users/card txns/avg spend,
+  wallet loads, marketplace GMV/orders/users/reward redemption share,
+  refunds/reversals shown separately, and active gym benefit users. Use the
+  transaction semantics CTE for card/wallet/refund metrics, `SUCCESS`/`CONFIRMED`
+  marketplace orders excluding deleted profiles, and current active milestone
+  users for gym.
+
+- Month-over-month transacting-user overlap questions such as "How many
+  transacting users in May, earlier transacted in April as well?" are a common
+  Supabase ad hoc case when the fast path/planner falls through. Interpret
+  unqualified "transacting users" as card transacting users / active spenders
+  unless the wording points to marketplace or app activity. Use Asia/Kolkata
+  calendar-month boundaries, the transaction semantics layer for realized card
+  spend (`is_card_spend = true`, excluding reward reconciliation), and
+  non-deleted profiles. Return the overlap count plus current-month total,
+  prior-month total, and overlap share. Do not answer from manual SQL alone.
+
+- Marketplace GMV + NMV questions for a calendar month or custom window are a
+  common ad hoc case when the saved `marketplace-gmv` topic cannot cover Net
+  GMV. Use `references/marketplace-gmv-nmv.md`: include metric contracts `gmv`
+  and `net_gmv`, use Asia/Kolkata `created_at` for gross successful orders,
+  subtract refund/cancellation adjustments in the adjustment period, and caveat
+  any `updated_at` proxy for refund timing.
+
+- Marketplace product/item ranking questions are a common ad hoc case. Use
 `references/marketplace-product-rankings.md` for the partner-specific
 `marketplace_order.order_details` extraction pattern; rank by units bought by
 default, include orders and gross GMV, and explicitly caveat that product names
 come from partner JSON payloads and refunds are not netted unless status moved
 out of `SUCCESS`/`CONFIRMED`.
+
+- Operational diagnostics and recent-failure pattern questions are also common
+  ad hoc cases. Use `references/operational-health-diagnostics.md` when the user
+  asks about transaction failures, recent failed rows, outages, health, or
+  "what's the pattern?" Keep the request bounded, expose repetition counts or
+  baseline comparisons, and answer with the pattern rather than a raw-row dump.
 
 Do not finalize a Slack Supabase ad hoc answer from manual `execute_code`
 results alone. The final Slack response must include the runner's structured
@@ -347,6 +438,17 @@ active before querying.
 
 After a successful PostHog runner result, include the same dashboard-link
 handoff rule as Supabase ad hoc queries.
+
+## Common PostHog Ad Hoc Patterns
+
+When a plain Slack question asks for the split between iOS and Android devices,
+interpret it as authenticated app activity by PostHog OS unless the wording asks
+for installed-device inventory. Use `posthog_ad_hoc` with metric contract
+`active_app_user`, source `posthog.events`, qualifying app activity events, and
+`properties['$os'] in ('iOS', 'Android')`. Return distinct authenticated users
+plus percentages; event counts can be supporting context. Note that users active
+on both OSes may count in both rows. Session-specific query pattern details live
+in `references/device-os-split.md`.
 
 ## Ad Hoc Runtime Pitfalls
 
@@ -433,6 +535,43 @@ Ask clarification for:
 - gym users: milestone users or marketplace gym buyers
 - gross/net: gross GMV/GTV or refund-adjusted net values
 - spend source: card spend, marketplace spend, or combined
+
+## Reconciliation Diagnostics
+
+- For GTV/card-spend reconciliation against Visa/LivQuik exports, use the
+  normal runner first, then compare the source-of-truth `gtv` contract with the
+  user's spreadsheet formula and raw export buckets.
+- See `references/gtv-visa-reconciliation.md` for the LivQuik formula pattern,
+  including the observed `ELIXIR-GYFTER` marketplace exclusion that can exactly
+  explain a Visa-vs-Elixir gap.
+- When a temp artifact is created for Slack delivery, delete it after the user
+  says the issue is resolved.
+
+## Follow-up Drilldowns
+
+When a user follows up on a prior data answer, keep the parent answer's date
+window, timezone, source-system scope, and metric semantics unless they ask to
+change them. For concentration, cause, purchaser, regularity, or abuse-style
+follow-ups, answer with a bounded drilldown rather than re-planning the whole
+business question.
+
+For marketplace product/item follow-ups, use
+`references/marketplace-product-rankings.md` for purchaser and regularity
+patterns. If the user asks whether buyers were "regular users" and does not
+specify app activity or retention, treat it as a prior-spend-history check and
+state the threshold explicitly before the table.
+
+For gym-buyer follow-ups, use `references/gym-buyer-regularity.md` for prior
+regularity and `references/gym-buyer-retention.md` for onboarding-date or
+"downloaded for gym and left" questions. When checking post-gym retention from
+Supabase, use next-IST-date+ successful card/non-gym marketplace activity so the
+gym payment itself does not count as retention, and label the result as business
+activity rather than app retention unless a separate PostHog query is run.
+
+Refund/reversal spike investigations have a reusable playbook in
+`references/refund-reversal-spike-drilldowns.md`: classify refund kind, break
+down by merchant/description, aggregate by user, then check reward credits,
+refund partial-reversal debits, and direct reward-to-refund transaction links.
 
 ## Source Change Rule
 

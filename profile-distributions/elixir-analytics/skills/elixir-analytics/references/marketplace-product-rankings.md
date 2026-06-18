@@ -52,7 +52,27 @@ Return `product_name`, normalized `vendor`, `orders`, `units_bought`,
 Default ranking for generic "top products bought" questions is distinct orders
 containing the product: `orders desc, units_bought desc, gross_gmv_inr desc,
 product_name`. Use `units_bought desc` only when the user explicitly asks for
-top products by units/quantity.
+top products by units/quantity. For follow-ups framed around unusually high GMV
+or "what caused this high GMV", preserve the parent answer's date window and
+rank by `gross_gmv_inr desc` first; lead with the concentration summary (e.g.,
+top vendor/product share) before the item table.
+
+## Follow-up drilldowns
+
+- For "who purchased these?" after a marketplace product/item breakdown, preserve
+  the parent date window, gross/net treatment, and partner extraction logic.
+  Return profile display names plus item/vendor/GMV, but omit phone, email, and
+  raw IDs unless explicitly requested.
+- For "were they regular users?" after a marketplace purchase drilldown, state
+  the working definition before querying. If the user does not specify app
+  activity or retention, default to prior spend history before the purchase:
+  `regular / existing user` = at least 3 prior successful card-spend transactions
+  or at least 1 prior successful/confirmed marketplace order; `some prior usage`
+  = 1-2 prior successful card-spend transactions; otherwise `no prior spend
+  history found`. Include card age when available.
+- When checking prior card spend, inline transaction semantics; do not query a
+  physical `classified_transactions` table. Exclude marketplace reward
+  reconciliation rows and use successful debit/card-spend filters.
 
 ## Pitfalls
 
