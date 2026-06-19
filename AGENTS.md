@@ -26,6 +26,33 @@ reviewing any change:
   high. Most new capability should arrive as a CLI command + skill, a
   service-gated tool, or a plugin — not as core surface.
 
+## Private Profile Branching Policy
+
+This fork uses a downstream profile-layer workflow. Keep these branch roles
+separate:
+
+- `upstream/main` is the read-only NousResearch source of truth. Fetch from it;
+  never push to it.
+- `origin/main` is the clean mirror of `upstream/main`. Do not develop private
+  profiles, employee work, or Chandler-specific changes directly on `main`.
+- `origin/profiles/main` is the private integration layer for approved profiles
+  and profile-local plugins. Chandler and future employee/profile distributions
+  belong here as additive `profile-distributions/<name>/` packages.
+- Employee and profile feature branches start from `origin/profiles/main`, then
+  merge back into `profiles/main` after review and verification.
+
+Sync order:
+
+1. Fetch `upstream`.
+2. Fast-forward `origin/main` from `upstream/main`.
+3. Rebase `profiles/main` onto the refreshed `origin/main`.
+4. Rebase active employee/profile branches onto `profiles/main`.
+5. Run the focused profile tests and release-packaging checks before pushing.
+
+Do not merge private profile work into `origin/main`; that branch must stay a
+clean upstream mirror so upstream changes can be audited independently from
+downstream profile behavior.
+
 ## Contribution Rubric — What We Want / What We Don't
 
 This is the project's intent layer. Use it two ways:
