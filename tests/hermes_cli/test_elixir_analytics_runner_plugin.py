@@ -294,14 +294,49 @@ def test_direct_final_response_uses_chandler_personality_for_simple_gtv():
     )
 
     assert direct == (
-        "*₹56.8L* GTV in the last 30 completed days.\n\n"
-        "1,907 txns across 252 card users. Successful card spend only."
+        "*Bottom line:* Card GTV was *₹56.8L* in the last 30 completed days.\n\n"
+        "*Readout:* 1,907 transactions across 252 card users.\n"
+        "*Scope:* Successful card spend only."
     )
     assert "Freshness" not in direct
     assert "Metric contract" not in direct
     assert "Source table" not in direct
     assert "Fine print" not in direct
     assert "Dashboard:" not in direct
+
+
+def test_direct_final_response_uses_consultant_format_for_card_transactions():
+    module = _load_plugin_module()
+
+    direct = module._direct_final_response_for_answer_payload(
+        {
+            "ok": True,
+            "route": "supabase_ad_hoc",
+            "shortcut": "card_transaction_count_7d",
+            "payload": {
+                "ok": True,
+                "resultType": "kpi",
+                "rows": [
+                    {
+                        "transactions": 1907,
+                        "gtv": 5680556.07,
+                        "users": 252,
+                    }
+                ],
+                "slackText": "Card transactions last 7 days: 1,907",
+                "answerArtifact": _minimal_answer_artifact(
+                    "supabase_ad_hoc",
+                    "card_transaction_count_7d",
+                ),
+            },
+        }
+    )
+
+    assert direct == (
+        "*Bottom line:* Card transactions were *1,907* in the last 7 completed days.\n\n"
+        "*Readout:* ₹56.8L GTV across 252 card users.\n"
+        "*Scope:* Successful card spend only."
+    )
 
 
 def test_direct_final_response_strips_audit_lines_from_fallback_slack_text():
@@ -2258,8 +2293,9 @@ def test_answer_question_mode_handles_merchant_card_spend_last_7_days(monkeypatc
     assert "email" not in request["sql"].lower()
     assert "phone" not in request["sql"].lower()
     assert result["hermes_direct_final_response"] == (
-        "*₹46.8K* card spend at Zepto in the last 7 completed days.\n\n"
-        "19 txns across 11 card users. Successful card spend only."
+        "*Bottom line:* Card spend at Zepto was *₹46.8K* in the last 7 completed days.\n\n"
+        "*Readout:* 19 transactions across 11 card users.\n"
+        "*Scope:* Successful card spend only."
     )
     assert "Dashboard:" not in result["hermes_direct_final_response"]
 
@@ -2443,8 +2479,9 @@ def test_answer_question_mode_handles_merchant_card_spend_this_week(monkeypatch)
     assert "ilike '%swiggy%'" in request["sql"]
     assert "week-to-date" in request["assumptions"]
     assert direct == (
-        "*₹81.2K* card spend at Swiggy this week.\n\n"
-        "42 txns across 31 card users. Successful card spend only."
+        "*Bottom line:* Card spend at Swiggy was *₹81.2K* this week.\n\n"
+        "*Readout:* 42 transactions across 31 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
@@ -2596,7 +2633,7 @@ def test_answer_question_mode_handles_card_gtv_last_7_days(monkeypatch):
     ]
     assert kwargs["input"] == "what was GTV for last 7 days?"
     assert result["hermes_direct_final_response"] == (
-        "*₹9.3L* GTV in the last 7 completed days."
+        "*Bottom line:* Card GTV was *₹9.3L* in the last 7 completed days."
     )
 
 
@@ -2643,8 +2680,9 @@ def test_answer_question_mode_handles_card_gtv_last_12_days(monkeypatch):
     assert "is_card_spend = true" in request["sql"]
     assert "is_reward_reconciliation = false" in request["sql"]
     assert result["hermes_direct_final_response"] == (
-        "*₹22.4L* GTV in the last 12 completed days.\n\n"
-        "1,014 txns across 243 card users. Successful card spend only."
+        "*Bottom line:* Card GTV was *₹22.4L* in the last 12 completed days.\n\n"
+        "*Readout:* 1,014 transactions across 243 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
@@ -2787,8 +2825,9 @@ def test_answer_question_mode_handles_card_gtv_today(monkeypatch):
     assert "including today-to-date" in request["assumptions"]
     assert "is_card_spend = true" in request["sql"]
     assert result["hermes_direct_final_response"] == (
-        "*₹1.5L* GTV today.\n\n"
-        "73 txns across 31 card users. Successful card spend only."
+        "*Bottom line:* Card GTV was *₹1.5L* today.\n\n"
+        "*Readout:* 73 transactions across 31 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
@@ -2832,8 +2871,9 @@ def test_answer_question_mode_handles_card_spend_yesterday(monkeypatch):
     assert request["metricIds"] == ["gtv"]
     assert "completed yesterday" in request["assumptions"]
     assert result["hermes_direct_final_response"] == (
-        "*₹1.2L* GTV yesterday.\n\n"
-        "61 txns across 28 card users. Successful card spend only."
+        "*Bottom line:* Card GTV was *₹1.2L* yesterday.\n\n"
+        "*Readout:* 61 transactions across 28 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
@@ -2877,8 +2917,9 @@ def test_answer_question_mode_handles_card_gtv_this_week(monkeypatch):
     assert request["metricIds"] == ["gtv"]
     assert "week-to-date" in request["assumptions"]
     assert result["hermes_direct_final_response"] == (
-        "*₹7L* GTV this week.\n\n"
-        "320 txns across 99 card users. Successful card spend only."
+        "*Bottom line:* Card GTV was *₹7L* this week.\n\n"
+        "*Readout:* 320 transactions across 99 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
@@ -3067,8 +3108,9 @@ def test_answer_question_mode_handles_card_transaction_count_last_7_days(monkeyp
     assert "is_card_spend = true" in request["sql"]
     assert "is_reward_reconciliation = false" in request["sql"]
     assert result["hermes_direct_final_response"] == (
-        "*421* card transactions in the last 7 completed days.\n\n"
-        "₹9.3L GTV, 144 card users. Successful card spend only."
+        "*Bottom line:* Card transactions were *421* in the last 7 completed days.\n\n"
+        "*Readout:* ₹9.3L GTV across 144 card users.\n"
+        "*Scope:* Successful card spend only."
     )
     assert "Dashboard:" not in result["hermes_direct_final_response"]
 
@@ -3113,8 +3155,9 @@ def test_answer_question_mode_handles_card_transaction_count_today(monkeypatch):
     assert request["metricIds"] == ["card_transactions", "gtv"]
     assert "including today-to-date" in request["assumptions"]
     assert result["hermes_direct_final_response"] == (
-        "*73* card transactions today.\n\n"
-        "₹1.5L GTV, 31 card users. Successful card spend only."
+        "*Bottom line:* Card transactions were *73* today.\n\n"
+        "*Readout:* ₹1.5L GTV across 31 card users.\n"
+        "*Scope:* Successful card spend only."
     )
 
 
