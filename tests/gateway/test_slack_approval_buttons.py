@@ -122,6 +122,29 @@ class TestSlackExecApproval:
             assert e["value"] == "agent:main:slack:group:C1:1111"
 
     @pytest.mark.asyncio
+    async def test_approval_copy_is_human_readable_for_inline_script_flag(self):
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.chat_postMessage = AsyncMock(return_value={"ts": "1234.5678"})
+
+        await adapter.send_exec_approval(
+            chat_id="C1",
+            command="node --import tsx scripts/run-ad-hoc-query.ts --request-json \"$(python -c 'print(1)')\"",
+            session_key="agent:main:slack:dm:D1:1111",
+            description="script execution via -e/-c flag",
+        )
+
+        kwargs = mock_client.chat_postMessage.call_args[1]
+        section_text = kwargs["blocks"][0]["text"]["text"]
+
+        assert "Permission needed to continue" in section_text
+        assert "run a local analytics command" in section_text
+        assert "runs a short inline script" in section_text
+        assert "Allow Once" in section_text
+        assert "Deny" in section_text
+        assert "script execution via -e/-c flag" not in section_text
+
+    @pytest.mark.asyncio
     async def test_sends_in_thread(self):
         adapter = _make_adapter()
         mock_client = adapter._team_clients["T1"]
@@ -512,6 +535,39 @@ class TestSlackThreadContext:
         assert "Previous self reply" not in context
         assert "Follow-up question" in context
         assert "Current" not in context
+
+    @pytest.mark.asyncio
+    async def test_fetch_thread_context_can_include_self_bot_replies_for_session_recovery(self):
+        """When no agent session exists, prior Chandler replies may be the
+        only place the clarification prompt exists, so recovery context can
+        opt in to include them."""
+        adapter = _make_adapter()
+        mock_client = adapter._team_clients["T1"]
+        mock_client.conversations_replies = AsyncMock(return_value={
+            "messages": [
+                {"ts": "1000.0", "user": "U1", "text": "Who's our most active user?"},
+                {
+                    "ts": "1000.1",
+                    "bot_id": "B_SELF",
+                    "user": "U_BOT",
+                    "text": "Which active user definition should I use?",
+                },
+                {"ts": "1000.2", "user": "U1", "text": "Take 1 for now"},
+            ]
+        })
+        adapter._user_name_cache = {"U1": "Ritik", "U_BOT": "chandler"}
+
+        context = await adapter._fetch_thread_context(
+            channel_id="C1",
+            thread_ts="1000.0",
+            current_ts="1000.2",
+            team_id="T1",
+            include_self_bot_replies=True,
+        )
+
+        assert "Ritik: Who's our most active user?" in context
+        assert "chandler: Which active user definition should I use?" in context
+        assert "Take 1 for now" not in context
 
     @pytest.mark.asyncio
     async def test_fetch_thread_context_multi_workspace(self):

@@ -210,6 +210,72 @@ Gateway hooks are Python modules that respond to lifecycle events:
 
 Hooks are discovered from `gateway/builtin_hooks/` (an extension point — currently empty in the shipped distribution; `_register_builtin_hooks()` is a no-op stub) and `~/.hermes/hooks/` (user-installed). Each hook is a directory with a `HOOK.yaml` manifest and `handler.py`.
 
+### Agentic Gateway Contract
+
+Inbound user turns pass through a typed pre-gateway boundary before the agent
+runtime sees them. This boundary is deliberately narrow: hooks may drop a turn,
+enforce infrastructure guardrails, normalize platform transport wrappers, or
+attach agent-only runtime context. Hooks must not conduct dialogue, resolve the
+user's semantic intent, choose from a clarification menu, or write the final
+answer. Chandler, through the agent runtime and its session history, owns those
+decisions.
+
+`pre_gateway_dispatch` supports these capabilities:
+
+| Action | Required typing | Effect |
+|--------|-----------------|--------|
+| `skip` | None | Drop the turn because an infrastructure hook handled it. |
+| `respond` | `response_type` or `kind` is `guardrail`, `system_notice`, or `auth` | Send a non-conversational infrastructure response and stop dispatch. |
+| `rewrite` | `rewrite_type` or `text_type` is `transport_normalization`, `transport`, or `sanitization` | Replace only transport noise, such as wrapper text, then continue to the agent. |
+| `annotate` | Optional `context` / `runtime_context`; typed text mutation if `text` is present | Add bounded runtime context for the agent, then continue. |
+| `allow` | None | Record the decision and continue. |
+
+Conversational `respond` results are ignored and ledgered with
+`blocked_reason="conversational_respond_not_allowed"`. Untyped text mutations
+are ignored and ledgered with `blocked_reason="untyped_text_mutation"`. This
+keeps deterministic helpers useful without turning them into a second bot with
+partial context.
+
+Each inbound turn gets a `GatewayDecisionLedger` (`gateway/decision_ledger.py`)
+with a stable `turn_id`, bounded/redacted hook payloads, the runtime
+fingerprint, and the final route decision. Summaries are persisted in
+`SessionDB.gateway_turns` through `append_gateway_turn()` and can be inspected
+with `get_gateway_turns(session_id)` or the gateway slash command
+`/turns [limit]`.
+
+At startup the gateway logs an agentic contract fingerprint and runs a canary
+from `gateway/canary.py`. The canary proves that an untyped conversational
+pre-gateway `respond` still routes to the agent instead of answering directly.
+Treat a missing or failing canary as a deployment problem before trusting live
+Slack behavior.
+
+Optional fast-model routing lives behind
+`gateway.agentic_router.middle_model.enabled`. It is advisory only: its output
+is reduced to bounded runtime context for the main agent and cannot provide a
+final answer.
+
+Recommended verification after changing this path:
+
+```bash
+env HERMES_HOME=/private/tmp/hermes-agent-test-home venv/bin/python -m pytest \
+  tests/gateway/test_agentic_router.py \
+  tests/gateway/test_decision_ledger.py \
+  tests/gateway/test_pre_gateway_dispatch.py \
+  tests/gateway/test_gateway_canary.py
+```
+
+For live Slack rollout, restart the profile gateway and verify
+`logs/gateway.log` contains both:
+
+```text
+Agentic gateway contract: version=...
+Agentic gateway canary passed: route=agent blocked_reason=conversational_respond_not_allowed
+```
+
+Then send one Slack test turn and confirm a `gateway_turns` record exists for
+the resolved session. The log must not show a stale conversational
+`pre_gateway_dispatch respond` before normal inbound dispatch.
+
 ## Memory Provider Integration
 
 When a memory provider plugin (e.g., Honcho) is enabled:

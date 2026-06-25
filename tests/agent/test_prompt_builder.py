@@ -1050,6 +1050,12 @@ class TestPromptBuilderConstants:
         assert "MEDIA:" in hint
         assert "Markdown" in hint
 
+    def test_platform_hints_slack_mentions_native_table_rendering(self):
+        hint = PLATFORM_HINTS["slack"]
+        assert "Slack" in hint
+        assert "Markdown tables" in hint
+        assert "native table rendering" in hint
+
     def test_platform_hints_matrix(self):
         hint = PLATFORM_HINTS["matrix"]
         assert "Matrix" in hint
@@ -1545,5 +1551,4 @@ class TestParallelToolCallGuidance:
 # =========================================================================
 # Budget warning history stripping
 # =========================================================================
-
 

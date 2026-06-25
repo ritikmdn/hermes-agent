@@ -773,6 +773,7 @@ def load_gateway_config() -> GatewayConfig:
     """
     _home = get_hermes_home()
     gw_data: dict = {}
+    monica_slack_bridge_enabled = False
 
     # Legacy fallback: gateway.json provides the base layer.
     # config.yaml keys always win when both specify the same setting.
@@ -795,6 +796,13 @@ def load_gateway_config() -> GatewayConfig:
         if config_yaml_path.exists():
             with open(config_yaml_path, encoding="utf-8") as f:
                 yaml_cfg = yaml.safe_load(f) or {}
+
+            monica_cfg = yaml_cfg.get("mobile_bug_agent")
+            if isinstance(monica_cfg, dict):
+                monica_slack_bridge_enabled = _coerce_bool(
+                    monica_cfg.get("enabled"),
+                    False,
+                )
 
             # Map config.yaml keys → GatewayConfig.from_dict() schema.
             # Each key overwrites whatever gateway.json may have set.
@@ -1272,6 +1280,14 @@ def load_gateway_config() -> GatewayConfig:
             _home / "config.yaml",
             e,
         )
+
+    if monica_slack_bridge_enabled:
+        monica_bot_token = os.getenv("MONICA_SLACK_BOT_TOKEN", "").strip()
+        if monica_bot_token:
+            os.environ["SLACK_BOT_TOKEN"] = monica_bot_token
+        monica_app_token = os.getenv("MONICA_SLACK_APP_TOKEN", "").strip()
+        if monica_app_token:
+            os.environ["SLACK_APP_TOKEN"] = monica_app_token
 
     config = GatewayConfig.from_dict(gw_data)
 

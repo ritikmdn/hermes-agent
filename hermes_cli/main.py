@@ -8448,6 +8448,8 @@ def cmd_update(args):
         )
         return
 
+    _run_pre_update_hooks(args)
+
     gateway_mode = getattr(args, "gateway", False)
 
     # Protect against mid-update terminal disconnects (SIGHUP) and tolerate
@@ -8456,8 +8458,43 @@ def cmd_update(args):
     _update_io_state = _install_hangup_protection(gateway_mode=gateway_mode)
     try:
         _cmd_update_impl(args, gateway_mode=gateway_mode)
+        _run_post_update_hooks(args)
     finally:
         _finalize_update_output(_update_io_state)
+
+
+def _run_pre_update_hooks(args) -> None:
+    """Allow plugins to block a mutating Hermes update before local state changes."""
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        results = invoke_hook("pre_update", args=args, project_root=str(PROJECT_ROOT))
+    except Exception as exc:
+        logger.debug("pre_update hook discovery/invocation failed: %s", exc, exc_info=True)
+        return
+
+    for result in results:
+        if not isinstance(result, dict):
+            continue
+        if result.get("action") != "block":
+            continue
+        message = str(result.get("message") or "A plugin blocked this update.").strip()
+        print("✗ Update blocked by plugin.")
+        if message:
+            print(f"  {message}")
+        sys.exit(2)
+
+
+def _run_post_update_hooks(args) -> None:
+    """Notify plugins after a successful mutating Hermes update."""
+    try:
+        from hermes_cli.plugins import discover_plugins, invoke_hook
+
+        discover_plugins()
+        invoke_hook("post_update", args=args, project_root=str(PROJECT_ROOT))
+    except Exception as exc:
+        logger.debug("post_update hook discovery/invocation failed: %s", exc, exc_info=True)
 
 
 def _cmd_update_pip(args):
@@ -12606,7 +12643,9 @@ def main():
 
     # Execute the command
     if hasattr(args, "func"):
-        args.func(args)
+        result = args.func(args)
+        if isinstance(result, int) and result != 0:
+            sys.exit(result)
     else:
         parser.print_help()
 

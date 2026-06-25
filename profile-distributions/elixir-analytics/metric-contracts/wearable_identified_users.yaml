@@ -1,0 +1,77 @@
+id: wearable_identified_users
+displayName: Wearable Identified Users
+definition: >
+  Distinct non-deleted card-issued Elixir users with credible wearable
+  ecosystem or hardware evidence from Apple Health manufacturer metadata or
+  Terra provider/device-source evidence.
+sourceSystem: supabase
+sourceTables:
+  - public.profiles
+  - public.cards
+  - profiles.onboardstatus
+  - public.health_data_daily
+  - public.health_data_providers
+  - public.health_data_activity
+  - public.health_data_body
+  - public.health_data_daily_summary
+  - public.health_data_sleep
+dateColumn:
+  identification: all_time_evidence
+  syncRecency: public.health_data_daily.date
+  timezone: Asia/Kolkata
+aggregation: count_distinct_user_id
+grain: user_wearable_brand_evidence
+grossNetTreatment: not_applicable
+amountIncludes: not_applicable
+defaultFilters:
+  population: card_issued_users
+  cardIssuedUser: profiles.isCardIssued = true OR exists public.cards row
+  deletedUsers: exclude coalesce(profiles.is_deleted, false) = true
+  appleHealthEvidence: profiles.onboardstatus.data.metadata.healthDeviceManufacturer
+  appleWatchEvidence: exact WatchN,M
+  appleHealthProviderRowRequired: false
+  healthDataDailyRequiredForIdentification: false
+  terraMembership: active synced Terra provider rows
+  terraGoogle: health_rail_not_wearable_without_device_source_evidence
+  rewardRateSource: profiles.reward_rate
+counts:
+  - Apple Watch users: exact WatchN,M token via Apple Health metadata
+  - Whoop users: Whoop evidence across Apple Health, Terra, or Google Terra
+  - Oura users: Oura evidence across Apple Health or Terra
+  - Samsung Watch users: Samsung Terra, Samsung Health assumption, or Galaxy Watch model evidence
+  - Ultrahuman users: Ultrahuman evidence across Apple Health or Terra
+  - Garmin users: Garmin provider/source/model evidence
+  - Fitbit users: Fitbit provider/source evidence
+  - Huawei Watch users: Huawei Terra or Huawei Health assumption
+  - Nothing Watch users: Nothing watch source evidence
+  - Cultsport Watch users: Cultsport watch source evidence
+doesNotCount:
+  - Apple Health connection alone
+  - iPhone-only Apple Health source evidence
+  - Google Fit / Android health rail alone
+  - generic Terra provider rows without wearable provider or device-source evidence
+  - ANT+ sensor evidence as a consumer wearable headline
+nonWearableBuckets:
+  - IPHONE_HEALTH_ONLY
+  - GOOGLE_FIT_ANDROID_HEALTH_ONLY
+  - HEALTH_DATA_EXISTS_SOURCE_UNKNOWN
+validBreakdowns:
+  - wearable_brand
+  - source_label
+  - integration_path
+  - multi_wearable_users
+  - profiles.reward_rate
+  - wearable_sync_users_30d
+glossaryAnchor: wearable_identified_users
+ambiguityPolicy:
+  elixirUsers: default_to_card_issued_users
+  cardholders: default_to_card_issued_users
+  wearableUsers: wearable_identified_users
+  activeUsers: default_to_combined_active_users_for_wearable_questions
+  currentSync: require_health_data_daily_date_window
+  rewardRateCurrent: use_profiles_reward_rate
+  rewardRateHistorical: use_reward_rate_history_only_when_explicitly_historical
+defaultCaveat: >
+  Wearable identification is all-time evidence, not current sync. Health-only
+  Apple Health/iPhone, Google Fit/Android health, and source-unknown health data
+  are reported as coverage buckets and excluded from wearable totals.

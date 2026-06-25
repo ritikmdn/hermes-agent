@@ -1,0 +1,27 @@
+[Unit]
+Description=Hermes Elixir analytics Slack gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=hermes
+Group=hermes
+WorkingDirectory=/srv/hermes-agent
+EnvironmentFile=/etc/hermes/elixir-analytics-gateway.env
+ExecStart=/srv/hermes-agent/venv/bin/python -m hermes_cli.main --profile elixir-analytics gateway run
+Restart=on-failure
+RestartSec=10
+TimeoutStopSec=60
+KillSignal=SIGTERM
+
+# Basic hardening. Keep the profile home writable for logs, sessions, auth,
+# state, and plugin data.
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=full
+ReadWritePaths=/var/lib/hermes /srv/hermes-agent
+
+[Install]
+WantedBy=multi-user.target
+

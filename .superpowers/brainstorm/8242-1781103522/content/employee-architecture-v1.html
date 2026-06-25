@@ -1,0 +1,204 @@
+<style>
+  .arch-wrap {
+    display: grid;
+    gap: 24px;
+  }
+  .map {
+    display: grid;
+    grid-template-columns: 1fr auto 1.15fr auto 1fr;
+    gap: 14px;
+    align-items: stretch;
+    margin: 22px 0 8px;
+  }
+  .node {
+    border: 1px solid rgba(148, 163, 184, 0.35);
+    background: rgba(15, 23, 42, 0.64);
+    border-radius: 8px;
+    padding: 16px;
+    min-height: 128px;
+  }
+  .node h3 {
+    margin: 0 0 10px;
+    font-size: 16px;
+  }
+  .node p, .node li {
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .node ul {
+    margin: 0;
+    padding-left: 18px;
+  }
+  .arrow {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: #93c5fd;
+    font-size: 24px;
+    min-width: 18px;
+  }
+  .layers {
+    display: grid;
+    grid-template-columns: repeat(5, 1fr);
+    gap: 10px;
+  }
+  .layer {
+    border: 1px solid rgba(148, 163, 184, 0.32);
+    border-radius: 8px;
+    padding: 12px;
+    background: rgba(30, 41, 59, 0.55);
+  }
+  .layer .label {
+    color: #93c5fd;
+  }
+  .layer strong {
+    display: block;
+    margin: 6px 0;
+  }
+  .layer p {
+    font-size: 12px;
+    line-height: 1.4;
+    margin: 0;
+  }
+  .employee-grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 12px;
+  }
+  .employee {
+    border: 1px solid rgba(148, 163, 184, 0.28);
+    border-radius: 8px;
+    padding: 14px;
+    background: rgba(2, 6, 23, 0.42);
+  }
+  .employee h4 {
+    margin: 0 0 8px;
+    color: #e2e8f0;
+  }
+  .employee p {
+    margin: 0;
+    font-size: 13px;
+    line-height: 1.45;
+  }
+  .good {
+    color: #86efac;
+  }
+  .risk {
+    color: #fca5a5;
+  }
+  @media (max-width: 900px) {
+    .map, .layers, .employee-grid {
+      grid-template-columns: 1fr;
+    }
+    .arrow {
+      transform: rotate(90deg);
+      min-height: 12px;
+    }
+  }
+</style>
+
+<div class="arch-wrap">
+  <div>
+    <h2>Slack-First Ambient Employees On Hermes</h2>
+    <p class="subtitle">A first architecture map: employees are independent personalities, but Hermes provides the shared runtime, gateway, tools, and safety rails.</p>
+  </div>
+
+  <div class="map">
+    <div class="node">
+      <h3>1. Slack Surface</h3>
+      <ul>
+        <li>Default wake surface for every employee</li>
+        <li>Mention-gated first: <code>@monica</code>, <code>@chandler</code></li>
+        <li>Channel and user allowlists before side effects</li>
+      </ul>
+    </div>
+    <div class="arrow">-&gt;</div>
+    <div class="node">
+      <h3>2. Hermes Gateway</h3>
+      <ul>
+        <li>Receives Slack event</li>
+        <li>Runs employee gate before normal chat dispatch</li>
+        <li>Can skip, reply, rewrite, or route to profile</li>
+      </ul>
+    </div>
+    <div class="arrow">-&gt;</div>
+    <div class="node">
+      <h3>3. Employee Runtime</h3>
+      <ul>
+        <li>Profile identity and memory</li>
+        <li>Optional plugin workflow and state machine</li>
+        <li>Deterministic tools for risky or exact work</li>
+      </ul>
+    </div>
+  </div>
+
+  <div class="layers">
+    <div class="layer">
+      <div class="label">Identity</div>
+      <strong>Profile</strong>
+      <p><code>HERMES_HOME</code>, <code>SOUL.md</code>, skills, memory, sessions.</p>
+    </div>
+    <div class="layer">
+      <div class="label">Presence</div>
+      <strong>Wake Policy</strong>
+      <p>Slack mention, approved channels, allowed users, ignored noise.</p>
+    </div>
+    <div class="layer">
+      <div class="label">Judgment</div>
+      <strong>Intake</strong>
+      <p>Ignore, clarify, answer, file ticket, request approval, or start work.</p>
+    </div>
+    <div class="layer">
+      <div class="label">Hands</div>
+      <strong>Tools</strong>
+      <p>Runner, Linear, GitHub, repo worker, Notion, Gmail, app-specific scripts.</p>
+    </div>
+    <div class="layer">
+      <div class="label">Trust</div>
+      <strong>Safety Gates</strong>
+      <p>Rollout mode, dry run, verification, approval, audit trail.</p>
+    </div>
+  </div>
+
+  <div class="section">
+    <h3>What We Already Have</h3>
+    <div class="employee-grid">
+      <div class="employee">
+        <h4>Chandler / Elixir Analytics</h4>
+        <p><span class="good">Profile-first specialist.</span> Strong SOUL, analytics skill, Slack posture, and deterministic runner. Best example of a live employee with a narrow domain.</p>
+      </div>
+      <div class="employee">
+        <h4>Monica / Mobile Frontend</h4>
+        <p><span class="good">Workflow-first ambient agent.</span> Slack mention gate, SQLite run state, Linear creation, approval before code, isolated Codex worker, verification, draft PR.</p>
+      </div>
+    </div>
+  </div>
+
+  <div>
+    <h3>Architecture Direction</h3>
+    <p class="subtitle">Click the option that feels closest to the future employee system you want.</p>
+    <div class="options">
+      <div class="option" data-choice="profile-first" onclick="toggleSelect(this)">
+        <div class="letter">A</div>
+        <div class="content">
+          <h3>Profile-First Employees</h3>
+          <p>Every employee is primarily a Hermes profile. Plugins are optional hands. Simple, personal, easy to reason about, but ambient workflows stay bespoke.</p>
+        </div>
+      </div>
+      <div class="option" data-choice="plugin-first" onclick="toggleSelect(this)">
+        <div class="letter">B</div>
+        <div class="content">
+          <h3>Plugin-First Employees</h3>
+          <p>Every employee is a purpose-built workflow plugin. Powerful and safe for side effects, but risks making employees feel like backend services, not personalities.</p>
+        </div>
+      </div>
+      <div class="option" data-choice="employee-contract" onclick="toggleSelect(this)">
+        <div class="letter">C</div>
+        <div class="content">
+          <h3>Employee Contract</h3>
+          <p>Each employee has a profile, wake policy, intake policy, tools, state, approval rules, and surfaces. This makes Chandler and Monica different implementations of one concept.</p>
+        </div>
+      </div>
+    </div>
+  </div>
+</div>

@@ -39,6 +39,67 @@ def mock_args():
     return SimpleNamespace()
 
 
+def test_update_pre_update_hook_blocks_before_fetch(monkeypatch, tmp_path, capsys):
+    from hermes_cli import main as hm
+
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda _root: "git")
+    monkeypatch.setattr("hermes_cli.config.format_docker_update_message", lambda: "docker update")
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+    monkeypatch.setattr(
+        "hermes_cli.plugins.invoke_hook",
+        lambda hook_name, **_kwargs: [
+            {"action": "block", "message": "Monica is proofing run MOB-123."}
+        ]
+        if hook_name == "pre_update"
+        else [],
+    )
+    monkeypatch.setattr(
+        hm.subprocess,
+        "run",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("update touched git")),
+    )
+
+    with pytest.raises(SystemExit) as exc:
+        cmd_update(SimpleNamespace(check=False))
+
+    out = capsys.readouterr().out
+    assert exc.value.code == 2
+    assert "Update blocked by plugin" in out
+    assert "Monica is proofing run MOB-123." in out
+
+
+def test_update_runs_post_update_hook_after_success(monkeypatch, tmp_path):
+    from hermes_cli import main as hm
+
+    calls: list[str] = []
+    (tmp_path / ".git").mkdir()
+    monkeypatch.setattr(hm, "PROJECT_ROOT", tmp_path)
+    monkeypatch.setattr("hermes_cli.config.is_managed", lambda: False)
+    monkeypatch.setattr("hermes_cli.config.detect_install_method", lambda _root: "git")
+    monkeypatch.setattr("hermes_cli.config.format_docker_update_message", lambda: "docker update")
+    monkeypatch.setattr("hermes_cli.plugins.discover_plugins", lambda: None)
+
+    def invoke_hook(hook_name, **_kwargs):
+        calls.append(hook_name)
+        return []
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+    monkeypatch.setattr(hm, "_install_hangup_protection", lambda gateway_mode=False: None)
+    monkeypatch.setattr(hm, "_finalize_update_output", lambda _state: None)
+
+    def fake_update_impl(_args, *, gateway_mode):
+        calls.append("update_impl")
+
+    monkeypatch.setattr(hm, "_cmd_update_impl", fake_update_impl)
+
+    cmd_update(SimpleNamespace(check=False, gateway=False))
+
+    assert calls == ["pre_update", "update_impl", "post_update"]
+
+
 # ---------------------------------------------------------------------------
 # Managed-uv compatibility for tests that patch shutil.which
 # ---------------------------------------------------------------------------

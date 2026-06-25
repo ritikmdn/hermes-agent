@@ -1,0 +1,7 @@
+name: elixir-analytics-runner
+version: 0.1.0
+description: Deterministic Elixir analytics runner.
+kind: standalone
+provides_tools:
+  - analytics_answer
+  - elixir_analytics_runner
