@@ -8,6 +8,8 @@ from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
 
+import pytest
+
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PLUGIN_PATH = (
@@ -18,6 +20,13 @@ PLUGIN_PATH = (
     / "elixir-analytics-runner"
     / "__init__.py"
 )
+
+
+@pytest.fixture(autouse=True)
+def _analytics_repo_exists(monkeypatch, tmp_path):
+    analytics_repo = tmp_path / "claude-analytics"
+    analytics_repo.mkdir()
+    monkeypatch.setenv("ELIXIR_ANALYTICS_REPO", str(analytics_repo))
 
 
 def _load_plugin_module():

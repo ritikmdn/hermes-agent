@@ -6948,7 +6948,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "pre_gateway_dispatch",
                     event=event,
                     gateway=self,
-                    session_store=self.session_store,
+                    session_store=getattr(self, "session_store", None),
                 )
             except Exception as _hook_exc:
                 logger.warning("pre_gateway_dispatch invocation failed: %s", _hook_exc)
@@ -7075,7 +7075,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _decision_ledger.set_final_action(
                     "auth_denied",
                     reason="missing_user_id_denied",
-                    session_id=self._session_key_for_source(source),
                 )
                 self._persist_gateway_decision_ledger(_decision_ledger)
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
@@ -7099,7 +7098,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _decision_ledger.set_final_action(
                         "auth_rate_limited",
                         reason="pairing_rate_limited",
-                        session_id=self._session_key_for_source(source),
                     )
                     self._persist_gateway_decision_ledger(_decision_ledger)
                     return None
@@ -7138,7 +7136,6 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             _decision_ledger.set_final_action(
                 _auth_final_action,
                 reason=_auth_reason,
-                session_id=self._session_key_for_source(source),
             )
             self._persist_gateway_decision_ledger(_decision_ledger)
             return None
@@ -8149,13 +8146,19 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     canonical = _cmd_def.name if _cmd_def else command
                     break
 
-        async def _finalize_gateway_command_result(result_or_awaitable, *, command_name: str):
+        async def _finalize_gateway_command_result(
+            result_or_awaitable,
+            *,
+            command_name: str,
+            session_id: str | None = None,
+        ):
             return await _finalize_gateway_turn_result(
                 result_or_awaitable,
                 action="command",
                 reason=f"/{command_name}",
                 capability="slash_command",
                 details={"command": command_name},
+                session_id=session_id,
             )
 
         if canonical == "new":
@@ -8163,6 +8166,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return await _finalize_gateway_command_result(
                     self._telegram_topic_root_new_message(),
                     command_name=canonical,
+                    session_id=_quick_key,
                 )
             async def _do_reset():
                 return await self._handle_reset_command(event)
@@ -8757,12 +8761,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     action="topic_lobby",
                     reason="telegram_topic_root_lobby",
                     capability="telegram_topic",
+                    session_id=_quick_key,
                 )
             return await _finalize_gateway_turn_result(
                 None,
                 action="topic_lobby_suppressed",
                 reason="telegram_topic_root_lobby_debounced",
                 capability="telegram_topic",
+                session_id=_quick_key,
             )
 
         try:
@@ -10821,6 +10827,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         queue_depth = self._queue_depth(session_key, adapter=adapter)
 
         title = None
+        row = None
         # Pull token totals from the SQLite session DB rather than the
         # in-memory SessionStore.  The agent's per-turn token deltas are
         # persisted into sessions_db (run_agent.py), not into SessionEntry,
@@ -10846,6 +10853,60 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             except Exception:
                 db_total_tokens = 0
 
+        def _positive_int(value: Any) -> int | None:
+            try:
+                parsed = int(value)
+            except (TypeError, ValueError):
+                return None
+            return parsed if parsed > 0 else None
+
+        status_model = None
+        status_provider = None
+        status_context_used = None
+        status_context_length = None
+
+        status_agent = self._running_agents.get(session_key)
+        if status_agent is _AGENT_PENDING_SENTINEL:
+            status_agent = None
+        if status_agent is None:
+            cached = getattr(self, "_agent_cache", {}).get(session_key)
+            if isinstance(cached, (tuple, list)) and cached:
+                status_agent = cached[0]
+
+        if status_agent is not None:
+            status_model = getattr(status_agent, "model", None) or None
+            status_provider = getattr(status_agent, "provider", None) or None
+            compressor = getattr(status_agent, "context_compressor", None)
+            if compressor is not None:
+                status_context_used = _positive_int(
+                    getattr(compressor, "last_prompt_tokens", None)
+                )
+                status_context_length = _positive_int(
+                    getattr(compressor, "context_length", None)
+                )
+
+        if isinstance(row, dict):
+            status_model = status_model or row.get("model")
+            status_provider = (
+                status_provider
+                or row.get("billing_provider")
+                or row.get("provider")
+            )
+
+        status_context_used = status_context_used or _positive_int(
+            getattr(session_entry, "last_prompt_tokens", None)
+        )
+        if status_context_used and not status_context_length:
+            try:
+                config = _load_gateway_config()
+                model_config = config.get("model", {}) if isinstance(config, dict) else {}
+                if isinstance(model_config, dict):
+                    status_context_length = _positive_int(
+                        model_config.get("context_length")
+                    )
+            except Exception:
+                status_context_length = None
+
         lines = [
             t("gateway.status.header"),
             "",
@@ -10853,6 +10914,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         ]
         if title:
             lines.append(t("gateway.status.title", title=title))
+        if source.platform == Platform.MATRIX:
+            import hashlib
+
+            session_key_digest = hashlib.sha256(
+                session_key.encode("utf-8")
+            ).hexdigest()[:16]
+            scope = "thread" if source.thread_id else "room"
+            matrix_scope = source.chat_name or source.chat_id or "unknown room"
+            lines.extend(
+                [
+                    f"Matrix scope: {matrix_scope}",
+                    f"room_id: `{source.chat_id or 'unknown'}`",
+                    f"session_scope: {scope}",
+                    f"session_key: sha256:{session_key_digest}",
+                ]
+            )
+        if status_model:
+            provider_suffix = f" ({status_provider})" if status_provider else ""
+            lines.append(f"**Model:** `{status_model}`{provider_suffix}")
+        if status_context_used and status_context_length:
+            context_pct = round((status_context_used / status_context_length) * 100)
+            lines.append(
+                f"**Context:** {status_context_used:,} / "
+                f"{status_context_length:,} ({context_pct}%)"
+            )
         lines.extend([
             t("gateway.status.created", timestamp=session_entry.created_at.strftime('%Y-%m-%d %H:%M')),
             t("gateway.status.last_activity", timestamp=session_entry.updated_at.strftime('%Y-%m-%d %H:%M')),
