@@ -8,11 +8,11 @@ from typing import Any
 
 CHANDLER_PERSONALITY = """Chandler is Ritik's sharp business analyst in Slack.
 
-He is concise, confident when the data is clear, explicit when assumptions
-matter, and direct without sounding like a report. He answers the question
-first, then gives only the supporting facts a business user needs. Provenance,
-freshness, source tables, metric contracts, and fine print stay available in
-the answer artifact, but they are not dumped into Slack by default.
+He writes like a consultant briefing a founder: crisp bottom line first,
+clean Slack formatting, one short readout, and only the scope caveat that
+changes interpretation. Provenance, freshness, source tables, metric
+contracts, and fine print stay available in the answer artifact, but they
+are not dumped into Slack by default.
 """
 
 
@@ -169,7 +169,7 @@ def _compose_card_gtv(answer_payload: dict[str, Any], shortcut: str) -> str | No
         return None
 
     period = _period_phrase(shortcut)
-    first_line = f"*{_format_inr_human(amount)}* GTV {period}."
+    first_line = f"*Bottom line:* Card GTV was *{_format_inr_human(amount)}* {period}."
     if not first_row:
         return first_line
 
@@ -178,13 +178,16 @@ def _compose_card_gtv(answer_payload: dict[str, Any], shortcut: str) -> str | No
     if transactions is None and users is None:
         return first_line
 
-    stats = _stats_sentence(
+    readout = _transaction_user_readout(
         transactions=transactions,
         users=users,
         user_label="card users",
-        assumption="Successful card spend only.",
     )
-    return f"{first_line}\n\n{stats}" if stats else first_line
+    return _consultant_response(
+        first_line,
+        readout=readout,
+        scope="Successful card spend only.",
+    )
 
 
 def _compose_card_transactions(answer_payload: dict[str, Any], shortcut: str) -> str | None:
@@ -197,17 +200,17 @@ def _compose_card_transactions(answer_payload: dict[str, Any], shortcut: str) ->
         return None
 
     period = _period_phrase(shortcut)
-    first_line = f"*{_format_number(transactions)}* card transactions {period}."
+    first_line = (
+        f"*Bottom line:* Card transactions were "
+        f"*{_format_number(transactions)}* {period}."
+    )
     gtv = _coerce_float(first_row.get("gtv"))
     users = _coerce_int(first_row.get("users"))
-    stats_parts: list[str] = []
-    if gtv is not None:
-        stats_parts.append(f"{_format_inr_human(gtv)} GTV")
-    if users is not None:
-        stats_parts.append(f"{_format_number(users)} card users")
-    if stats_parts:
-        return f"{first_line}\n\n{', '.join(stats_parts)}. Successful card spend only."
-    return f"{first_line}\n\nSuccessful card spend only."
+    return _consultant_response(
+        first_line,
+        readout=_gtv_user_readout(gtv=gtv, users=users, user_label="card users"),
+        scope="Successful card spend only.",
+    )
 
 
 def _compose_merchant_card_spend(answer_payload: dict[str, Any], shortcut: str) -> str | None:
@@ -221,16 +224,22 @@ def _compose_merchant_card_spend(answer_payload: dict[str, Any], shortcut: str) 
 
     merchant = _merchant_label(answer_payload, first_row)
     period = _period_phrase(shortcut)
-    first_line = f"*{_format_inr_human(amount)}* card spend at {merchant} {period}."
+    first_line = (
+        f"*Bottom line:* Card spend at {merchant} was "
+        f"*{_format_inr_human(amount)}* {period}."
+    )
     transactions = _coerce_int(first_row.get("txn_count") or first_row.get("transactions"))
     users = _coerce_int(first_row.get("user_count") or first_row.get("users"))
-    stats = _stats_sentence(
+    readout = _transaction_user_readout(
         transactions=transactions,
         users=users,
         user_label="card users",
-        assumption="Successful card spend only.",
     )
-    return f"{first_line}\n\n{stats}" if stats else first_line
+    return _consultant_response(
+        first_line,
+        readout=readout,
+        scope="Successful card spend only.",
+    )
 
 
 def _period_phrase(shortcut: str) -> str:
@@ -270,23 +279,50 @@ def _metadata_value(answer_payload: dict[str, Any], key: str) -> Any:
     return None
 
 
-def _stats_sentence(
+def _consultant_response(
+    first_line: str,
+    *,
+    readout: str | None,
+    scope: str,
+) -> str:
+    support_lines: list[str] = []
+    if readout:
+        support_lines.append(f"*Readout:* {readout}")
+    support_lines.append(f"*Scope:* {scope}")
+    return f"{first_line}\n\n" + "\n".join(support_lines)
+
+
+def _transaction_user_readout(
     *,
     transactions: int | None,
     users: int | None,
     user_label: str,
-    assumption: str,
 ) -> str | None:
     if transactions is not None and users is not None:
         return (
-            f"{_format_number(transactions)} txns across "
-            f"{_format_number(users)} {user_label}. {assumption}"
+            f"{_format_number(transactions)} transactions across "
+            f"{_format_number(users)} {user_label}."
         )
     if transactions is not None:
-        return f"{_format_number(transactions)} txns. {assumption}"
+        return f"{_format_number(transactions)} transactions."
     if users is not None:
-        return f"{_format_number(users)} {user_label}. {assumption}"
-    return assumption
+        return f"{_format_number(users)} {user_label}."
+    return None
+
+
+def _gtv_user_readout(
+    *,
+    gtv: float | None,
+    users: int | None,
+    user_label: str,
+) -> str | None:
+    if gtv is not None and users is not None:
+        return f"{_format_inr_human(gtv)} GTV across {_format_number(users)} {user_label}."
+    if gtv is not None:
+        return f"{_format_inr_human(gtv)} GTV."
+    if users is not None:
+        return f"{_format_number(users)} {user_label}."
+    return None
 
 
 def _format_inr_human(value: float) -> str:
