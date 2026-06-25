@@ -1,7 +1,9 @@
 import importlib.util
 import json
 import logging
+import os
 import subprocess
+import sys
 from contextlib import contextmanager
 from pathlib import Path
 from types import SimpleNamespace
@@ -19,13 +21,18 @@ PLUGIN_PATH = (
 
 
 def _load_plugin_module():
+    module_name = "test_elixir_analytics_runner_plugin_pkg"
     spec = importlib.util.spec_from_file_location(
-        "test_elixir_analytics_runner_plugin",
+        module_name,
         PLUGIN_PATH,
+        submodule_search_locations=[str(PLUGIN_PATH.parent)],
     )
     assert spec is not None
     assert spec.loader is not None
     module = importlib.util.module_from_spec(spec)
+    module.__package__ = module_name
+    module.__path__ = [str(PLUGIN_PATH.parent)]
+    sys.modules[module_name] = module
     spec.loader.exec_module(module)
     return module
 
@@ -50,7 +57,7 @@ def _gateway_session_vars(*, platform: str, user_id: str, user_name: str):
 
 class _Completed:
     def __init__(self, stdout: str, stderr: str = "", returncode: int = 0):
-        self.stdout = stdout
+        self.stdout = _stdout_with_default_answer_artifacts(stdout)
         self.stderr = stderr
         self.returncode = returncode
 
@@ -65,6 +72,50 @@ class _Ctx:
 
     def register_hook(self, hook_name, callback):
         self.hooks.setdefault(hook_name, []).append(callback)
+
+
+def _minimal_answer_artifact(route: str = "supabase_ad_hoc", shortcut: str | None = None):
+    return {
+        "version": "answer-artifact.v1",
+        "artifactId": f"answer_{route}_{shortcut or 'ad_hoc'}",
+        "sourceRunner": {"route": route, "shortcut": shortcut},
+    }
+
+
+def _stdout_with_default_answer_artifacts(stdout: str) -> str:
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError):
+        return stdout
+    return json.dumps(_value_with_default_answer_artifacts(payload))
+
+
+def _value_with_default_answer_artifacts(value):
+    if isinstance(value, list):
+        return [_value_with_default_answer_artifacts(item) for item in value]
+    if not isinstance(value, dict):
+        return value
+
+    normalized = {
+        key: _value_with_default_answer_artifacts(nested)
+        for key, nested in value.items()
+    }
+    if (
+        (
+            (
+                isinstance(normalized.get("slackText"), str)
+                and normalized["slackText"].strip()
+            )
+            or "rows" in normalized
+            or "rowCount" in normalized
+        )
+        and "answerArtifact" not in normalized
+    ):
+        normalized["answerArtifact"] = _minimal_answer_artifact(
+            str(normalized.get("route") or "supabase_ad_hoc"),
+            normalized.get("shortcut") if isinstance(normalized.get("shortcut"), str) else None,
+        )
+    return normalized
 
 
 def _slack_event(text: str, *, user_id: str = "ritik", user_name: str = "Ritik Madan"):
@@ -109,6 +160,237 @@ def test_registers_pre_gateway_agent_handoff_hook():
     module.register(ctx)
 
     assert "pre_gateway_dispatch" in ctx.hooks
+
+
+def test_pre_gateway_agent_handoff_lives_in_slack_handoff_module():
+    module = _load_plugin_module()
+    ctx = _Ctx()
+
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    assert hook.__module__.endswith(".slack_handoff")
+
+
+def test_runner_command_lives_in_runner_modes_module():
+    module = _load_plugin_module()
+
+    assert module._runner_command.__module__.endswith(".runner_modes")
+
+
+def test_answer_payload_helpers_live_in_answer_payloads_module():
+    module = _load_plugin_module()
+
+    assert module._compact_answer_question_payload.__module__.endswith(".answer_payloads")
+    assert module._direct_final_response_for_answer_payload.__module__.endswith(
+        ".answer_payloads"
+    )
+    assert module._safe_payload_summary.__module__.endswith(".answer_payloads")
+
+
+def test_compact_answer_question_payload_preserves_answer_artifact():
+    module = _load_plugin_module()
+
+    compact = module._compact_answer_question_payload(
+        {
+            "ok": True,
+            "route": "supabase_ad_hoc",
+            "shortcut": "top_card_spenders_30d",
+            "payload": {
+                "ok": True,
+                "rowCount": 2,
+                "slackText": "*Top card spenders*\nRows: 2",
+                "answerArtifact": {
+                    "version": "answer-artifact.v1",
+                    "artifactId": "artifact_1",
+                    "entities": {
+                        "top_5_users": {
+                            "type": "cohort",
+                            "ids": ["u1", "u2"],
+                            "displayLabel": "top 5 users from this answer",
+                        }
+                    },
+                    "followUpHandles": ["top_5_users"],
+                },
+            },
+        }
+    )
+
+    assert compact["payload"]["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert compact["payload"]["answerArtifact"]["entities"]["top_5_users"]["ids"] == [
+        "u1",
+        "u2",
+    ]
+    assert compact["payload"]["answerArtifact"]["followUpHandles"] == ["top_5_users"]
+
+
+def test_direct_final_response_requires_answer_artifact():
+    module = _load_plugin_module()
+
+    direct = module._direct_final_response_for_answer_payload(
+        {
+            "ok": True,
+            "route": "supabase_ad_hoc",
+            "payload": {
+                "ok": True,
+                "slackText": "Top card spenders last 30 days",
+            },
+        }
+    )
+
+    assert direct is None
+
+
+def test_direct_final_response_uses_chandler_personality_for_simple_gtv():
+    module = _load_plugin_module()
+
+    direct = module._direct_final_response_for_answer_payload(
+        {
+            "ok": True,
+            "route": "supabase_ad_hoc",
+            "shortcut": "card_gtv_last_30d",
+            "payload": {
+                "ok": True,
+                "resultType": "kpi",
+                "rowCount": 1,
+                "rows": [
+                    {
+                        "gtv": 5680556.07,
+                        "transactions": 1907,
+                        "users": 252,
+                        "source_freshness": "2026-06-25 18:09:38 UTC",
+                    }
+                ],
+                "slackText": (
+                    "GTV for the last 30-day completed business window is "
+                    "₹56,80,556.07.\n\n"
+                    "- Transactions: 1,907\n"
+                    "- Card users: 252\n"
+                    "- Window: 2026-05-27 to 2026-06-26 Asia/Kolkata\n"
+                    "- Freshness: 2026-06-25 18:09:38 UTC\n"
+                    "- Metric contract: `gtv`\n"
+                    "- Source table: `transactions`\n\n"
+                    "Fine print: GTV here means gross successful card spend only; "
+                    "wallet loads, refunds, and marketplace reward-reconciliation "
+                    "rows are excluded.\n\n"
+                    "Dashboard: <https://analytics.joinelixir.club/query?topic=card-gtv|View trend>"
+                ),
+                "answerArtifact": _minimal_answer_artifact(
+                    "supabase_ad_hoc",
+                    "card_gtv_last_30d",
+                ),
+                "dashboardUrl": "https://analytics.joinelixir.club/query?topic=card-gtv",
+            },
+        }
+    )
+
+    assert direct == (
+        "*₹56.8L* GTV in the last 30 completed days.\n\n"
+        "1,907 txns across 252 card users. Successful card spend only."
+    )
+    assert "Freshness" not in direct
+    assert "Metric contract" not in direct
+    assert "Source table" not in direct
+    assert "Fine print" not in direct
+    assert "Dashboard:" not in direct
+
+
+def test_direct_final_response_strips_audit_lines_from_fallback_slack_text():
+    module = _load_plugin_module()
+
+    direct = module._direct_final_response_for_answer_payload(
+        {
+            "ok": True,
+            "route": "supabase_ad_hoc",
+            "payload": {
+                "ok": True,
+                "resultType": "kpi",
+                "slackText": (
+                    "Active users with a wearable: 42\n"
+                    "- Freshness: 2026-06-25 18:09:38 UTC\n"
+                    "- Source table: `profiles`\n"
+                    "Fine print: wearable source evidence is strict."
+                ),
+                "answerArtifact": _minimal_answer_artifact(
+                    "supabase_ad_hoc",
+                    "wearable_active_users",
+                ),
+            },
+        }
+    )
+
+    assert direct == "Active users with a wearable: 42"
+
+
+def test_source_control_guard_lives_in_source_control_guard_module():
+    module = _load_plugin_module()
+
+    assert module._permission_denied_result.__module__.endswith(".source_control_guard")
+    assert module._block_non_ritik_source_control_tool.__module__.endswith(
+        ".source_control_guard"
+    )
+
+
+def test_shortcut_request_builders_live_in_shortcut_requests_module():
+    module = _load_plugin_module()
+
+    assert module._profile_answer_question_shortcut.__module__.endswith(
+        ".shortcut_requests"
+    )
+    assert module._relative_period_label.__module__.endswith(".shortcut_requests")
+
+
+def test_card_shortcut_requests_live_in_card_module():
+    module = _load_plugin_module()
+
+    assert module._card_gtv_7d_request.__module__.endswith(".card_shortcut_requests")
+    assert module._card_gtv_daily_request.__module__.endswith(".card_shortcut_requests")
+    assert module._top_card_spender_7d_spend_breakdown_request.__module__.endswith(
+        ".card_shortcut_requests"
+    )
+
+
+def test_commerce_shortcut_requests_live_in_commerce_module():
+    module = _load_plugin_module()
+
+    assert module._merchant_card_spend_7d_request.__module__.endswith(
+        ".commerce_shortcut_requests"
+    )
+    assert module._swiggy_spend_trend_10d_request.__module__.endswith(
+        ".commerce_shortcut_requests"
+    )
+    assert module._gym_milestone_avg_monthly_spend_3mo_request.__module__.endswith(
+        ".commerce_shortcut_requests"
+    )
+
+
+def test_slack_formatters_live_in_slack_formatters_module():
+    module = _load_plugin_module()
+
+    assert module._card_gtv_7d_slack_text.__module__.endswith(".slack_formatters")
+    assert module._format_inr.__module__.endswith(".slack_formatters")
+
+
+def test_commerce_slack_formatters_live_in_commerce_module():
+    module = _load_plugin_module()
+
+    assert module._merchant_card_spend_7d_slack_text.__module__.endswith(
+        ".commerce_slack_formatters"
+    )
+    assert module._swiggy_spend_trend_10d_slack_text.__module__.endswith(
+        ".commerce_slack_formatters"
+    )
+    assert module._gym_milestone_avg_monthly_spend_3mo_slack_text.__module__.endswith(
+        ".commerce_slack_formatters"
+    )
+
+
+def test_slack_payload_router_lives_in_payload_router_module():
+    module = _load_plugin_module()
+
+    assert module._profile_answer_question_payload.__module__.endswith(
+        ".slack_payload_router"
+    )
 
 
 def test_pre_gateway_agent_handoff_strips_slack_context(monkeypatch):
@@ -206,7 +488,7 @@ def test_pre_gateway_agent_handoff_keeps_model_required_questions_in_agent(monke
     assert "how have spends on swiggy evolved over last 10 days" in result["text"]
     assert "analytics-capable Hermes profile" in result["context"]
     assert "This Slack analytics request" not in result["context"]
-    assert "Call `elixir_analytics_runner`" in result["context"]
+    assert "Call `analytics_answer`" in result["context"]
     assert "You do not need `skill_view`" in result["context"]
 
 
@@ -234,8 +516,133 @@ def test_pre_gateway_agent_handoff_annotates_ambiguous_active_users(monkeypatch)
     assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
     assert "who was our most active user in last 7 days" in result["text"]
     assert "active user definition is ambiguous" in result["context"]
-    assert "Most card-active user" in result["context"]
-    assert "Highest card spender" in result["context"]
+    assert "Card-active users" in result["context"]
+    assert "Card spenders by GTV" in result["context"]
+    assert calls == []
+
+
+def test_pre_gateway_agent_handoff_does_not_inject_rank_menu_for_active_user_count(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    ctx = _Ctx()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "run_elixir_analytics_runner",
+        lambda args: calls.append(args) or {"ok": True},
+    )
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    result = hook(
+        event=_slack_event("how many active users this week?"),
+        gateway=SimpleNamespace(_is_user_authorized=lambda source: True),
+        session_store=None,
+    )
+
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "how many active users this week?"
+    assert "Call `analytics_answer`" in result["context"]
+    assert "active user definition is ambiguous" not in result["context"]
+    assert "Card-active users" not in result["context"]
+    assert "Card spenders by GTV" not in result["context"]
+    assert calls == []
+
+
+def test_pre_gateway_agent_handoff_treats_app_active_as_resolved(monkeypatch):
+    module = _load_plugin_module()
+    ctx = _Ctx()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "run_elixir_analytics_runner",
+        lambda args: calls.append(args) or {"ok": True},
+    )
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    result = hook(
+        event=_slack_event("how many app active users this week?"),
+        gateway=SimpleNamespace(_is_user_authorized=lambda source: True),
+        session_store=None,
+    )
+
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["text"] == "how many app active users this week?"
+    assert "active-user definition is already resolved" in result["context"]
+    assert "do not clarify" in result["context"]
+    assert "active user definition is ambiguous" not in result["context"]
+    assert calls == []
+
+
+def test_pre_gateway_agent_handoff_does_not_inject_rank_menu_for_wearable_active_count(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    ctx = _Ctx()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "run_elixir_analytics_runner",
+        lambda args: calls.append(args) or {"ok": True},
+    )
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    result = hook(
+        event=_slack_event("In last 30 days, how many active users have a wearable?"),
+        gateway=SimpleNamespace(_is_user_authorized=lambda source: True),
+        session_store=None,
+    )
+
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "In last 30 days, how many active users have a wearable?"
+    assert "Call `analytics_answer`" in result["context"]
+    assert "active-users-with-wearable default" in result["context"]
+    assert "do not clarify" in result["context"]
+    assert "active user definition is ambiguous" not in result["context"]
+    assert "Card-active users" not in result["context"]
+    assert "Card spenders by GTV" not in result["context"]
+    assert calls == []
+
+
+def test_pre_gateway_agent_handoff_defaults_plain_top_spender_to_card_spend(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    ctx = _Ctx()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "run_elixir_analytics_runner",
+        lambda args: calls.append(args) or {"ok": True},
+    )
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    result = hook(
+        event=_slack_event("who spent the most in last 30 days?"),
+        gateway=SimpleNamespace(_is_user_authorized=lambda source: True),
+        session_store=None,
+    )
+
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
+    assert result["text"] == "who spent the most in last 30 days?"
+    assert "Call `analytics_answer`" in result["context"]
+    assert "default spend source to successful card spend" in result["context"]
+    assert "do not clarify" in result["context"]
     assert calls == []
 
 
@@ -277,7 +684,7 @@ def test_pre_gateway_agent_handoff_preserves_active_users_clarification_reply(mo
     assert result["action"] == "annotate"
     assert result["reason"] == "elixir_analytics_agent_runtime_handoff"
     assert result["text"] == "highest spender sorry"
-    assert "Call `elixir_analytics_runner`" in result["context"]
+    assert "Call `analytics_answer`" in result["context"]
     assert "who was our most active user in last 7 days" in result["context"]
     assert calls == []
 
@@ -383,6 +790,79 @@ def test_pre_gateway_agent_handoff_preserves_session_history_followup(monkeypatc
     assert calls == []
 
 
+def test_pre_gateway_agent_handoff_injects_recent_answer_artifacts(monkeypatch):
+    module = _load_plugin_module()
+    ctx = _Ctx()
+    calls = []
+
+    monkeypatch.setattr(
+        module,
+        "run_elixir_analytics_runner",
+        lambda args: calls.append(args) or {"ok": True},
+    )
+    module.register(ctx)
+
+    hook = ctx.hooks["pre_gateway_dispatch"][0]
+    result = hook(
+        event=_slack_event("Give me a split of GTV between these 5 users vs others"),
+        gateway=SimpleNamespace(_is_user_authorized=lambda source: True),
+        session_store=_FakeSessionStore(
+            "agent:main:slack:dm:D0B7CHZFGA3:1780654833.865679",
+            [
+                {
+                    "role": "user",
+                    "content": "who spent the most in last 30 days?",
+                },
+                {
+                    "role": "tool",
+                    "tool_name": "analytics_answer",
+                    "content": json.dumps(
+                        {
+                            "ok": True,
+                            "status": "answered",
+                            "answerText": "Top card spenders last 30 days...",
+                            "answerArtifact": {
+                                "version": "answer-artifact.v1",
+                                "artifactId": "answer_supabase_ad_hoc_top_card_spenders_30d_202606251233",
+                                "userQuestion": "who spent the most in last 30 days?",
+                                "intent": {
+                                    "kind": "ranking",
+                                    "metricIds": ["gtv", "active_spender"],
+                                    "resultType": "users",
+                                },
+                                "entities": {
+                                    "top_5_users": {
+                                        "type": "cohort",
+                                        "ids": ["u1", "u2", "u3", "u4", "u5"],
+                                        "displayLabel": "top 5 users from this answer",
+                                    }
+                                },
+                                "plan": {"timeWindow": "2026-05-26 to 2026-06-25"},
+                                "followUpHandles": ["top_5_users"],
+                            },
+                        }
+                    ),
+                },
+                {
+                    "role": "assistant",
+                    "content": "Top card spenders last 30 days...",
+                },
+            ],
+        ),
+    )
+
+    assert result is not None
+    assert result["action"] == "annotate"
+    assert "Recent analytics AnswerArtifacts:" in result["context"]
+    assert "answer_supabase_ad_hoc_top_card_spenders_30d_202606251233" in result["context"]
+    assert "top_5_users" in result["context"]
+    assert "u1" in result["context"]
+    assert "2026-05-26 to 2026-06-25" in result["context"]
+    assert "resolve the phrase from Recent analytics AnswerArtifacts" in result["context"]
+    assert "do not repeat the previous answer" in result["context"]
+    assert calls == []
+
+
 def test_pre_gateway_agent_handoff_refuses_destructive_analytics_mutation(monkeypatch):
     module = _load_plugin_module()
     ctx = _Ctx()
@@ -410,27 +890,160 @@ def test_pre_gateway_agent_handoff_refuses_destructive_analytics_mutation(monkey
     assert calls == []
 
 
-def test_tool_schema_tells_model_to_use_answer_question_first():
+def test_legacy_runner_schema_points_plain_questions_to_analytics_answer():
     module = _load_plugin_module()
     ctx = _Ctx()
 
     module.register(ctx)
 
-    schema = ctx.tools[0]["schema"]
-    assert "Use mode='answer_question' first" in schema["description"]
-    assert "payload.slackText" in schema["description"]
+    schema = next(
+        tool["schema"]
+        for tool in ctx.tools
+        if tool["schema"]["name"] == "elixir_analytics_runner"
+    )
+    assert "use `analytics_answer` first" in schema["description"]
+    assert "AnswerArtifact" in schema["description"]
     assert "use `clarify`" in schema["description"]
     assert "answer_question" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "source_change_plan" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "source_change_scope_check" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "self_improvement_check" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "self_improvement_plan" in schema["parameters"]["properties"]["mode"]["enum"]
+    assert "validate_contract" in schema["parameters"]["properties"]["mode"]["enum"]
+    assert "run_contract" in schema["parameters"]["properties"]["mode"]["enum"]
     assert "query_log" in schema["parameters"]["properties"]
+    assert "contract" in schema["parameters"]["properties"]
     assert "changed_files" in schema["parameters"]["properties"]
     assert (
-        "use answer_question first"
+        "Use analytics_answer for plain Slack"
         in schema["parameters"]["properties"]["mode"]["description"]
     )
+
+
+def test_registers_primary_analytics_answer_tool():
+    module = _load_plugin_module()
+    ctx = _Ctx()
+
+    module.register(ctx)
+
+    tool_names = [tool["schema"]["name"] for tool in ctx.tools]
+    assert "analytics_answer" in tool_names
+    answer_tool = next(tool for tool in ctx.tools if tool["schema"]["name"] == "analytics_answer")
+    assert answer_tool["schema"]["parameters"]["required"] == ["question"]
+    assert "AnswerArtifact" in answer_tool["schema"]["description"]
+    assert "max_rows" in answer_tool["schema"]["parameters"]["properties"]
+
+
+def test_analytics_answer_tool_invokes_answer_boundary_script(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "status": "answered",
+                    "answerText": "Top card spenders last 30 days",
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "artifact_1",
+                    },
+                    "sourceResult": {
+                        "route": "supabase_ad_hoc",
+                        "shortcut": "top_card_spenders_30d",
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_analytics_answer(
+        {"question": "who spent the most in last 30 days?", "max_rows": 25}
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert result["status"] == "answered"
+    assert result["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert result["hermes_direct_final_response"] == "Top card spenders last 30 days"
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-analytics-answer.ts",
+        "--max-rows",
+        "25",
+    ]
+    assert kwargs["input"] == "who spent the most in last 30 days?"
+
+
+def test_analytics_answer_logs_answer_artifact_evidence(monkeypatch, caplog):
+    module = _load_plugin_module()
+
+    def fake_run(command, **kwargs):
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "status": "answered",
+                    "answerText": "Top card spenders last 30 days",
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "artifact_1",
+                    },
+                    "sourceResult": {
+                        "route": "supabase_ad_hoc",
+                        "shortcut": "top_card_spenders_30d",
+                        "rowCount": 5,
+                        "resultType": "users",
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    with caplog.at_level(logging.INFO, logger="hermes.elixir_analytics_runner"):
+        result = module.run_analytics_answer(
+            {"question": "who spent the most in last 30 days?", "max_rows": 25}
+        )
+
+    assert result["ok"] is True
+    log_text = "\n".join(record.getMessage() for record in caplog.records)
+    assert "mode=analytics_answer" in log_text
+    assert "answerArtifact=True" in log_text
+    assert "Top card spenders last 30 days" not in log_text
+
+
+def test_analytics_answer_tool_requires_artifact_for_direct_final(monkeypatch):
+    module = _load_plugin_module()
+
+    def fake_run(command, **kwargs):
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "status": "answered",
+                    "answerText": "Top card spenders last 30 days",
+                    "sourceResult": {
+                        "route": "supabase_ad_hoc",
+                        "shortcut": "top_card_spenders_30d",
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_analytics_answer(
+        {"question": "who spent the most in last 30 days?", "max_rows": 25}
+    )
+
+    assert result["ok"] is True
+    assert "hermes_direct_final_response" not in result
 
 
 def test_elixir_analytics_skill_view_result_is_compacted_for_slack_fast_path():
@@ -468,7 +1081,8 @@ def test_elixir_analytics_skill_view_result_is_compacted_for_slack_fast_path():
     assert len(payload["content"]) < 3500
     assert "large manual text" not in payload["content"]
     assert "Mandatory Slack Fast Path" in payload["content"]
-    assert "mode='answer_question'" in payload["content"]
+    assert "`analytics_answer`" in payload["content"]
+    assert "`answerText`" in payload["content"]
     assert "what can Chandler do?" in payload["content"]
     assert "Ritik-only" in payload["content"]
     assert "source_change_plan" in payload["content"]
@@ -532,7 +1146,19 @@ def test_ad_hoc_mode_sends_request_json_on_stdin_and_defaults_base_url(monkeypat
 
     def fake_run(command, **kwargs):
         calls.append((command, kwargs))
-        return _Completed(json.dumps({"ok": True, "rows": [{"user": "Ada"}]}))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "rows": [{"user": "Ada"}],
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "answer_supabase_ad_hoc_fallback",
+                        "sourceRunner": {"route": "supabase_ad_hoc", "shortcut": None},
+                    },
+                }
+            )
+        )
 
     monkeypatch.delenv("ANALYTICS_BASE_URL", raising=False)
     monkeypatch.setattr(module.subprocess, "run", fake_run)
@@ -558,7 +1184,136 @@ def test_ad_hoc_mode_sends_request_json_on_stdin_and_defaults_base_url(monkeypat
     assert json.loads(kwargs["input"]) == {
         "question": "which users spent on Swiggy this week?"
     }
+    assert result["payload"]["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert (
+        result["payload"]["answerArtifact"]["sourceRunner"]["route"]
+        == "supabase_ad_hoc"
+    )
     assert kwargs["env"]["ANALYTICS_BASE_URL"] == "https://analytics.joinelixir.club"
+
+
+def test_posthog_ad_hoc_mode_preserves_answer_artifact(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "rows": [{"active_app_users": 42}],
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "answer_posthog_ad_hoc_fallback",
+                        "sourceRunner": {"route": "posthog_ad_hoc", "shortcut": None},
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "posthog_ad_hoc",
+            "request": {"question": "how many app active users this week?"},
+            "max_rows": 25,
+        }
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-posthog-query.ts",
+        "--max-rows",
+        "25",
+    ]
+    assert json.loads(kwargs["input"]) == {
+        "question": "how many app active users this week?"
+    }
+    assert result["payload"]["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert result["payload"]["answerArtifact"]["sourceRunner"]["route"] == "posthog_ad_hoc"
+
+
+def test_saved_topic_mode_preserves_answer_artifact(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "topicId": "card-gtv-weekly",
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "answer_saved_topic_card_gtv_weekly",
+                        "sourceRunner": {
+                            "route": "saved_topic",
+                            "shortcut": "card-gtv-weekly",
+                        },
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "saved_topic",
+            "topic_id": "card-gtv-weekly",
+            "range": "30d",
+        }
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-saved-query-topic.ts",
+        "card-gtv-weekly",
+        "--range",
+        "30d",
+    ]
+    assert kwargs["input"] is None
+    assert result["payload"]["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert result["payload"]["answerArtifact"]["sourceRunner"]["route"] == "saved_topic"
+
+
+def test_runner_profile_env_adds_nvm_node_to_service_path(monkeypatch, tmp_path):
+    module = _load_plugin_module()
+    node_dir = tmp_path / ".nvm" / "versions" / "node" / "v24.13.1" / "bin"
+    node_dir.mkdir(parents=True)
+    node_path = node_dir / "node"
+    node_path.write_text("#!/bin/sh\n", encoding="utf-8")
+    node_path.chmod(0o755)
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps({"ok": True, "route": "saved_topic"}))
+
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("PATH", "")
+    monkeypatch.delenv("HERMES_HOME", raising=False)
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "plan", "question": "show GTV last 30 days by week"}
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command[0] == "node"
+    assert kwargs["env"]["PATH"].split(os.pathsep)[0] == str(node_dir)
 
 
 def test_answer_question_mode_invokes_shortcut_runner_on_stdin(monkeypatch):
@@ -590,6 +1345,107 @@ def test_answer_question_mode_invokes_shortcut_runner_on_stdin(monkeypatch):
         "25",
     ]
     assert kwargs["input"] == "which users had failed onboarding attempts this week?"
+
+
+def test_validate_contract_mode_invokes_contract_validator_on_stdin(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    contract = {
+        "family": "users",
+        "contractId": "active_users_with_wearable",
+        "rawQuestion": "In last 30 days, how many active users have a wearable?",
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps({"ok": True, "executableContract": {"contractId": "users.active_users_with_wearable"}}))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "validate_contract", "contract": contract}
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/validate-contract.ts",
+    ]
+    assert json.loads(kwargs["input"]) == contract
+
+
+def test_run_contract_mode_invokes_contract_runner_and_returns_direct_slack_text(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    calls = []
+    contract = {
+        "family": "users",
+        "contractId": "active_users_with_wearable",
+        "rawQuestion": "In last 30 days, how many active users have a wearable?",
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "answerPayload": {
+                        "finalText": "Active users with a wearable: 2",
+                    },
+                    "answerArtifact": {
+                        "version": "answer-artifact.v1",
+                        "artifactId": "answer_contract_active_users_with_wearable",
+                        "sourceRunner": {
+                            "route": "answer_contract",
+                            "shortcut": "users.active_users_with_wearable",
+                        },
+                    },
+                    "safeLogRecord": {"ok": True},
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "run_contract", "contract": contract}
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-contract.ts",
+    ]
+    assert json.loads(kwargs["input"]) == contract
+    assert result["hermes_direct_final_response"] == "Active users with a wearable: 2"
+    assert result["payload"]["slackText"] == "Active users with a wearable: 2"
+    assert result["payload"]["answerArtifact"]["version"] == "answer-artifact.v1"
+    assert result["payload"]["answerArtifact"]["sourceRunner"]["route"] == "answer_contract"
+
+
+def test_contract_modes_require_structured_contract_without_subprocess(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    monkeypatch.setattr(
+        module.subprocess,
+        "run",
+        lambda *args, **kwargs: calls.append((args, kwargs)) or _Completed("{}"),
+    )
+
+    result = module.run_elixir_analytics_runner({"mode": "run_contract"})
+
+    assert result["ok"] is False
+    assert result["errorType"] == "ValueError"
+    assert "requires contract" in result["message"]
+    assert calls == []
 
 
 def test_answer_question_mode_returns_compact_slack_handoff(monkeypatch):
@@ -846,6 +1702,145 @@ def test_answer_question_mode_handles_top_card_spenders_last_7_days_as_ranking(m
     assert "| 1 | Nagendra G | ₹130,427 | 32 | ₹4,076 |" in direct
     assert "| 2 | Ada Lovelace | ₹62,420 | 12 | ₹5,202 |" in direct
     assert "Highest spender in the last 7 IST days" not in direct
+
+
+def test_answer_question_mode_routes_top_card_spenders_last_30_days_to_question_runner(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    calls = []
+    payload = {
+        "ok": True,
+        "route": "supabase_ad_hoc",
+        "shortcut": "top_card_spenders_30d",
+        "payload": {
+            "ok": True,
+            "resultType": "users",
+            "rowCount": 1,
+            "truncated": False,
+            "slackText": (
+                "Top card spenders in the last 30 IST days:\n"
+                "| # | User | GTV | Txns | Avg txn |\n"
+                "|---|---|---:|---:|---:|\n"
+                "| 1 | Nagendra G | ₹130,427 | 32 | ₹4,076 |"
+            ),
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "answer_question", "question": "who spent the most in last 30 days?"}
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-analytics-question.ts",
+        "--max-rows",
+        "100",
+    ]
+    assert kwargs["input"] == "who spent the most in last 30 days?"
+    assert result["payload"]["route"] == "supabase_ad_hoc"
+    assert result["payload"]["shortcut"] == "top_card_spenders_30d"
+    assert result["payload"]["payload"]["resultType"] == "users"
+    assert result["hermes_direct_final_response"].startswith(
+        "Top card spenders in the last 30 IST days:"
+    )
+
+
+def test_answer_question_mode_handles_prior_top_spender_cohort_split(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    payload = {
+        "ok": True,
+        "route": "supabase_ad_hoc",
+        "shortcut": "top_card_spenders_cohort_split_30d",
+        "payload": {
+            "ok": True,
+            "resultType": "breakdown",
+            "rowCount": 2,
+            "truncated": False,
+            "slackText": (
+                "*GTV split: selected users vs others*\n"
+                "Rows: 2\n"
+                "1. cohort: selected_users, user_count: 5, txn_count: 329, "
+                "gross_spend_inr: 24,38,696.44, gtv_share_pct: 18.2, "
+                "total_gtv_inr: 1,33,99,430.12\n"
+                "2. cohort: other_users, user_count: 1,982, txn_count: 6,210, "
+                "gross_spend_inr: 1,09,60,733.68, gtv_share_pct: 81.8, "
+                "total_gtv_inr: 1,33,99,430.12"
+            ),
+            "rows": [
+                {
+                    "cohort": "selected_users",
+                    "user_count": 5,
+                    "txn_count": 329,
+                    "gross_spend_inr": 2438696.44,
+                    "gtv_share_pct": 18.2,
+                    "total_gtv_inr": 13399430.12,
+                    "source_freshness": "2026-06-25 09:00:00",
+                },
+                {
+                    "cohort": "other_users",
+                    "user_count": 1982,
+                    "txn_count": 6210,
+                    "gross_spend_inr": 10960733.68,
+                    "gtv_share_pct": 81.8,
+                    "total_gtv_inr": 13399430.12,
+                    "source_freshness": "2026-06-25 09:00:00",
+                },
+            ],
+            "dashboardUrl": "https://analytics.joinelixir.club/share/cohort-split",
+        },
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    question = (
+        "For the same last 30 days successful card GTV window, split total GTV "
+        "between these 5 users from the prior top spenders result "
+        "(70ebf2b0-075d-48fd-8baf-87ccb787b071, "
+        "8491c9d2-d14f-4f8d-9051-04df13baf5da, "
+        "1eb1892c-b2c5-43cc-89d4-6324727a90bf, "
+        "842ca3f4-88f3-4e88-8aee-7e7380c9aa26, "
+        "d208ee3e-1bf4-47b3-89c0-799dc5c3e70d) vs all other users. "
+        "Return GTV INR, transaction count, percent of total GTV, and include total."
+    )
+
+    result = module.run_elixir_analytics_runner(
+        {"mode": "answer_question", "question": question, "max_rows": 25}
+    )
+
+    command, kwargs = calls[0]
+    direct = result["hermes_direct_final_response"]
+
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-analytics-question.ts",
+        "--max-rows",
+        "25",
+    ]
+    assert kwargs["input"] == question
+    assert result["payload"]["shortcut"] == "top_card_spenders_cohort_split_30d"
+    assert "Top card spenders last 30 days" not in direct
+    assert direct.startswith("*GTV split: selected users vs others")
+    assert "cohort: selected_users" in direct
+    assert "cohort: other_users" in direct
 
 
 def test_answer_question_mode_handles_top_card_spender_today(monkeypatch):
@@ -1253,14 +2248,10 @@ def test_answer_question_mode_handles_merchant_card_spend_last_7_days(monkeypatc
     assert "is_reward_reconciliation = false" in request["sql"]
     assert "email" not in request["sql"].lower()
     assert "phone" not in request["sql"].lower()
-    assert result["hermes_direct_final_response"].startswith(
-        "Zepto card spend in the last 7 IST days was *₹46,821*."
+    assert result["hermes_direct_final_response"] == (
+        "*₹46.8K* card spend at Zepto in the last 7 completed days.\n\n"
+        "19 txns across 11 card users. Successful card spend only."
     )
-    assert "Transactions:* 19" in result["hermes_direct_final_response"]
-    assert "Card users:* 11" in result["hermes_direct_final_response"]
-    assert "matched merchant_name or description containing `zepto`" in result[
-        "hermes_direct_final_response"
-    ]
     assert "Dashboard:" not in result["hermes_direct_final_response"]
 
 
@@ -1340,7 +2331,7 @@ def test_answer_question_mode_handles_merchant_users_this_week(monkeypatch):
     assert "| Asha K | ₹8,120 | 4 | 2026-06-05 11:03:44 |" in result[
         "hermes_direct_final_response"
     ]
-    assert "matched merchant_name or description containing `zepto`" in result[
+    assert "matched merchant_name or description containing `zepto`" not in result[
         "hermes_direct_final_response"
     ]
     assert (
@@ -1442,7 +2433,10 @@ def test_answer_question_mode_handles_merchant_card_spend_this_week(monkeypatch)
     assert request["merchantQuery"] == "swiggy"
     assert "ilike '%swiggy%'" in request["sql"]
     assert "week-to-date" in request["assumptions"]
-    assert direct.startswith("Swiggy card spend this week in IST is *₹81,220*.")
+    assert direct == (
+        "*₹81.2K* card spend at Swiggy this week.\n\n"
+        "42 txns across 31 card users. Successful card spend only."
+    )
 
 
 def test_answer_question_mode_handles_swiggy_users_this_week(monkeypatch):
@@ -1450,24 +2444,20 @@ def test_answer_question_mode_handles_swiggy_users_this_week(monkeypatch):
     calls = []
     payload = {
         "ok": True,
-        "dryRun": False,
-        "rows": [
-            {
-                "merchant_query": "swiggy",
-                "user_name": "Asha K",
-                "user_id": "user-1",
-                "txn_count": 4,
-                "gross_spend_inr": 8120.5,
-                "last_card_txn_at": "2026-06-05 11:03:44",
-            }
-        ],
-        "rowCount": 1,
-        "truncated": False,
-        "maxRows": 25,
-        "metadata": {},
-        "dashboardUrlPath": None,
-        "dashboardUrl": None,
-        "logEntry": "## Query #0",
+        "route": "supabase_ad_hoc",
+        "shortcut": "swiggy_users_this_week",
+        "payload": {
+            "ok": True,
+            "resultType": "users",
+            "rowCount": 1,
+            "truncated": False,
+            "slackText": (
+                "Users who spent on Swiggy this week:\n"
+                "| User | GTV | Txns | Latest |\n"
+                "|---|---:|---:|---|\n"
+                "| Asha K | ₹8,120 | 4 | 2026-06-05 11:03:44 |"
+            ),
+        },
     }
 
     def fake_run(command, **kwargs):
@@ -1480,12 +2470,20 @@ def test_answer_question_mode_handles_swiggy_users_this_week(monkeypatch):
         {"mode": "answer_question", "question": "which users spent on Swiggy this week?"}
     )
 
-    request = json.loads(calls[0][1]["input"])
+    command, kwargs = calls[0]
     direct = result["hermes_direct_final_response"]
     assert result["ok"] is True
-    assert result["payload"]["shortcut"] == "merchant_users_this_week"
-    assert request["merchantQuery"] == "swiggy"
-    assert "ilike '%swiggy%'" in request["sql"]
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-analytics-question.ts",
+        "--max-rows",
+        "100",
+    ]
+    assert kwargs["input"] == "which users spent on Swiggy this week?"
+    assert result["payload"]["route"] == "supabase_ad_hoc"
+    assert result["payload"]["shortcut"] == "swiggy_users_this_week"
     assert direct.startswith("Users who spent on Swiggy this week:")
     assert "| Asha K | ₹8,120 | 4 | 2026-06-05 11:03:44 |" in direct
 
@@ -1541,22 +2539,27 @@ def test_answer_question_mode_handles_card_gtv_last_7_days(monkeypatch):
     calls = []
     payload = {
         "ok": True,
-        "dryRun": False,
-        "rows": [
-            {
-                "gtv": 928183.22,
-                "transactions": 421,
-                "users": 144,
-                "source_freshness": "2026-06-05 03:42:49",
-            }
-        ],
-        "rowCount": 1,
-        "truncated": False,
-        "maxRows": 25,
-        "metadata": {},
-        "dashboardUrlPath": None,
-        "dashboardUrl": None,
-        "logEntry": "## Query #0",
+        "route": "saved_topic",
+        "shortcut": "card_gtv_7d",
+        "payload": {
+            "ok": True,
+            "topicId": "card-gtv",
+            "range": "7d",
+            "title": "Card GTV",
+            "rowCount": 1,
+            "dashboardUrlPath": "/query?topic=card-gtv&range=7d",
+            "dashboardUrl": (
+                "https://analytics.joinelixir.club/query?"
+                "topic=card-gtv&range=7d"
+            ),
+            "slackText": (
+                "Card GTV\n"
+                "Range: 7d\n"
+                "GTV: ₹928,183\n"
+                "Dashboard: <https://analytics.joinelixir.club/query?"
+                "topic=card-gtv&range=7d|View trend>"
+            ),
+        },
     }
 
     def fake_run(command, **kwargs):
@@ -1570,26 +2573,22 @@ def test_answer_question_mode_handles_card_gtv_last_7_days(monkeypatch):
     )
 
     command, kwargs = calls[0]
-    request = json.loads(kwargs["input"])
     assert result["ok"] is True
+    assert result["payload"]["route"] == "saved_topic"
     assert result["payload"]["shortcut"] == "card_gtv_7d"
+    assert result["payload"]["payload"]["topicId"] == "card-gtv"
     assert command == [
         "node",
         "--import",
         "tsx",
-        "scripts/run-ad-hoc-query.ts",
+        "scripts/run-analytics-question.ts",
         "--max-rows",
-        "25",
+        "100",
     ]
-    assert request["resultType"] == "kpi"
-    assert request["metricIds"] == ["gtv"]
-    assert "classified_transactions" in request["sql"]
-    assert "is_card_spend = true" in request["sql"]
-    assert "is_reward_reconciliation = false" in request["sql"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card GTV for the last 7 completed IST days was *₹928,183*."
+    assert kwargs["input"] == "what was GTV for last 7 days?"
+    assert result["hermes_direct_final_response"] == (
+        "*₹9.3L* GTV in the last 7 completed days."
     )
-    assert "Dashboard:" not in result["hermes_direct_final_response"]
 
 
 def test_answer_question_mode_handles_card_gtv_last_12_days(monkeypatch):
@@ -1634,8 +2633,9 @@ def test_answer_question_mode_handles_card_gtv_last_12_days(monkeypatch):
     assert "classified_transactions" in request["sql"]
     assert "is_card_spend = true" in request["sql"]
     assert "is_reward_reconciliation = false" in request["sql"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card GTV for the last 12 completed IST days was *₹2,242,224*."
+    assert result["hermes_direct_final_response"] == (
+        "*₹22.4L* GTV in the last 12 completed days.\n\n"
+        "1,014 txns across 243 card users. Successful card spend only."
     )
 
 
@@ -1777,8 +2777,9 @@ def test_answer_question_mode_handles_card_gtv_today(monkeypatch):
     assert request["metricIds"] == ["gtv"]
     assert "including today-to-date" in request["assumptions"]
     assert "is_card_spend = true" in request["sql"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card GTV today in IST is *₹145,507*."
+    assert result["hermes_direct_final_response"] == (
+        "*₹1.5L* GTV today.\n\n"
+        "73 txns across 31 card users. Successful card spend only."
     )
 
 
@@ -1821,8 +2822,9 @@ def test_answer_question_mode_handles_card_spend_yesterday(monkeypatch):
     assert request["resultType"] == "kpi"
     assert request["metricIds"] == ["gtv"]
     assert "completed yesterday" in request["assumptions"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card GTV yesterday in IST was *₹118,003*."
+    assert result["hermes_direct_final_response"] == (
+        "*₹1.2L* GTV yesterday.\n\n"
+        "61 txns across 28 card users. Successful card spend only."
     )
 
 
@@ -1865,8 +2867,9 @@ def test_answer_question_mode_handles_card_gtv_this_week(monkeypatch):
     assert request["resultType"] == "kpi"
     assert request["metricIds"] == ["gtv"]
     assert "week-to-date" in request["assumptions"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card GTV this week in IST is *₹702,001*."
+    assert result["hermes_direct_final_response"] == (
+        "*₹7L* GTV this week.\n\n"
+        "320 txns across 99 card users. Successful card spend only."
     )
 
 
@@ -2054,10 +3057,10 @@ def test_answer_question_mode_handles_card_transaction_count_last_7_days(monkeyp
     assert "classified_transactions" in request["sql"]
     assert "is_card_spend = true" in request["sql"]
     assert "is_reward_reconciliation = false" in request["sql"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card transaction count for the last 7 completed IST days was *421*."
+    assert result["hermes_direct_final_response"] == (
+        "*421* card transactions in the last 7 completed days.\n\n"
+        "₹9.3L GTV, 144 card users. Successful card spend only."
     )
-    assert "GTV:* ₹928,183" in result["hermes_direct_final_response"]
     assert "Dashboard:" not in result["hermes_direct_final_response"]
 
 
@@ -2100,12 +3103,15 @@ def test_answer_question_mode_handles_card_transaction_count_today(monkeypatch):
     assert request["resultType"] == "kpi"
     assert request["metricIds"] == ["card_transactions", "gtv"]
     assert "including today-to-date" in request["assumptions"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Card transaction count today in IST is *73*."
+    assert result["hermes_direct_final_response"] == (
+        "*73* card transactions today.\n\n"
+        "₹1.5L GTV, 31 card users. Successful card spend only."
     )
 
 
-def test_answer_question_mode_handles_weekly_card_gtv_last_30_days(monkeypatch):
+def test_answer_question_mode_handles_wearable_counts_with_strict_identification(
+    monkeypatch,
+):
     module = _load_plugin_module()
     calls = []
     payload = {
@@ -2113,27 +3119,231 @@ def test_answer_question_mode_handles_weekly_card_gtv_last_30_days(monkeypatch):
         "dryRun": False,
         "rows": [
             {
-                "week_start": "2026-05-04",
-                "gtv": 102030.4,
-                "transactions": 45,
-                "users": 28,
-                "source_freshness": "2026-05-10 23:59:59",
+                "classification": "wearable_identified_total",
+                "provider_label": "TOTAL_WEARABLE_IDENTIFIED_USERS",
+                "users": 42,
+                "latest_synced_at": "2026-06-18 12:30:00",
             },
             {
-                "week_start": "2026-05-11",
-                "gtv": 203040.5,
-                "transactions": 67,
-                "users": 33,
-                "source_freshness": "2026-05-17 23:59:59",
+                "classification": "health_sync_total",
+                "provider_label": "TOTAL_HEALTH_SYNC_USERS",
+                "users": 127,
+                "latest_synced_at": "2026-06-18 12:30:00",
             },
         ],
         "rowCount": 2,
         "truncated": False,
         "maxRows": 25,
         "metadata": {},
-        "dashboardUrlPath": "/query?result=weekly_gtv",
-        "dashboardUrl": "https://analytics.joinelixir.club/query?result=weekly_gtv",
+        "dashboardUrlPath": "/query?result=wearable",
+        "dashboardUrl": "https://analytics.joinelixir.club/query?result=wearable",
+        "slackText": "Wearable-identified users: 42",
         "logEntry": "## Query #0",
+    }
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(json.dumps(payload))
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": "how many users have health data synced using some wearable?",
+        }
+    )
+
+    command, kwargs = calls[0]
+    request = json.loads(kwargs["input"])
+    sql = request["sql"]
+    assert result["ok"] is True
+    assert result["payload"]["shortcut"] == "wearable_identified_users"
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-ad-hoc-query.ts",
+        "--max-rows",
+        "25",
+    ]
+    assert request["resultType"] == "breakdown"
+    assert request["metricIds"] == ["wearable_identified_users"]
+    assert "wearable-identified" in request["interpretedDefinition"]
+    assert "card-issued" in request["interpretedDefinition"]
+    assert "profiles.reward_rate" in request["interpretedDefinition"]
+    assert "health_data_providers" in sql
+    assert "eligible_profiles" in sql
+    assert "exists (select 1 from public.cards c where c.user_id = p.id)" in sql
+    assert "health_data_activity" in sql
+    assert "health_data_body" in sql
+    assert "health_data_daily_summary" in sql
+    assert "health_data_sleep" in sql
+    assert "p.onboardstatus" in sql
+    assert "healthDeviceManufacturer" in sql
+    assert "jsonb_array_elements_text" in sql
+    assert "data_text ilike '%apple watch%'" not in sql
+    assert "manufacturer_value ilike '%|Watch%'" not in sql
+    assert "manufacturer_value ilike '%Watch%|%'" not in sql
+    assert "manufacturer_value ~* '(^|[|])Watch[0-9]+,[0-9]+([|]|$)'" in sql
+    assert "manufacturer_value ilike '%apple watch%'" not in sql
+    assert "manufacturer_value ilike '%watchos%'" not in sql
+    assert "provider_health_rows" in sql
+    assert "ap.provider_user_id" in sql
+    assert "sp.provider_user_id" in sql
+    assert "where sp.provider = 'APPLE_HEALTH'" not in sql
+    assert "when hdp.provider = 'TERRA' then 'TERRA'" in sql
+    assert "APPLE_WATCH_VIA_APPLE_HEALTH" in sql
+    assert "WHOOP_VIA_APPLE_HEALTH" in sql
+    assert "GARMIN_VIA_APPLE_HEALTH" in sql
+    assert "FITBIT_VIA_APPLE_HEALTH" in sql
+    assert "OURA_VIA_APPLE_HEALTH" in sql
+    assert "COROS_VIA_APPLE_HEALTH" in sql
+    assert "ULTRAHUMAN_VIA_APPLE_HEALTH" in sql
+    assert "WHOOP_VIA_TERRA" in sql
+    assert "GARMIN_VIA_TERRA" in sql
+    assert "FITBIT_VIA_TERRA" in sql
+    assert "COROS_VIA_TERRA" in sql
+    assert "HUAWEI_WATCH_VIA_TERRA" in sql
+    assert "OURA_VIA_TERRA" in sql
+    assert "SAMSUNG_GALAXY_WATCH_VIA_TERRA" in sql
+    assert "ULTRAHUMAN_VIA_TERRA" in sql
+    assert "terra_device_names" in sql
+    assert "terra_device_health_rows" in sql
+    assert "data->'device_data'->>'name'" in sql
+    assert "other_devices" in sql
+    assert "when provider_label = 'GOOGLE'" in sql
+    assert "lower(device_name) like '%forerunner%'" in sql
+    assert "lower(device_name) like '%fenix%'" in sql
+    assert "lower(device_name) like '%pace 3%'" in sql
+    assert "lower(device_name) like '%sm-r%'" in sql
+    assert "lower(device_name) like '%q explorist%'" in sql
+    assert "NOISEFIT_VIA_GOOGLE_TERRA" in sql
+    assert "DAFIT_CRREPA_VIA_GOOGLE_TERRA" in sql
+    assert "DAFIT_CRREPA_VIA_TERRA" in sql
+    assert "XIAOMI_MI_FIT_OR_MI_BAND_VIA_GOOGLE_TERRA" in sql
+    assert "FASTRACK_TITAN_VIA_GOOGLE_TERRA" in sql
+    assert "BOAT_COVEIOT_VIA_GOOGLE_TERRA" in sql
+    assert "FOSSIL_VIA_GOOGLE_TERRA" in sql
+    assert "FOSSIL_VIA_TERRA" in sql
+    assert "FIREBOLTT_VIA_GOOGLE_TERRA" in sql
+    assert "NOTHING_WATCH_VIA_GOOGLE_TERRA" in sql
+    assert "CULTSPORT_WATCH_VIA_GOOGLE_TERRA" in sql
+    assert "ANTPLUS_SENSOR_VIA_GOOGLE_TERRA" in sql
+    assert "ANTPLUS_SENSOR_VIA_TERRA" in sql
+    assert "SAMSUNG_GALAXY_WATCH_VIA_GOOGLE_TERRA" in sql
+    assert "HUAWEI_WATCH_VIA_GOOGLE_TERRA" in sql
+    assert "provider_label in ('GOOGLE', 'SAMSUNG', 'TERRA')" not in sql
+    assert "com.google.android.gms" not in sql
+    assert "google.android.apps.fitness" not in sql
+    assert "TOTAL_HEALTH_SYNC_USERS" in sql
+    assert "TOTAL_APPLE_HEALTH_SYNC_USERS" in sql
+    assert "TOTAL_TERRA_SYNC_USERS" in sql
+    assert "TOTAL_WEARABLE_IDENTIFIED_USERS" in sql
+    assert "TOTAL_WEARABLE_SYNC_USERS_30D" in sql
+    assert "MULTI_WEARABLE_USERS" in sql
+    assert "IPHONE_HEALTH_ONLY" in sql
+    assert "GOOGLE_FIT_ANDROID_HEALTH_ONLY" in sql
+    assert "HEALTH_DATA_EXISTS_SOURCE_UNKNOWN" in sql
+    assert "REWARD_RATE_4_PLUS_WEARABLE_SEGMENT" in sql
+    assert "count(distinct user_id)" in sql
+    assert "count(distinct wearable_brand) >= 2" in sql
+    assert "p.reward_rate" in sql
+    assert "coalesce(ep.reward_rate, 0) >= 4" in sql
+    assert "APPLE_HEALTH, generic GOOGLE" in request["caveats"]
+    assert "iPhone Health only" in request["caveats"]
+    assert "Google Fit / Android health only" in request["caveats"]
+    assert "profiles.onboardstatus" in request["sources"]
+    assert "public.cards" in request["sources"]
+    assert "public.health_data_daily" in request["sources"]
+    assert result["hermes_direct_final_response"] == "Wearable-identified users: 42"
+
+
+def test_answer_question_mode_does_not_use_single_source_wearable_shortcut_for_active_percent(
+    monkeypatch,
+):
+    module = _load_plugin_module()
+    calls = []
+
+    def fake_run(command, **kwargs):
+        calls.append((command, kwargs))
+        return _Completed(
+            json.dumps(
+                {
+                    "ok": True,
+                    "route": "requires_model_request",
+                    "payload": {
+                        "ok": False,
+                        "requiresModelRequest": True,
+                        "reason": (
+                            "Combined active wearable percentages need "
+                            "Supabase wearable evidence plus PostHog app "
+                            "activity."
+                        ),
+                    },
+                }
+            )
+        )
+
+    monkeypatch.setattr(module.subprocess, "run", fake_run)
+
+    result = module.run_elixir_analytics_runner(
+        {
+            "mode": "answer_question",
+            "question": (
+                "Amongst users active in last 30 days, what is the % of users "
+                "with Whoop, Samsung watch and Ultrahuman?"
+            ),
+        }
+    )
+
+    command, kwargs = calls[0]
+    assert result["ok"] is True
+    assert command == [
+        "node",
+        "--import",
+        "tsx",
+        "scripts/run-analytics-question.ts",
+        "--max-rows",
+        "100",
+    ]
+    assert kwargs["input"] == (
+        "Amongst users active in last 30 days, what is the % of users "
+        "with Whoop, Samsung watch and Ultrahuman?"
+    )
+    assert "combined-source" in result["hermes_agent_instruction"]
+    assert "card activity OR app activity" in result["hermes_agent_instruction"]
+    assert "Whoop, Samsung Watch, and Ultrahuman" in result["hermes_agent_instruction"]
+
+
+def test_answer_question_mode_handles_weekly_card_gtv_last_30_days(monkeypatch):
+    module = _load_plugin_module()
+    calls = []
+    payload = {
+        "ok": True,
+        "route": "saved_topic",
+        "shortcut": "card_gtv_weekly_30d",
+        "payload": {
+            "ok": True,
+            "topicId": "card-gtv-weekly",
+            "title": "Weekly Card GTV",
+            "rowCount": 2,
+            "dashboardUrlPath": "/query?topic=card-gtv-weekly&range=30d",
+            "dashboardUrl": (
+                "https://analytics.joinelixir.club/query?"
+                "topic=card-gtv-weekly&range=30d"
+            ),
+            "slackText": (
+                "Weekly Card GTV\n"
+                "Rows: 2\n"
+                "1. week_start: 2026-05-04, gtv: 102030.4, "
+                "transactions: 45, users: 28\n"
+                "2. week_start: 2026-05-11, gtv: 203040.5, "
+                "transactions: 67, users: 33\n"
+                "Dashboard: <https://analytics.joinelixir.club/query?"
+                "topic=card-gtv-weekly&range=30d|View trend>"
+            ),
+        },
     }
 
     def fake_run(command, **kwargs):
@@ -2147,27 +3357,23 @@ def test_answer_question_mode_handles_weekly_card_gtv_last_30_days(monkeypatch):
     )
 
     command, kwargs = calls[0]
-    request = json.loads(kwargs["input"])
     assert result["ok"] is True
-    assert result["payload"]["shortcut"] == "card_gtv_weekly_30d"
     assert command == [
         "node",
         "--import",
         "tsx",
-        "scripts/run-ad-hoc-query.ts",
+        "scripts/run-analytics-question.ts",
         "--max-rows",
-        "25",
+        "100",
     ]
-    assert request["resultType"] == "trend"
-    assert request["metricIds"] == ["gtv"]
-    assert "date_trunc('week'" in request["sql"]
-    assert result["hermes_direct_final_response"].startswith(
-        "Weekly card GTV over the last 30 completed IST days"
-    )
-    assert "| Week | GTV | Txns | Users |" in result["hermes_direct_final_response"]
+    assert kwargs["input"] == "show GTV last 30 days by week"
+    assert result["payload"]["route"] == "saved_topic"
+    assert result["payload"]["shortcut"] == "card_gtv_weekly_30d"
+    assert result["payload"]["payload"]["topicId"] == "card-gtv-weekly"
+    assert "Weekly Card GTV" in result["hermes_direct_final_response"]
     assert (
-        "Dashboard: <https://analytics.joinelixir.club/query?result=weekly_gtv|"
-        "Open visualization>"
+        "Dashboard: <https://analytics.joinelixir.club/query?"
+        "topic=card-gtv-weekly&range=30d|View trend>"
         in result["hermes_direct_final_response"]
     )
 
@@ -2178,11 +3384,11 @@ def test_answer_question_mode_labels_saved_topic_dashboard_links(monkeypatch):
         "ok": True,
         "route": "saved_topic",
         "shortcut": "card_gtv_weekly_30d",
-        "payload": {
-            "ok": True,
-            "topicId": "card-gtv-weekly",
-            "title": "Weekly Card GTV",
-            "rowCount": 5,
+            "payload": {
+                "ok": True,
+                "topicId": "card-gtv-weekly",
+                "title": "Weekly Card GTV",
+                "rowCount": 5,
             "dashboardUrlPath": "/query?topic=card-gtv-weekly&range=30d",
             "dashboardUrl": (
                 "https://analytics.joinelixir.club/query?"
@@ -2192,11 +3398,15 @@ def test_answer_question_mode_labels_saved_topic_dashboard_links(monkeypatch):
                 "Weekly Card GTV\n"
                 "Rows: 5\n"
                 "1. week_start: 2026-05-04, gtv: 557638.14\n"
-                "Dashboard: <https://analytics.joinelixir.club/query?"
-                "topic=card-gtv-weekly&range=30d|View trend>"
-            ),
-        },
-    }
+                    "Dashboard: <https://analytics.joinelixir.club/query?"
+                    "topic=card-gtv-weekly&range=30d|View trend>"
+                ),
+                "answerArtifact": _minimal_answer_artifact(
+                    "saved_topic",
+                    "card-gtv-weekly",
+                ),
+            },
+        }
 
     compact_payload = module._compact_answer_question_payload(payload)
     direct_final = module._direct_final_response_for_answer_payload(compact_payload)
@@ -2382,6 +3592,7 @@ def test_runner_logs_safe_route_summary_without_rows_or_sql(monkeypatch, caplog)
     assert "rowCount=1" in log_text
     assert "resultType=users" in log_text
     assert "dashboard=True" in log_text
+    assert "answerArtifact=True" in log_text
     assert "ada@example.com" not in log_text
     assert "select * from transactions" not in log_text
     assert "which users spent on Swiggy this week" not in log_text
@@ -2453,12 +3664,12 @@ def test_question_without_mode_defaults_to_answer_question(monkeypatch):
         "node",
         "--import",
         "tsx",
-        "scripts/run-ad-hoc-query.ts",
+        "scripts/run-analytics-question.ts",
         "--max-rows",
-        "25",
+        "100",
         "--dry-run",
     ]
-    assert json.loads(kwargs["input"])["question"] == "show GTV last 30 days by week"
+    assert kwargs["input"] == "show GTV last 30 days by week"
 
 
 def test_source_change_plan_mode_invokes_source_change_planner_on_stdin(monkeypatch):

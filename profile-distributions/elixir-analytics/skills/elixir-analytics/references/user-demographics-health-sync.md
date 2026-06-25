@@ -27,27 +27,67 @@ Caveats to state:
 
 Default interpretation for plain Slack questions like "how many users have health data synced using some wearable?":
 
-- Count distinct non-deleted users with:
-  1. an active `health_data_providers` row (`active = true`, `disconnected_at is null`), and
-  2. at least one provider-backed synced health row in one of:
-     - `health_data_activity`
-     - `health_data_body`
-     - `health_data_daily_summary`
-     - `health_data_sleep`
-- Join provider-backed tables by `(provider, provider_user_id)` to `health_data_providers`.
-- Do not use `health_data_daily` for provider attribution because it is user-level and lacks `provider_user_id`.
-- For each user, pick the latest synced provider if multiple active providers exist, so each user is counted once.
-- Group source as:
-  - `APPLE_HEALTH` when `health_data_providers.provider = 'APPLE_HEALTH'`
-  - `upper(provider_metadata->>'provider')` for Terra/Android rows when present (e.g. `GOOGLE`, `FITBIT`, `SAMSUNG`, `GARMIN`, `COROS`, `OURA`, `ULTRAHUMAN`)
-  - otherwise fall back to `health_data_providers.provider`.
-- Use `resultType: "breakdown"` and include source/brand, users, share, earliest connection, and latest synced timestamp.
+- For plain wearable questions, report `wearable-identified` users separately
+  from broader health-sync users. Identification of wearable is critical; do
+  not collapse these into one number.
+- Default wearable denominator is non-deleted card-issued users:
+  `profiles.isCardIssued = true` OR at least one row in `cards`.
+- `health_sync_users` comes from health data presence, especially
+  `health_data_daily`, and includes phone-only Apple Health / Google Fit users.
+- `wearable_identified_users` is all-time wearable ecosystem evidence and does
+  not require recent sync by default.
+- `wearable_sync_users` is wearable-identified users with recent
+  `health_data_daily.date`; default recency is rolling last 30 Asia/Kolkata
+  calendar days.
+- Group wearable evidence as:
+  - Apple Health evidence from
+    `profiles.onboardstatus.data.metadata.healthDeviceManufacturer`.
+    Apple Health wearable evidence does not require an Apple Health provider row
+    or a `health_data_daily` row by default.
+  - Dedicated wearable ecosystems from Terra provider labels:
+    `FITBIT`, `GARMIN`, `OURA`, `WHOOP`, `COROS`, `ULTRAHUMAN`, plus accepted
+    watch assumptions for `SAMSUNG` and `HUAWEI`.
+  - Curated Terra `device_data.name` / `other_devices[*].name` source strings
+    or explicit model evidence for wearable ecosystems such as Garmin
+    Forerunner/fenix, COROS PACE, Samsung `SM-R...` Galaxy Watch models,
+    Fossil/Q Explorist, NoiseFit, DaFit/CRREPA, Xiaomi/Mi Band,
+    Fastrack/Titan, Fitbit, Amazfit/Huami, boAt/CoveIoT, FireBoltt, WHOOP,
+    Samsung Health/Galaxy Watch, Huawei Health/Watch, Nothing Watch, Cultsport
+    Watch, and ANT+.
+  - `health-sync provider` for APPLE_HEALTH/iPhone Health only, generic GOOGLE,
+    Google Fit, Health Connect, generic TERRA, and any other provider without
+    wearable hardware/source evidence.
+  - Use `upper(provider_metadata->>'provider')` for Terra labels when present;
+    otherwise fall back to `health_data_providers.provider`.
+- Use product-facing brand rollups by default; keep source labels for QA.
+- Use `resultType: "breakdown"` and include brand, users, share, denominator,
+  health-only buckets, and latest sync timestamp when relevant.
 
 Caveats to state:
 
-- This counts provider-backed health sync, not guaranteed physical wearable hardware.
-- Apple Health rows cannot be split into Apple Watch vs iPhone-only from stored data; label `APPLE_HEALTH` accordingly.
-- Android/Terra wearable brand comes from `health_data_providers.provider_metadata->>'provider'`.
+- `TOTAL_WEARABLE_IDENTIFIED_USERS` is the wearable number.
+- `TOTAL_HEALTH_SYNC_USERS` is the broader health-data base.
+- `TOTAL_APPLE_HEALTH_SYNC_USERS` and `TOTAL_TERRA_SYNC_USERS` are sync rail
+  totals, not wearable totals.
+- APPLE_HEALTH, generic GOOGLE, Google Fit, Health Connect, and generic TERRA
+  are health-sync provider evidence, not wearable proof by themselves; however,
+  generic Terra rows can still become wearable evidence when the synced
+  `device_data.name` / `other_devices[*].name` contains explicit wearable
+  source or model evidence.
+- Samsung Health and Huawei Health are accepted watch assumptions for wearable
+  attribution; do not count unrelated phone-model strings as watch evidence.
+- Apple Health users may only have phone data synced. Apple Health device or
+  wearable source attribution comes from
+  `profiles.onboardstatus.data.metadata.healthDeviceManufacturer`.
+- Terra provider labels come from
+  `health_data_providers.provider_metadata->>'provider'`; Terra wearable
+  attribution can also come from curated `device_data.name` source strings or
+  explicit device model evidence.
+- Report `IPHONE_HEALTH_ONLY`, `GOOGLE_FIT_ANDROID_HEALTH_ONLY`, and
+  `HEALTH_DATA_EXISTS_SOURCE_UNKNOWN` separately from wearable users.
+- Source rows may multi-count users with more than one wearable evidence label;
+  distinct totals must dedupe by user. `multi_wearable_users` means two or more
+  wearable brands/ecosystems, not two source paths for the same brand.
 
 ## Slack answer shape
 

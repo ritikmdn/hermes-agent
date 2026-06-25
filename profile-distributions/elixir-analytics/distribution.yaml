@@ -39,6 +39,7 @@ distribution_owned:
   - RELEASE_PACKAGING.md
   - INTERNAL_LAUNCH_RUNBOOK.md
   - config.yaml
+  - metric-contracts
   - skills
   - profile_plugins
   - HOSTED_GATEWAY.md
